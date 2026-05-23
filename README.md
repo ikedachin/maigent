@@ -1,6 +1,10 @@
 # Maigent Agent Web
 
 ローカルで動くDjango製のエージェントチャットWebアプリです。
+## 🚧 UNDER CONSTRUCTION 🚀
+### ✨ このリポジトリは現在進化中です。いっしょに育てていきましょう！
+
+![](./maigent.png)
 
 ## Setup
 

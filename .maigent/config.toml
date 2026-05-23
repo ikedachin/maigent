@@ -1,0 +1,17 @@
+# Project-local Maigent configuration.
+# This file overrides ~/.maigent/config.toml for this repository.
+
+# Required before sending normal chat messages to the OpenAI-compatible API.
+model = "Qwen3.5-35B-A3B-GPTQ-Int4"
+
+# Set your key here for project-local use, or remove this line and use
+# OPENAI_API_KEY in your shell environment.
+api_key = "apy_key"
+
+# Optional. Leave as the OpenAI default unless you use a compatible provider.
+base_url = "http://192.168.10.151:8000/v1"
+
+# auto: try Responses API first, then fall back to Chat Completions.
+# chat: use /v1/chat/completions directly for OpenAI-compatible local servers.
+# responses: use /v1/responses only.
+api_mode = "chat"

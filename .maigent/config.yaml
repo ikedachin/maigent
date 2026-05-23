@@ -1,0 +1,30 @@
+tools:
+  rag:
+    enabled: true
+  web_search:
+    enabled: false
+  sandbox:
+    enabled: true
+    image: maigent-sandbox:py311
+    timeout_seconds: 300
+    install_libraries_on_run: false
+    allowed_libraries:
+      - beautifulsoup4
+      - charset-normalizer
+      - lxml
+      - matplotlib
+      - numpy
+      - openpyxl
+      - pandas
+      - pdfplumber
+      - pillow
+      - pypdf
+      - python-docx
+      - python-pptx
+      - reportlab
+      - requests
+      - scipy
+      - seaborn
+      - tabulate
+      - xlsxwriter
+      - xlrd

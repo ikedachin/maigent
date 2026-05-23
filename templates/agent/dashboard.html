@@ -1,0 +1,296 @@
+{% load static %}
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Maigent Agent Web</title>
+  <script>
+    (() => {
+      try {
+        document.documentElement.dataset.theme = localStorage.getItem("maigent.theme")
+          || (window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+      } catch (error) {
+        document.documentElement.dataset.theme = "light";
+      }
+    })();
+  </script>
+  <link rel="stylesheet" href="{% static 'agent/app.css' %}">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <header class="brand">
+        <div>
+          <h1>Maigent</h1>
+          <p data-i18n="brandSubtitle">エージェントワークスペース</p>
+        </div>
+        <span class="status-dot"></span>
+      </header>
+
+      <section class="panel">
+        <h2 data-i18n="projects">プロジェクト</h2>
+        <div class="list">
+          {% for project in projects %}
+            <form method="post" action="{% url 'switch_project' project.id %}">
+              {% csrf_token %}
+              <button class="list-button {% if project.id == current_project.id %}active{% endif %}" type="submit">
+                <span>{{ project.name }}</span>
+                <small>{% if project.path %}{{ project.path }}{% else %}<span data-i18n="metadataOnly">メタデータのみ</span>{% endif %}</small>
+              </button>
+            </form>
+          {% endfor %}
+        </div>
+        <form class="stack-form" method="post" action="{% url 'create_project' %}">
+          {% csrf_token %}
+          <input name="name" placeholder="プロジェクト名" data-i18n-placeholder="projectNamePlaceholder">
+          <div class="path-picker-row">
+            <input name="path" placeholder="/path/to/repo" data-project-path-input>
+            <button type="button" class="secondary-button" data-open-directory-picker data-picker-target="project" data-i18n="browse">選択</button>
+          </div>
+          <button type="submit" data-i18n="addProject">プロジェクトを追加</button>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2 data-i18n="threads">スレッド</h2>
+        <div class="list">
+          {% for item in threads %}
+            <div class="thread-row {% if item.id == thread.id %}active{% endif %}">
+              <a class="list-button" href="{% url 'thread' item.id %}">
+                <span>{{ item.title }}</span>
+                <small>{% if item.memory_enabled %}<span data-i18n="memoryOn">メモリ有効</span>{% else %}<span data-i18n="memoryOff">メモリ無効</span>{% endif %}</small>
+              </a>
+              <form method="post" action="{% url 'delete_thread' item.id %}" data-confirm-delete>
+                {% csrf_token %}
+                <button class="icon-button danger" type="submit" aria-label="Delete thread" title="Delete thread" data-i18n-title="deleteThread">×</button>
+              </form>
+            </div>
+          {% endfor %}
+        </div>
+        <form class="stack-form" method="post" action="{% url 'create_thread' current_project.id %}">
+          {% csrf_token %}
+          <input name="title" placeholder="スレッド名" data-i18n-placeholder="threadTitlePlaceholder">
+          <button type="submit" data-i18n="newThread">新規スレッド</button>
+        </form>
+      </section>
+    </aside>
+
+    <main class="chat-pane">
+      <div class="chat-topbar">
+        <div>
+          <h2>{{ thread.title }}</h2>
+          <p>{{ current_project.name }} / <span data-i18n="modelLabel">モデル</span>: {{ config.model|default:"未設定" }}</p>
+        </div>
+        <div class="top-actions">
+          <div class="language-toggle" aria-label="Language">
+            <button type="button" class="lang-button active" data-lang="ja">JA</button>
+            <button type="button" class="lang-button" data-lang="en">EN</button>
+          </div>
+          <button type="button" class="theme-toggle" data-theme-toggle data-i18n-title="toggleTheme" title="テーマを切替">
+            <span class="theme-toggle-icon" aria-hidden="true"></span>
+            <span data-theme-label data-i18n="darkMode">ダーク</span>
+          </button>
+          <span class="pill">{% if thread.memory_enabled %}<span data-i18n="memoryOn">メモリ有効</span>{% else %}<span data-i18n="memoryOff">メモリ無効</span>{% endif %}</span>
+          <span class="pill"><span data-i18n-count="messages" data-count="{{ messages|length }}">{{ messages|length }}件のメッセージ</span></span>
+        </div>
+      </div>
+
+      <section id="messages" class="messages">
+        {% for message in messages %}
+          <article class="message {{ message.role }} {{ message.status }}" data-message-id="{{ message.id }}">
+            <div class="message-meta">
+              <span>{{ message.role }}</span>
+              <div class="message-actions">
+                <small data-status="{{ message.status }}">{{ message.status }}</small>
+                <button type="button" class="copy-message-button" data-copy-message data-i18n="copy" data-i18n-title="copyMessage" title="コピー">コピー</button>
+              </div>
+            </div>
+            <pre>{{ message.content }}</pre>
+          </article>
+        {% empty %}
+          <div class="empty-state" data-i18n="emptyState">メッセージまたはスラッシュコマンドで開始してください。</div>
+        {% endfor %}
+      </section>
+
+      <form id="chat-form" class="composer" method="post" action="{% url 'send_message' thread.id %}">
+        {% csrf_token %}
+        <div class="activity-indicator" data-activity-indicator aria-live="polite" hidden>
+          <span class="activity-spinner" aria-hidden="true"></span>
+          <span data-activity-text data-i18n="running">実行中</span>
+        </div>
+        <textarea name="message" rows="3" placeholder="/status またはメッセージを入力" data-i18n-placeholder="composerPlaceholder"></textarea>
+        <button type="submit" data-i18n="send">送信</button>
+      </form>
+    </main>
+
+    <aside class="inspector">
+      <section class="panel">
+        <h2 data-i18n="config">設定</h2>
+        <dl class="kv">
+          <dt data-i18n="sources">読み込み元</dt>
+          <dd>{{ config.sources|join:", "|default:"none" }}</dd>
+          {% for key, value in config_values.items %}
+            <dt>{{ key }}</dt>
+            <dd>{{ value }}</dd>
+          {% empty %}
+            <dt data-i18n="state">状態</dt>
+            <dd data-i18n="noConfig">設定なし</dd>
+          {% endfor %}
+        </dl>
+        <form class="stack-form setting-form" method="post" action="{% url 'update_rag_settings' %}">
+          {% csrf_token %}
+          <input type="hidden" name="next" value="{{ request.path }}">
+          <label>
+            <span data-i18n="ragTopK">RAG top_k</span>
+            <input type="number" name="rag_top_k" min="1" max="10" value="{{ rag_top_k }}">
+          </label>
+          <button type="submit" data-i18n="saveSettings">設定を保存</button>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2 data-i18n="tools">ツール</h2>
+        <div class="tool-list">
+          {% for tool in tool_settings %}
+            <div class="tool-item">
+              <strong>{{ tool.name }}</strong>
+              <span class="chip {% if tool.enabled == 'on' %}on{% endif %}">{{ tool.enabled }}</span>
+              <small>{{ tool.detail }}</small>
+            </div>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2 data-i18n="accessPaths">アクセス許可</h2>
+        <form class="stack-form" method="post" action="{% url 'add_access_path' current_project.id %}">
+          {% csrf_token %}
+          <div class="path-picker-row">
+            <input name="path" placeholder="/path/to/file-or-folder" data-access-path-input data-i18n-placeholder="accessPathPlaceholder">
+            <button type="button" class="secondary-light-button" data-open-directory-picker data-picker-target="access" data-i18n="browse">選択</button>
+          </div>
+          <select name="mode">
+            <option value="read" data-i18n="readOnly">読み取りのみ</option>
+            <option value="write" data-i18n="readWrite">読み書き</option>
+          </select>
+          <input name="note" placeholder="メモ" data-i18n-placeholder="notePlaceholder">
+          <button type="submit" data-i18n="addAccessPath">許可パスを追加</button>
+        </form>
+        <div class="access-list">
+          {% for access in access_paths %}
+            <div class="access-item">
+              <div>
+                <strong>{% if access.mode == "write" %}<span data-i18n="readWrite">読み書き</span>{% else %}<span data-i18n="readOnly">読み取りのみ</span>{% endif %}</strong>
+                <code>{{ access.path }}</code>
+                {% if access.note %}<small>{{ access.note }}</small>{% endif %}
+              </div>
+              <form method="post" action="{% url 'delete_access_path' access.id %}" data-confirm-access-delete>
+                {% csrf_token %}
+                <button class="icon-button danger light" type="submit" aria-label="Delete access path" title="Delete access path" data-i18n-title="deleteAccessPath">×</button>
+              </form>
+            </div>
+          {% empty %}
+            <p class="muted" data-i18n="noAccessPaths">許可パスは未設定です。</p>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2 data-i18n="featureFlags">機能フラグ</h2>
+        <div class="chips">
+          {% for flag in feature_flags %}
+            <span class="chip {% if flag.enabled %}on{% endif %}">{{ flag.name }}</span>
+          {% empty %}
+            <span class="muted" data-i18n="none">なし</span>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2 data-i18n="approvals">承認</h2>
+        <form class="stack-form" method="post" action="{% url 'create_approval' thread.id %}">
+          {% csrf_token %}
+          <input name="command" placeholder="コマンド提案" data-i18n-placeholder="commandPlaceholder">
+          <input name="rationale" placeholder="理由" data-i18n-placeholder="rationalePlaceholder">
+          <button type="submit" data-i18n="requestApproval">承認を依頼</button>
+        </form>
+        <div class="approval-list">
+          {% for approval in approvals %}
+            <div class="approval">
+              <strong>{{ approval.status }}</strong>
+              <code>{{ approval.command }}</code>
+              {% if approval.status == "pending" %}
+                <form method="post" action="{% url 'approval_action' approval.id %}">
+                  {% csrf_token %}
+                  <button name="action" value="approve" type="submit" data-i18n="approve">承認</button>
+                  <button name="action" value="reject" type="submit" data-i18n="reject">却下</button>
+                </form>
+              {% endif %}
+            </div>
+          {% empty %}
+            <p class="muted" data-i18n="noApprovals">承認リクエストはありません。</p>
+          {% endfor %}
+        </div>
+      </section>
+
+      <section class="panel">
+        <h2 data-i18n="automations">オートメーション</h2>
+        {% for automation in automations %}
+          <div class="automation">
+            <strong>{{ automation.name }}</strong>
+            <span>{{ automation.status }}</span>
+          </div>
+        {% empty %}
+          <p class="muted" data-i18n="noAutomations">オートメーションは未設定です。</p>
+        {% endfor %}
+      </section>
+
+      <section class="panel command-help">
+        <h2 data-i18n="slashCommands">スラッシュコマンド例</h2>
+        <div class="command-list">
+          <div><code>/status</code><span data-i18n="cmdStatus">現在のプロジェクト、モデル、機能フラグを表示</span></div>
+          <div><code>/model</code><span data-i18n="cmdModel">使用中のモデル設定を表示</span></div>
+          <div><code>/resume</code><span data-i18n="cmdResume">再開可能なスレッドを表示</span></div>
+          <div><code>/compact</code><span data-i18n="cmdCompact">このスレッドの要約メモリを更新</span></div>
+          <div><code>/fork</code><span data-i18n="cmdFork">現在の会話を新しいスレッドへ分岐</span></div>
+          <div><code>/features list</code><span data-i18n="cmdFeaturesList">機能フラグ一覧を表示</span></div>
+          <div><code>/features enable web_search</code><span data-i18n="cmdFeaturesEnable">機能フラグを有効化</span></div>
+          <div><code>/features disable web_search</code><span data-i18n="cmdFeaturesDisable">機能フラグを無効化</span></div>
+          <div><code>/memories</code><span data-i18n="cmdMemories">スレッドメモリのオン/オフを切替</span></div>
+          <div><code>/file</code><span data-i18n="cmdFile">許可済みファイル/フォルダを表示</span></div>
+          <div><code>/file /path/to/item</code><span data-i18n="cmdFilePath">ファイルなら読み取り、フォルダなら一覧表示</span></div>
+          <div><code>/read /path/to/file</code><span data-i18n="cmdRead">許可済みファイルを読み取る</span></div>
+          <div><code>/ls /path/to/folder</code><span data-i18n="cmdLs">許可済みフォルダの一覧を表示</span></div>
+          <div><code>/experimental</code><span data-i18n="cmdExperimental">試験的機能の状態を表示</span></div>
+          <div><code>/agent</code><span data-i18n="cmdAgent">エージェント設定の状態を表示</span></div>
+          <div><code>/theme</code><span data-i18n="cmdTheme">テーマ設定の状態を表示</span></div>
+          <div><code>/apps</code><span data-i18n="cmdApps">アプリ連携の状態を表示</span></div>
+        </div>
+      </section>
+    </aside>
+  </div>
+  <div class="modal-backdrop" data-directory-modal hidden>
+    <div class="directory-modal" role="dialog" aria-modal="true" aria-labelledby="directory-picker-title">
+      <div class="modal-header">
+        <div>
+          <h2 id="directory-picker-title" data-i18n="selectRepository">リポジトリを選択</h2>
+          <p data-i18n="selectRepositoryHelp">フォルダをクリックして移動し、現在のフォルダをプロジェクトパスに設定できます。</p>
+        </div>
+        <button type="button" class="icon-button modal-close" data-close-directory-picker aria-label="Close">×</button>
+      </div>
+      <div class="directory-current">
+        <span data-i18n="currentFolder">現在のフォルダ</span>
+        <code data-directory-current></code>
+      </div>
+      <div class="directory-actions">
+        <button type="button" data-directory-parent data-i18n="parentFolder">上へ</button>
+        <button type="button" class="primary-button" data-choose-current-directory data-i18n="useThisFolder">このフォルダを使う</button>
+      </div>
+      <div class="directory-list" data-directory-list></div>
+      <p class="muted" data-directory-empty hidden data-i18n="noFolders">表示できるフォルダがありません。</p>
+    </div>
+  </div>
+  <script src="{% static 'agent/app.js' %}"></script>
+</body>
+</html>

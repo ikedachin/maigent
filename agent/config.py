@@ -49,6 +49,22 @@ class RuntimeConfig:
         tools = self.values.get("tools", {})
         return tools if isinstance(tools, dict) else {}
 
+    @property
+    def final_evaluation(self) -> dict[str, Any]:
+        settings = self.values.get("final_evaluation", {})
+        return settings if isinstance(settings, dict) else {}
+
+    @property
+    def final_evaluation_enabled(self) -> bool:
+        return _as_bool(self.final_evaluation.get("enabled", False))
+
+    @property
+    def final_evaluation_max_retries(self) -> int:
+        try:
+            return max(0, min(3, int(self.final_evaluation.get("max_retries", 3))))
+        except (TypeError, ValueError):
+            return 3
+
     def tool_enabled(self, name: str, default: bool = False) -> bool:
         config = self.tools.get(name, {})
         if not isinstance(config, dict):

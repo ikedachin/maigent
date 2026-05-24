@@ -125,31 +125,45 @@
     </main>
 
     <aside class="inspector">
-      <section class="panel">
-        <h2 data-i18n="config">設定</h2>
-        <dl class="kv">
-          <dt data-i18n="sources">読み込み元</dt>
-          <dd>{{ config.sources|join:", "|default:"none" }}</dd>
-          {% for key, value in config_values.items %}
-            <dt>{{ key }}</dt>
-            <dd>{{ value }}</dd>
-          {% empty %}
-            <dt data-i18n="state">状態</dt>
-            <dd data-i18n="noConfig">設定なし</dd>
-          {% endfor %}
-        </dl>
-        <form class="stack-form setting-form" method="post" action="{% url 'update_rag_settings' %}">
-          {% csrf_token %}
-          <input type="hidden" name="next" value="{{ request.path }}">
-          <label>
-            <span data-i18n="ragTopK">RAG top_k</span>
-            <input type="number" name="rag_top_k" min="1" max="10" value="{{ rag_top_k }}">
-          </label>
-          <button type="submit" data-i18n="saveSettings">設定を保存</button>
-        </form>
+      <section class="panel config-panel">
+        <div class="panel-heading">
+          <h2>
+            <button type="button" class="panel-title-button is-collapsed" data-settings-toggle aria-expanded="false" aria-controls="settings-panel-body settings-tools-panel" data-i18n="config">設定</button>
+          </h2>
+        </div>
+        <div id="settings-panel-body" class="settings-panel-body is-collapsed" data-settings-panel-body hidden>
+          <dl class="kv">
+            <dt data-i18n="sources">読み込み元</dt>
+            <dd>{{ config.sources|join:", "|default:"none" }}</dd>
+            {% for key, value in config_values.items %}
+              <dt>{{ key }}</dt>
+              <dd>{{ value }}</dd>
+            {% empty %}
+              <dt data-i18n="state">状態</dt>
+              <dd data-i18n="noConfig">設定なし</dd>
+            {% endfor %}
+          </dl>
+          <form class="stack-form setting-form" method="post" action="{% url 'update_rag_settings' %}">
+            {% csrf_token %}
+            <input type="hidden" name="next" value="{{ request.path }}">
+            <label>
+              <span data-i18n="ragTopK">RAG top_k</span>
+              <input type="number" name="rag_top_k" min="1" max="10" value="{{ rag_top_k }}">
+            </label>
+            <label class="checkbox-label">
+              <input type="checkbox" name="final_evaluation_enabled" {% if final_evaluation.enabled %}checked{% endif %}>
+              <span data-i18n="finalEvaluation">最終評価</span>
+            </label>
+            <label>
+              <span data-i18n="finalEvaluationRetries">最終評価リトライ</span>
+              <input type="number" name="final_evaluation_max_retries" min="0" max="3" value="{{ final_evaluation.max_retries }}">
+            </label>
+            <button type="submit" data-i18n="saveSettings">設定を保存</button>
+          </form>
+        </div>
       </section>
 
-      <section class="panel">
+      <section id="settings-tools-panel" class="panel settings-panel-body is-collapsed" data-settings-panel-body hidden>
         <h2 data-i18n="tools">ツール</h2>
         <div class="tool-list">
           {% for tool in tool_settings %}

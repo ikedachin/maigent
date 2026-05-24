@@ -10,6 +10,8 @@ from .config import load_runtime_config
 from .openai_client import stream_response
 from .models import AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .tooling import (
+    AgentPlan,
+    AgentPlanStep,
     SandboxResult,
     _python_for_tabular_task,
     build_agent_plan,
@@ -18,6 +20,7 @@ from .tooling import (
     run_sandbox,
     select_tool,
 )
+from .views import _avoid_failed_plan
 
 
 @override_settings(STATICFILES_DIRS=[])
@@ -100,6 +103,27 @@ class ConfigTests(TestCase):
             self.assertTrue(config.sandbox_install_libraries_on_run)
             self.assertEqual(config.sandbox_allowed_libraries, ["numpy", "pandas"])
 
+    def test_final_evaluation_config_clamps_retries(self):
+        with TemporaryDirectory() as app_dir:
+            app = Path(app_dir)
+            (app / ".maigent").mkdir()
+            (app / ".maigent" / "config.toml").write_text(
+                "\n".join(
+                    [
+                        "[final_evaluation]",
+                        "enabled = true",
+                        "max_retries = 9",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+
+            with override_settings(BASE_DIR=app):
+                config = load_runtime_config("")
+
+            self.assertTrue(config.final_evaluation_enabled)
+            self.assertEqual(config.final_evaluation_max_retries, 3)
+
 
 @override_settings(STATICFILES_DIRS=[])
 class ChatFlowTests(TestCase):
@@ -124,10 +148,19 @@ class ChatFlowTests(TestCase):
         self.assertEqual(Message.objects.filter(role="assistant").first().status, "error")
 
     def test_update_rag_settings_clamps_top_k(self):
-        response = self.client.post(reverse("update_rag_settings"), {"rag_top_k": "99"})
+        response = self.client.post(
+            reverse("update_rag_settings"),
+            {
+                "rag_top_k": "99",
+                "final_evaluation_enabled": "on",
+                "final_evaluation_max_retries": "9",
+            },
+        )
 
         self.assertEqual(response.status_code, 302)
         self.assertEqual(AppSetting.objects.get(key="rag_top_k").value, "10")
+        self.assertEqual(AppSetting.objects.get(key="final_evaluation_enabled").value, "true")
+        self.assertEqual(AppSetting.objects.get(key="final_evaluation_max_retries").value, "3")
 
     def test_slash_status_returns_assistant_message(self):
         FeatureFlag.objects.create(name="web_search", enabled=True)
@@ -252,11 +285,96 @@ class ChatFlowTests(TestCase):
         stream = self.client.get(payload["stream_url"])
         body = b"".join(stream.streaming_content).decode()
 
+        self.assertIn('"progress_tail"', body)
+        self.assertIn("Goal: Answer the user's request: hello", body)
+        self.assertIn("Criteria: The answer directly addresses the user's request.", body)
+        self.assertIn("Plan: Direct answer; no tool use needed.", body)
         self.assertIn('"done": true', body)
         assistant = Message.objects.get(id=payload["assistant_id"])
         self.assertEqual(assistant.content, "hello")
         self.assertEqual(assistant.status, "complete")
         self.assertEqual(assistant.openai_response_id, "resp_1")
+
+    @patch("agent.views.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_final_evaluation_retries_from_plan_when_inadequate(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = True
+            final_evaluation_max_retries = 1
+
+            def tool_enabled(self, name, default=False):
+                return False
+
+        mock_config.return_value = Config()
+        mock_stream.side_effect = [
+            iter([("delta", "bad answer"), ("response_id", "resp_1")]),
+            iter([("delta", "good answer"), ("response_id", "resp_2")]),
+        ]
+        mock_complete.side_effect = [
+            '{"adequate": false, "reason": "too vague"}',
+            '{"adequate": true, "reason": "answers the question"}',
+        ]
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        body = b"".join(stream.streaming_content).decode()
+
+        self.assertIn("good answer", body)
+        self.assertIn("final evaluation failed; replanning with a different plan", body)
+        self.assertIn("Revised direct answer after failed final evaluation", body)
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertEqual(assistant.content, "good answer")
+        self.assertEqual(assistant.openai_response_id, "resp_2")
+        self.assertEqual(mock_stream.call_count, 2)
+        first_evaluation_prompt = mock_complete.call_args_list[0].args[1]
+        self.assertIn("Goal set before planning:", first_evaluation_prompt)
+        self.assertIn("Evaluation criteria set before planning:", first_evaluation_prompt)
+        self.assertIn("The answer directly addresses the user's request.", first_evaluation_prompt)
+
+    def test_failed_final_evaluation_uses_different_plan(self):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return name == "rag" or default
+
+        plan = AgentPlan(
+            goal="Answer the user's request: hello",
+            evaluation_criteria=["The answer directly addresses the user's request."],
+            summary="Direct answer; no tool use needed.",
+            steps=[AgentPlanStep("final", "Answer directly.")],
+        )
+        revised = _avoid_failed_plan(plan, Config(), [plan.summary])
+
+        self.assertNotEqual(revised.summary, plan.summary)
+        self.assertEqual(revised.goal, plan.goal)
+        self.assertEqual(revised.evaluation_criteria, plan.evaluation_criteria)
+        self.assertEqual([step.tool for step in revised.steps], ["rag", "final"])
+
+    def test_failed_sandbox_plan_retries_without_sandbox(self):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return True
+
+        plan = AgentPlan(
+            goal="Answer the user's request: calculate from files",
+            evaluation_criteria=["The answer includes the computed result."],
+            summary="rag -> sandbox -> final",
+            steps=[
+                AgentPlanStep("rag", "Search context."),
+                AgentPlanStep("sandbox", "Run calculation."),
+            ],
+        )
+        revised = _avoid_failed_plan(plan, Config(), [plan.summary])
+
+        self.assertNotEqual(revised.summary, plan.summary)
+        self.assertEqual(revised.goal, plan.goal)
+        self.assertEqual(revised.evaluation_criteria, plan.evaluation_criteria)
+        self.assertEqual([step.tool for step in revised.steps], ["rag"])
 
     @patch("agent.views.run_sandbox")
     @patch("agent.views.load_runtime_config")
@@ -541,6 +659,8 @@ class ChatFlowTests(TestCase):
 
         plan = build_agent_plan("正確に説明してください", Config())
 
+        self.assertEqual(plan.goal, "Answer the user's request: 正確に説明してください")
+        self.assertIn("The answer directly addresses the user's request.", plan.evaluation_criteria)
         self.assertEqual([step.tool for step in plan.steps], ["final"])
         self.assertFalse(can_build_sandbox_program("正確に説明してください"))
 
@@ -666,14 +786,51 @@ class ChatFlowTests(TestCase):
         self.assertIn("alpha_one.txt", input_text)
         self.assertNotIn("alpha_two.txt", input_text)
 
+    @patch("agent.views.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
-    def test_streaming_returns_no_info_when_search_needed_but_bm25_not_relevant(self, mock_config, mock_stream):
+    def test_llm_decision_can_select_rag_for_ambiguous_named_question(self, mock_config, mock_stream, mock_complete):
+        mock_config.return_value.model = "test-model"
+        mock_config.return_value.api_key = "test-key"
+        mock_config.return_value.base_url = ""
+        mock_config.return_value.sources = []
+        mock_stream.return_value = iter([("delta", "ok")])
+        mock_complete.return_value = "\n".join(
+            [
+                "RAG_REQUIRED",
+                "QUERY: 深海図書館 アビス リブラ 本 保存",
+                "REASON: named local setting",
+            ]
+        )
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "text_10.txt").write_text(
+                "深海図書館アビス・リブラでは、本は棚に並ばず、読者の肺活量に合わせて泳いでくる。",
+                encoding="utf-8",
+            )
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+
+            create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "深海図書館アビス・リブラでは本はどのように保存されていますか？"})
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+        input_text = mock_stream.call_args.args[1]
+        self.assertIn("RAG search query: 深海図書館 アビス リブラ 本 保存", input_text)
+        self.assertIn("RAG context from allowed local files", input_text)
+        self.assertIn("読者の肺活量に合わせて泳いでくる", input_text)
+        mock_complete.assert_called_once()
+
+    @patch("agent.views.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_streaming_returns_no_info_when_search_needed_but_bm25_not_relevant(self, mock_config, mock_stream, mock_complete):
         mock_config.return_value.model = "test-model"
         mock_config.return_value.api_key = "test-key"
         mock_config.return_value.base_url = ""
         mock_config.return_value.sources = []
         mock_stream.return_value = iter([("delta", "should not call")])
+        mock_complete.return_value = '{"relevant_indexes": [], "reason": "unrelated"}'
         with TemporaryDirectory() as root_dir:
             root = Path(root_dir)
             (root / "budget.txt").write_text("cost amount", encoding="utf-8")
@@ -687,6 +844,36 @@ class ChatFlowTests(TestCase):
         assistant = Message.objects.get(id=payload["assistant_id"])
         self.assertIn("十分な情報が見つかりません", assistant.content)
         mock_stream.assert_not_called()
+        mock_complete.assert_called_once()
+
+    @patch("agent.views.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_bm25_inadequate_uses_llm_judge_for_top_k_files(self, mock_config, mock_stream, mock_complete):
+        mock_config.return_value.model = "test-model"
+        mock_config.return_value.api_key = "test-key"
+        mock_config.return_value.base_url = ""
+        mock_config.return_value.sources = []
+        mock_stream.return_value = iter([("delta", "ok")])
+        mock_complete.return_value = '{"relevant_indexes": [1], "reason": "contains relevant lore"}'
+        AppSetting.objects.create(key="rag_top_k", value="1")
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "a_notes.txt").write_text("books are sealed in glass", encoding="utf-8")
+            (root / "budget.txt").write_text("cost amount", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+
+            create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "深海図書館の本について要約して"})
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+        input_text = mock_stream.call_args.args[1]
+        self.assertIn("RAG context from allowed local files", input_text)
+        self.assertIn("a_notes.txt", input_text)
+        self.assertIn("sealed in glass", input_text)
+        self.assertNotIn("budget.txt", input_text)
+        mock_complete.assert_called_once()
 
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")

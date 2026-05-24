@@ -26,8 +26,11 @@ class AgentPlanStep:
 
 @dataclass(frozen=True)
 class AgentPlan:
+    goal: str
+    evaluation_criteria: list[str]
     summary: str
     steps: list[AgentPlanStep]
+    rag_query: str = ""
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,8 @@ def requires_llm_sandbox_program(message: str) -> bool:
 
 
 def build_agent_plan(message: str, config: RuntimeConfig) -> AgentPlan:
+    goal = build_agent_goal(message)
+    evaluation_criteria = build_agent_evaluation_criteria(message)
     steps: list[AgentPlanStep] = []
     if _config_tool_enabled(config, "web_search") and _looks_like_web_search(message):
         steps.append(AgentPlanStep("web_search", "Collect current or external information."))
@@ -70,9 +75,41 @@ def build_agent_plan(message: str, config: RuntimeConfig) -> AgentPlan:
         steps.append(AgentPlanStep("sandbox", "Run deterministic Python in Docker for exact computation."))
     if not steps:
         steps.append(AgentPlanStep("final", "Answer directly with the language model."))
-    plan = AgentPlan(summary=_summarize_plan(steps), steps=steps)
-    logger.debug("tool_plan_built summary=%s steps=%s", plan.summary, [step.tool for step in plan.steps])
+    plan = AgentPlan(goal=goal, evaluation_criteria=evaluation_criteria, summary=_summarize_plan(steps), steps=steps)
+    logger.debug(
+        "tool_plan_built goal=%r criteria=%s summary=%s steps=%s",
+        plan.goal,
+        plan.evaluation_criteria,
+        plan.summary,
+        [step.tool for step in plan.steps],
+    )
     return plan
+
+
+def build_agent_goal(message: str) -> str:
+    text = " ".join(message.strip().split())
+    if not text:
+        return "Answer the user's request."
+    if len(text) > 180:
+        text = text[:177].rstrip() + "..."
+    return f"Answer the user's request: {text}"
+
+
+def build_agent_evaluation_criteria(message: str) -> list[str]:
+    criteria = [
+        "The answer directly addresses the user's request.",
+        "The answer is specific enough to be useful and does not dodge the question.",
+    ]
+    lowered = message.lower()
+    if _looks_like_rag_task(message):
+        criteria.append("If local file context is needed, the answer is grounded in the allowed file contents or clearly says enough information was not found.")
+    if _looks_like_sandbox_task(message):
+        criteria.append("If exact computation or code execution is requested, the answer includes the computed result and does not rely on unsupported mental arithmetic.")
+    if any(marker in lowered or marker in message for marker in ["要約", "summary", "summarize"]):
+        criteria.append("If a summary is requested, the answer captures the main points without inventing unsupported details.")
+    if any(marker in lowered or marker in message for marker in ["一覧", "list", "列挙"]):
+        criteria.append("If a list is requested, the answer provides the requested items in a clear list or states why they cannot be listed.")
+    return criteria
 
 
 def select_tool(message: str, config: RuntimeConfig) -> ToolDecision:

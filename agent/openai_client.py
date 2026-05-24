@@ -16,6 +16,10 @@ def generate_sandbox_code(config: RuntimeConfig, input_text: str) -> str:
     return _extract_code(text)
 
 
+def complete_response(config: RuntimeConfig, input_text: str, instructions: str = "") -> str:
+    return _complete_response(config, input_text, instructions)
+
+
 def stream_response(config: RuntimeConfig, input_text: str, instructions: str = "") -> Iterable[tuple[str, str]]:
     if not config.model:
         raise ValueError("モデルが未設定です。config.tomlに model または default_model を設定してください。")

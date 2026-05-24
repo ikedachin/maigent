@@ -4,3 +4,12 @@ __pycache__/
 db.sqlite3
 .pytest_cache/
 .coverage
+
+
+# 設定ファイル
+.maigent/*
+!.maigent/config.yaml.sample
+
+# memo
+残タスク.md
+

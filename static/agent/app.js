@@ -31,6 +31,8 @@ const translations = {
     state: "状態",
     noConfig: "設定なし",
     ragTopK: "RAG top_k",
+    finalEvaluation: "最終評価",
+    finalEvaluationRetries: "最終評価リトライ",
     saveSettings: "設定を保存",
     tools: "ツール",
     accessPaths: "アクセス許可",
@@ -83,6 +85,7 @@ const translations = {
     streaming: "生成中",
     running: "実行中",
     preparing: "準備中",
+    partialProgress: "進行ログ（一部・最新3行）",
     error: "エラー",
     pending: "待機中",
     copy: "コピー",
@@ -116,6 +119,8 @@ const translations = {
     state: "State",
     noConfig: "No config loaded",
     ragTopK: "RAG top_k",
+    finalEvaluation: "Final evaluation",
+    finalEvaluationRetries: "Final evaluation retries",
     saveSettings: "Save settings",
     tools: "Tools",
     accessPaths: "Access paths",
@@ -168,6 +173,7 @@ const translations = {
     streaming: "streaming",
     running: "running",
     preparing: "preparing",
+    partialProgress: "Progress log (partial, latest 3 lines)",
     error: "error",
     pending: "pending",
     copy: "Copy",
@@ -275,9 +281,23 @@ function appendMessage(role, content, status) {
   }
   meta.append(roleNode, actions);
   article.append(meta, pre);
+  let progress = null;
+  if (role === "assistant") {
+    progress = document.createElement("div");
+    progress.className = "message-progress";
+    progress.hidden = true;
+    const label = document.createElement("div");
+    label.className = "message-progress-label";
+    label.dataset.i18n = "partialProgress";
+    label.textContent = t("partialProgress");
+    const list = document.createElement("ol");
+    list.className = "message-progress-lines";
+    progress.append(label, list);
+    article.append(progress);
+  }
   container.append(article);
   scrollMessagesToBottom();
-  return { article, pre, meta };
+  return { article, pre, meta, progress };
 }
 
 function setActivity(active, key = "running") {
@@ -310,6 +330,9 @@ function streamAssistant(url, node) {
   const source = new EventSource(url);
   source.onmessage = (event) => {
     const payload = JSON.parse(event.data);
+    if (payload.progress_tail) {
+      updateProgressTail(node, payload.progress_tail, payload.progress_truncated);
+    }
     if (payload.delta) {
       if (node.pre.classList.contains("message-loading")) {
         node.pre.className = "";
@@ -346,6 +369,20 @@ function streamAssistant(url, node) {
     setActivity(false);
     source.close();
   };
+}
+
+function updateProgressTail(node, lines, truncated) {
+  if (!node.progress) return;
+  const list = node.progress.querySelector(".message-progress-lines");
+  if (!list) return;
+  list.innerHTML = "";
+  lines.forEach((line) => {
+    const item = document.createElement("li");
+    item.textContent = line;
+    list.append(item);
+  });
+  node.progress.classList.toggle("truncated", Boolean(truncated));
+  node.progress.hidden = lines.length === 0;
 }
 
 async function copyText(text) {
@@ -385,6 +422,28 @@ function setupMessageCopy() {
       button.setAttribute("aria-label", t("copyMessage"));
     }, 1400);
   });
+}
+
+function setupSettingsToggle() {
+  const button = document.querySelector("[data-settings-toggle]");
+  const bodies = Array.from(document.querySelectorAll("[data-settings-panel-body]"));
+  if (!button || bodies.length === 0) return;
+  const storageKey = "maigent.settingsGroupCollapsed";
+
+  const setCollapsed = (collapsed) => {
+    bodies.forEach((body) => {
+      body.hidden = collapsed;
+      body.classList.toggle("is-collapsed", collapsed);
+    });
+    button.setAttribute("aria-expanded", collapsed ? "false" : "true");
+    button.classList.toggle("is-collapsed", collapsed);
+    button.textContent = t("config");
+    localStorage.setItem(storageKey, collapsed ? "true" : "false");
+  };
+
+  const savedState = localStorage.getItem(storageKey);
+  setCollapsed(savedState === null ? true : savedState === "true");
+  button.addEventListener("click", () => setCollapsed(!bodies.every((body) => body.hidden)));
 }
 
 const directoryPicker = {
@@ -504,13 +563,23 @@ document.addEventListener("DOMContentLoaded", () => {
   });
   setupDirectoryPicker();
   setupMessageCopy();
+  setupSettingsToggle();
 
   const form = document.querySelector("#chat-form");
   if (!form) return;
+  const messageInput = form.querySelector("textarea[name=message]");
+
+  messageInput?.addEventListener("keydown", (event) => {
+    if (event.key !== "Enter" || event.shiftKey || event.isComposing || event.keyCode === 229) {
+      return;
+    }
+    event.preventDefault();
+    form.requestSubmit();
+  });
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
-    const textarea = form.querySelector("textarea[name=message]");
+    const textarea = messageInput || form.querySelector("textarea[name=message]");
     const text = textarea.value.trim();
     if (!text) return;
 

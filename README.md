@@ -15,20 +15,25 @@ docker build -t maigent-sandbox:py311 docker/sandbox
 uv run python manage.py runserver
 ```
 
-設定は `~/.maigent/config.toml` と、プロジェクト内の `.maigent/config.toml` から読みます。プロジェクト設定がユーザー設定を上書きします。
+設定は `~/.maigent/config.yaml` と、プロジェクト内の `.maigent/config.yaml` から読みます。プロジェクト設定がユーザー設定を上書きします。
 
-```toml
-model = "gpt-5"
-api_key = "sk-..."
-base_url = "https://api.openai.com/v1"
-api_mode = "auto"
+```yaml
+model: gpt-5
+api_key: sk-...
+base_url: https://api.openai.com/v1
+api_mode: auto
+
+final_evaluation:
+  enabled: false
+  max_retries: 3
 ```
 
 `model` または `default_model` は必須です。APIキーはDBへ保存しません。
+`final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。
 
 ## Tool configuration
 
-`.maigent/config.yaml` でツールを管理できます。
+`.maigent/config.yaml` の `tools` でツールを管理できます。
 
 ```yaml
 tools:

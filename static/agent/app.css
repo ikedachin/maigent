@@ -247,6 +247,57 @@ textarea:focus {
   margin-bottom: 10px;
 }
 
+.panel-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.panel-heading h2 {
+  margin-bottom: 0;
+}
+
+.panel-title-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  color: var(--muted);
+  background: transparent;
+  font: inherit;
+  text-transform: inherit;
+}
+
+.panel-title-button::before {
+  content: "";
+  width: 0;
+  height: 0;
+  border-top: 4px solid transparent;
+  border-bottom: 4px solid transparent;
+  border-left: 6px solid currentColor;
+  transform: rotate(90deg);
+}
+
+.panel-title-button.is-collapsed::before {
+  transform: rotate(0deg);
+}
+
+.panel-title-button:hover {
+  border-color: transparent;
+  box-shadow: none;
+  color: var(--ink);
+  transform: none;
+}
+
+.settings-panel-body[hidden],
+.settings-panel-body.is-collapsed {
+  display: none;
+}
+
 .list,
 .stack-form,
 .approval-list {
@@ -262,6 +313,16 @@ textarea:focus {
   display: grid;
   gap: 6px;
   color: var(--muted);
+}
+
+.setting-form .checkbox-label {
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: center;
+  justify-content: start;
+}
+
+.setting-form .checkbox-label input {
+  width: auto;
 }
 
 .path-picker-row {
@@ -552,6 +613,43 @@ textarea:focus {
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-family: inherit;
+}
+
+.message-progress {
+  display: grid;
+  gap: 6px;
+  margin-top: 12px;
+  padding: 10px;
+  border: 1px dashed var(--line);
+  border-radius: 8px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.message-progress[hidden] {
+  display: none;
+}
+
+.message-progress-label {
+  font-weight: 700;
+  color: var(--ink);
+}
+
+.message-progress.truncated .message-progress-label::after {
+  content: " ...";
+  color: var(--muted);
+}
+
+.message-progress-lines {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.message-progress-lines li {
+  overflow-wrap: anywhere;
 }
 
 .message-loading {

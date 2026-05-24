@@ -386,6 +386,8 @@ flowchart TD
     Command -- "/fork" --> Fork["Copy current thread\nand messages to new thread"]
     Command -- "/read" --> Read["Read file"]
     Command -- "/ls" --> List["List folder"]
+    Command -- "/write" --> Write["Write file"]
+    Command -- "/append" --> Append["Append file"]
     Command -- "/file or /files" --> File{"Path argument exists?"}
     File -- "No" --> AccessList["List allowed access paths"]
     File -- "Yes, directory" --> List
@@ -403,6 +405,15 @@ flowchart TD
     AllowedList -- "Yes" --> IsDir{"Exists and is directory?"}
     IsDir -- "Yes" --> ReturnList["Return up to 80 children"]
     IsDir -- "No" --> ListError["Return specific error"]
+    Write --> WriteFlag{"FeatureFlag file_write enabled?"}
+    Append --> WriteFlag
+    WriteFlag -- "No" --> DenyWriteFlag["Return feature disabled"]
+    WriteFlag -- "Yes" --> NormalizeWrite["Resolve path"]
+    NormalizeWrite --> AllowedWrite{"is_path_allowed(write)?"}
+    AllowedWrite -- "No" --> DenyWrite["Return write denied"]
+    AllowedWrite -- "Yes" --> WriteTarget{"Parent exists\nand target is not directory?"}
+    WriteTarget -- "No" --> WriteError["Return specific error"]
+    WriteTarget -- "Yes" --> WriteFile["Write or append UTF-8 text"]
 ```
 
 ### プロジェクト、スレッド、承認、アクセス許可
@@ -419,6 +430,7 @@ flowchart TD
     HasThread -- "No" --> RecreateMain["Create Main thread\nthen redirect"]
     Action -- "Add Access Path" --> AddPath["Normalize path\nget_or_create ProjectAccessPath"]
     Action -- "Delete Access Path" --> DeletePath["Delete ProjectAccessPath"]
+    Action -- "Toggle Feature Flag" --> ToggleFlag["Update FeatureFlag.enabled"]
     Action -- "Create Approval" --> CreateApproval["Create ApprovalRequest\nstatus=pending"]
     Action -- "Approve/Reject" --> ApprovalAction["Update ApprovalRequest.status"]
     Action -- "Save Settings" --> SaveSettings["Clamp rag_top_k and final_evaluation retries\nsave AppSetting"]

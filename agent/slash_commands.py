@@ -7,6 +7,7 @@ from .config import RuntimeConfig
 from .models import FeatureFlag, Message, Thread
 
 MAX_READ_CHARS = 12000
+FILE_WRITE_FEATURE_FLAG = "file_write"
 
 
 def handle_slash_command(thread: Thread, command_text: str, config: RuntimeConfig) -> str:
@@ -39,6 +40,12 @@ def handle_slash_command(thread: Thread, command_text: str, config: RuntimeConfi
 
     if command in {"/file", "/files"}:
         return _handle_file(thread, parts)
+
+    if command == "/write":
+        return _handle_write(thread, command_text, append=False)
+
+    if command == "/append":
+        return _handle_write(thread, command_text, append=True)
 
     if command == "/compact":
         messages = thread.messages.order_by("-created_at")[:12]
@@ -125,6 +132,54 @@ def _handle_file(thread: Thread, parts: list[str]) -> str:
     lines.append("")
     lines.append("使い方: /file <path> または /read <file-path> / /ls <folder-path>")
     return "\n".join(lines)
+
+
+def _handle_write(thread: Thread, command_text: str, append: bool = False) -> str:
+    if not _file_write_enabled():
+        return (
+            "ファイル書き込み機能が無効です。"
+            "右側の機能フラグで file_write を有効化するか、/features enable file_write を実行してください。"
+        )
+    command = "/append" if append else "/write"
+    body = command_text[len(command) :].lstrip()
+    path_text = ""
+    content = ""
+    if "\n" in body:
+        path_text, content = body.split("\n", 1)
+        path_text = path_text.strip()
+    elif " -- " in body:
+        path_text, content = body.split(" -- ", 1)
+        path_text = path_text.strip()
+    if not path_text:
+        return f"使い方: {command} <file-path> -- <content> または {command} <file-path> の次行に本文"
+    target = Path(path_text).expanduser()
+    try:
+        resolved = target.resolve()
+    except OSError as exc:
+        return f"書き込み先の確認に失敗しました: {exc}"
+    if not is_path_allowed(thread.project, str(resolved), write=True):
+        return "書き込みが許可されていません。右側のアクセス許可に、このファイルまたは親フォルダを読み書きで追加してください。"
+    if resolved.exists() and resolved.is_dir():
+        return f"書き込み先がフォルダです: {resolved}"
+    if not resolved.parent.exists():
+        return f"親フォルダが存在しません: {resolved.parent}"
+    if not resolved.parent.is_dir():
+        return f"親パスがフォルダではありません: {resolved.parent}"
+    try:
+        if append:
+            with resolved.open("a", encoding="utf-8") as handle:
+                handle.write(content)
+        else:
+            resolved.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return f"書き込みに失敗しました: {exc}"
+    action = "追記" if append else "書き込み"
+    return f"{action}しました: {resolved}\n文字数: {len(content)}"
+
+
+def _file_write_enabled() -> bool:
+    flag = FeatureFlag.objects.filter(name=FILE_WRITE_FEATURE_FLAG).first()
+    return True if flag is None else flag.enabled
 
 
 def _handle_ls(thread: Thread, parts: list[str]) -> str:

@@ -7,6 +7,7 @@ urlpatterns = [
     path("threads/<int:thread_id>/", views.dashboard, name="thread"),
     path("browse-directories/", views.browse_directories, name="browse_directories"),
     path("settings/rag/", views.update_rag_settings, name="update_rag_settings"),
+    path("feature-flags/<int:flag_id>/", views.update_feature_flag, name="update_feature_flag"),
     path("projects/", views.create_project, name="create_project"),
     path("projects/<int:project_id>/switch/", views.switch_project, name="switch_project"),
     path("projects/<int:project_id>/threads/", views.create_thread, name="create_thread"),

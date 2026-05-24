@@ -30,6 +30,12 @@ from .tooling import (
 
 logger = logging.getLogger("agent")
 
+BUILTIN_FEATURE_FLAGS = {
+    "file_write": {
+        "enabled": True,
+        "description": "Allow /write and /append slash commands after write access path validation.",
+    },
+}
 MAX_CONTEXT_FILE_CHARS = 8000
 AUTO_CONTEXT_FILE_CHARS = 3000
 AUTO_CONTEXT_MAX_FILES = 3
@@ -82,8 +88,14 @@ def _ensure_defaults() -> tuple[Project, Thread]:
     return project, thread
 
 
+def _ensure_builtin_feature_flags() -> None:
+    for name, defaults in BUILTIN_FEATURE_FLAGS.items():
+        FeatureFlag.objects.get_or_create(name=name, defaults=defaults)
+
+
 def dashboard(request, thread_id=None):
     project, thread = _ensure_defaults()
+    _ensure_builtin_feature_flags()
     if thread_id:
         thread = get_object_or_404(Thread, id=thread_id)
         project = thread.project
@@ -142,6 +154,20 @@ def update_rag_settings(request):
     max_retries = max(0, min(3, max_retries))
     AppSetting.objects.update_or_create(key="final_evaluation_enabled", defaults={"value": "true" if enabled else "false"})
     AppSetting.objects.update_or_create(key="final_evaluation_max_retries", defaults={"value": str(max_retries)})
+    return redirect(request.POST.get("next") or "dashboard")
+
+
+@require_POST
+def update_feature_flag(request, flag_id):
+    flag = get_object_or_404(FeatureFlag, id=flag_id)
+    action = request.POST.get("action")
+    if action == "enable":
+        flag.enabled = True
+    elif action == "disable":
+        flag.enabled = False
+    else:
+        raise Http404("Unknown feature flag action")
+    flag.save(update_fields=["enabled", "updated_at"])
     return redirect(request.POST.get("next") or "dashboard")
 
 

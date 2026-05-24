@@ -453,6 +453,29 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
+.feature-flag-list {
+  display: grid;
+  gap: 8px;
+}
+
+.feature-flag-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+}
+
+.feature-flag-item small {
+  display: block;
+  margin-top: 6px;
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+
 .language-toggle {
   display: inline-grid;
   grid-template-columns: 1fr 1fr;

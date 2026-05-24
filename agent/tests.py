@@ -244,6 +244,22 @@ class ChatFlowTests(TestCase):
         self.assertEqual(AppSetting.objects.get(key="final_evaluation_enabled").value, "true")
         self.assertEqual(AppSetting.objects.get(key="final_evaluation_max_retries").value, "3")
 
+    def test_dashboard_creates_builtin_file_write_flag(self):
+        response = self.client.get(reverse("dashboard"))
+
+        self.assertEqual(response.status_code, 200)
+        flag = FeatureFlag.objects.get(name="file_write")
+        self.assertTrue(flag.enabled)
+
+    def test_update_feature_flag_toggles_flag(self):
+        flag = FeatureFlag.objects.create(name="file_write", enabled=True)
+
+        response = self.client.post(reverse("update_feature_flag", args=[flag.id]), {"action": "disable"})
+
+        self.assertEqual(response.status_code, 302)
+        flag.refresh_from_db()
+        self.assertFalse(flag.enabled)
+
     def test_slash_status_returns_assistant_message(self):
         FeatureFlag.objects.create(name="web_search", enabled=True)
         response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/status"})
@@ -324,6 +340,68 @@ class ChatFlowTests(TestCase):
 
         self.assertIn("note body", file_response.json()["content"])
         self.assertIn("[file] note.txt", folder_response.json()["content"])
+
+    def test_write_command_writes_allowed_file(self):
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            file_path = root / "created.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"/write {file_path} -- hello write"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("書き込みしました", response.json()["content"])
+            self.assertEqual(file_path.read_text(encoding="utf-8"), "hello write")
+
+    def test_write_command_rejects_disabled_file_write_flag(self):
+        FeatureFlag.objects.create(name="file_write", enabled=False)
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            file_path = root / "blocked.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"/write {file_path} -- blocked"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("ファイル書き込み機能が無効です", response.json()["content"])
+            self.assertFalse(file_path.exists())
+
+    def test_write_command_rejects_read_only_access(self):
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            file_path = root / "blocked.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"/write {file_path} -- blocked"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("書き込みが許可されていません", response.json()["content"])
+            self.assertFalse(file_path.exists())
+
+    def test_append_command_appends_allowed_file(self):
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            file_path = root / "note.txt"
+            file_path.write_text("first", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"/append {file_path} -- second"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("追記しました", response.json()["content"])
+            self.assertEqual(file_path.read_text(encoding="utf-8"), "firstsecond")
 
     def test_fork_command_copies_messages(self):
         Message.objects.create(thread=self.thread, role="user", content="before")

@@ -6,7 +6,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from .access import is_path_allowed, normalize_access_path
-from .config import load_runtime_config
+from .config import RuntimeConfig, load_runtime_config
 from .openai_client import stream_response
 from .models import AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .tooling import (
@@ -70,6 +70,88 @@ class ConfigTests(TestCase):
                 config = load_runtime_config("")
 
             self.assertEqual(config.api_mode, "chat")
+
+    def test_provider_config_selects_first_enabled_provider(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "openai": {"enabled": False, "model": "gpt"},
+                    "ollama": {"enabled": True, "model": "llama3.1"},
+                    "openrouter": {"enabled": True, "model": "openai/gpt-4o-mini", "api_key": "router-key"},
+                }
+            },
+            sources=[],
+        )
+
+        self.assertEqual(config.active_provider, "ollama")
+        self.assertEqual(config.model, "llama3.1")
+        self.assertEqual(config.base_url, "http://localhost:11434/v1")
+        self.assertEqual(config.api_mode, "chat")
+        self.assertEqual(config.api_key, "")
+
+    def test_openrouter_provider_uses_provider_api_key_and_redacts_it(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "openrouter": {
+                        "enabled": True,
+                        "model": "openai/gpt-4o-mini",
+                        "api_key": "router-key",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        self.assertEqual(config.active_provider, "openrouter")
+        self.assertEqual(config.api_key, "router-key")
+        self.assertEqual(config.base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(config.redacted()["providers"]["openrouter"]["api_key"], "********")
+
+    def test_bedrock_provider_exposes_credentials_and_redacts_them(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "bedrock": {
+                        "enabled": True,
+                        "model": "anthropic.model",
+                        "region": "ap-northeast-1",
+                        "aws_access_key_id": "access",
+                        "aws_secret_access_key": "secret",
+                        "aws_session_token": "token",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        self.assertEqual(
+            config.bedrock_credentials,
+            {
+                "aws_access_key_id": "access",
+                "aws_secret_access_key": "secret",
+                "aws_session_token": "token",
+            },
+        )
+        safe = config.redacted()["providers"]["bedrock"]
+        self.assertEqual(safe["aws_access_key_id"], "********")
+        self.assertEqual(safe["aws_secret_access_key"], "********")
+        self.assertEqual(safe["aws_session_token"], "********")
+
+    def test_all_providers_disabled_disables_model_resolution(self):
+        config = RuntimeConfig(
+            values={
+                "model": "legacy-model",
+                "providers": {
+                    "openai": {"enabled": False, "model": "gpt"},
+                    "bedrock": {"enabled": False, "model": "anthropic.model"},
+                },
+            },
+            sources=[],
+        )
+
+        self.assertEqual(config.active_provider, "")
+        self.assertEqual(config.model, "")
 
     def test_yaml_config_loads_tools_and_sandbox_libraries(self):
         with TemporaryDirectory() as app_dir:
@@ -1125,3 +1207,103 @@ class OpenAIClientTests(TestCase):
             events = list(stream_response(Config(), "hello", "system"))
 
         self.assertEqual(events, [("delta", "ok"), ("response_id", "chat_1")])
+
+    def test_ollama_uses_openai_compatible_client_with_default_base_url_and_dummy_key(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "ollama": {
+                        "enabled": True,
+                        "model": "llama3.1",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                message = type("Message", (), {"content": "local ok"})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Response", (), {"choices": [choice]})()
+
+        class Chat:
+            completions = ChatCompletions()
+
+        class Client:
+            chat = Chat()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()) as mock_openai:
+            from .openai_client import complete_response
+
+            result = complete_response(config, "hello")
+
+        self.assertEqual(result, "local ok")
+        mock_openai.assert_called_once_with(api_key="ollama", base_url="http://localhost:11434/v1")
+
+    def test_azure_provider_uses_azure_client(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "azure": {
+                        "enabled": True,
+                        "model": "deployment",
+                        "api_key": "azure-key",
+                        "azure_endpoint": "https://example.openai.azure.com",
+                        "api_version": "2024-02-15-preview",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                message = type("Message", (), {"content": "azure ok"})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Response", (), {"choices": [choice]})()
+
+        class Chat:
+            completions = ChatCompletions()
+
+        class Client:
+            chat = Chat()
+
+        with patch("agent.openai_client.AzureOpenAI", return_value=Client()) as mock_azure:
+            from .openai_client import complete_response
+
+            result = complete_response(config, "hello")
+
+        self.assertEqual(result, "azure ok")
+        mock_azure.assert_called_once_with(
+            api_key="azure-key",
+            azure_endpoint="https://example.openai.azure.com",
+            api_version="2024-02-15-preview",
+        )
+
+    def test_bedrock_provider_uses_converse(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "bedrock": {
+                        "enabled": True,
+                        "model": "anthropic.test-model",
+                        "region": "ap-northeast-1",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class BedrockClient:
+            def converse(self, **kwargs):
+                self.kwargs = kwargs
+                return {"output": {"message": {"content": [{"text": "bedrock ok"}]}}}
+
+        with patch("agent.openai_client._bedrock_client", return_value=BedrockClient()):
+            from .openai_client import complete_response
+
+            result = complete_response(config, "hello", "system")
+
+        self.assertEqual(result, "bedrock ok")

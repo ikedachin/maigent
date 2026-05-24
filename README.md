@@ -15,7 +15,7 @@ docker build -t maigent-sandbox:py311 docker/sandbox
 uv run python manage.py runserver
 ```
 
-設定は `~/.maigent/config.yaml` と、プロジェクト内の `.maigent/config.yaml` から読みます。プロジェクト設定がユーザー設定を上書きします。
+設定は `config.toml` または `config.yaml` で管理します。読み込み順は `~/.maigent/`、アプリ直下の `.maigent/`、プロジェクト内の `.maigent/` です。後から読み込まれた設定が前の設定を上書きします。
 
 ```yaml
 model: gpt-5
@@ -28,8 +28,68 @@ final_evaluation:
   max_retries: 3
 ```
 
-`model` または `default_model` は必須です。APIキーはDBへ保存しません。
-`final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。
+`providers` を使わない場合は、上記のトップレベル設定をOpenAI互換APIとして扱います。`model` または `default_model` は必須です。`OPENAI_MODEL` はモデル未設定時のみ補完に使われます。APIキーはDBへ保存しません。
+
+`final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。画面から保存した最終評価設定はDBの `AppSetting` に保存され、設定ファイル値より優先されます。
+
+YAMLローダーはこのアプリ内の簡易実装です。基本的なネスト、真偽値、整数、リストには対応しますが、一般的なYAMLの全機能を使う設定は `config.toml` を推奨します。
+
+## LLM provider configuration
+
+`providers.<name>.enabled` で使用するAPIを切り替えられます。複数を `true` にした場合は `openai`, `ollama`, `lmstudio`, `openrouter`, `azure`, `bedrock` の順で最初に有効なものを使用します。`providers` を書いたうえで全て `false` にした場合、active provider はなしになり、モデル未設定として扱われます。
+ちなみに、作者が確認できているのはOpenAI互換APIのみです。
+
+```yaml
+providers:
+  openai:
+    enabled: true
+    model: gpt-5
+    api_key: sk-...
+    api_mode: auto
+
+  ollama:
+    enabled: false
+    model: llama3.1
+    base_url: http://localhost:11434/v1
+    api_mode: chat
+
+  lmstudio:
+    enabled: false
+    model: local-model
+    base_url: http://localhost:1234/v1
+    api_mode: chat
+
+  openrouter:
+    enabled: false
+    model: openai/gpt-4o-mini
+    api_key: sk-or-...
+    base_url: https://openrouter.ai/api/v1
+    api_mode: chat
+    http_referer: http://localhost:8000
+    x_title: Maigent Agent Web
+
+  azure:
+    enabled: false
+    model: azure-deployment-name
+    api_key: azure-key-...
+    azure_endpoint: https://your-resource.openai.azure.com
+    api_version: 2024-02-15-preview
+    api_mode: chat
+
+  bedrock:
+    enabled: false
+    model: anthropic.claude-3-5-sonnet-20240620-v1:0
+    region: ap-northeast-1
+    profile: default
+    # profileの代わりにキーを設定する場合:
+    # aws_access_key_id: ...
+    # aws_secret_access_key: ...
+    # aws_session_token: ...
+```
+
+OllamaとLM StudioはOpenAI互換の `/v1` エンドポイントを使うため、APIキー未指定でもローカル用のダミーキーで接続します。OpenRouterはOpenAI互換APIとして扱い、任意で `http_referer` と `x_title` をヘッダーへ付与できます。Azureは `AzureOpenAI` クライアント、AWS Bedrockは `boto3` の Converse API を使用します。
+
+環境変数も利用できます。OpenAIは `OPENAI_API_KEY` / `OPENAI_BASE_URL`、OpenRouterは `OPENROUTER_API_KEY` / `OPENROUTER_BASE_URL`、Azureは `AZURE_OPENAI_API_KEY` / `AZURE_OPENAI_ENDPOINT`、Bedrockは `AWS_REGION` / `AWS_DEFAULT_REGION` / `AWS_PROFILE` を参照します。Bedrockは設定ファイル内の `aws_access_key_id` / `aws_secret_access_key` / `aws_session_token` も利用できます。
 
 ## Tool configuration
 
@@ -85,3 +145,281 @@ docker run --rm maigent-sandbox:py311 python --version
 ```
 
 `.maigent/config.yaml` の `tools.sandbox.image` が `maigent-sandbox:py311` を指していれば、このアプリはそのイメージを使います。標準の `docker/sandbox/Dockerfile` には、CSV/Excel処理、PDF/Word/PowerPoint処理、グラフ作成、HTML解析、HTTP取得で使う一般的な事務作業向けライブラリを事前インストールしています。ライブラリを追加する場合はDockerfileにも追記し、もう一度 `docker build -t maigent-sandbox:py311 docker/sandbox` を実行してください。実行時インストールが必要な場合だけ `.maigent/config.yaml` で `install_libraries_on_run: true` にします。
+
+## Program flow
+
+### 全体構成
+
+```mermaid
+flowchart LR
+    Browser["Browser UI\nagent/dashboard.html + static/agent/app.js"]
+    Views["Django views\nagent/views.py"]
+    Models["Django models\nProject / Thread / Message / Settings"]
+    Config["RuntimeConfig\nagent/config.py"]
+    Planner["Agent planner/tool selector\nagent/tooling.py"]
+    Client["LLM client\nagent/openai_client.py"]
+    Commands["Slash commands\nagent/slash_commands.py"]
+    Access["Path access control\nagent/access.py"]
+    Docker["Docker sandbox\nmaigent-sandbox:py311"]
+    Files["Allowed local files"]
+    LLM["LLM providers\nOpenAI / Ollama / LM Studio / OpenRouter / Azure / Bedrock"]
+
+    Browser <--> Views
+    Views <--> Models
+    Views --> Config
+    Views --> Commands
+    Views --> Planner
+    Views --> Client
+    Commands --> Access
+    Access --> Files
+    Planner --> Access
+    Planner --> Docker
+    Client --> LLM
+```
+
+### 起動・初期表示
+
+```mermaid
+flowchart TD
+    Start["GET / または /threads/<thread_id>/"] --> EnsureDefaults["_ensure_defaults()"]
+    EnsureDefaults --> HasProject{"Project exists?"}
+    HasProject -- "No" --> CreateDefault["Create Default Project"]
+    CreateDefault --> CreateMain["Create Main thread"]
+    HasProject -- "Yes" --> PickProject["Use current Project\nor first Project"]
+    PickProject --> IsCurrent{"is_current?"}
+    IsCurrent -- "No" --> MarkCurrent["Set all Projects is_current=false\nand selected Project=true"]
+    IsCurrent -- "Yes" --> PickThread["Pick requested Thread\nor first Project thread"]
+    MarkCurrent --> PickThread
+    CreateMain --> LoadConfig
+    PickThread --> LoadConfig["load_runtime_config(project.path)"]
+    LoadConfig --> LoadSettings["Load DB settings\nRAG top_k / final evaluation"]
+    LoadSettings --> Render["Render dashboard with\nprojects, threads, messages, tools,\naccess paths, approvals, automations"]
+```
+
+### 設定ファイル読み込みとプロバイダ選択
+
+```mermaid
+flowchart TD
+    Start["load_runtime_config(project_path)"] --> UserConfig["Read ~/.maigent/config.toml|yaml"]
+    UserConfig --> AppConfig["Read app .maigent/config.toml|yaml"]
+    AppConfig --> ProjectConfig{"project_path configured?"}
+    ProjectConfig -- "Yes" --> ReadProject["Read <project>/.maigent/config.toml|yaml"]
+    ProjectConfig -- "No" --> EnvModel
+    ReadProject --> EnvModel["If model is missing,\napply OPENAI_MODEL"]
+    EnvModel --> Runtime["RuntimeConfig(values, sources)"]
+    Runtime --> Providers{"providers exists?"}
+    Providers -- "No" --> Legacy["Use legacy OpenAI-compatible config\nmodel/api_key/base_url/api_mode"]
+    Providers -- "Yes" --> FirstEnabled["Select first enabled provider\nopenai -> ollama -> lmstudio -> openrouter -> azure -> bedrock"]
+    FirstEnabled --> AnyEnabled{"Any provider enabled?"}
+    AnyEnabled -- "No" --> Disabled["No active provider\nmodel resolves empty"]
+    AnyEnabled -- "Yes" --> Active["Resolve provider-specific\nmodel, key, endpoint, api_mode,\nheaders, Azure settings, Bedrock settings"]
+    Legacy --> Active
+    Active --> Redact["Redact sensitive values\nbefore dashboard display"]
+```
+
+### LLM client分岐
+
+```mermaid
+flowchart TD
+    Request["complete_response() / stream_response()"] --> Validate["Validate model and provider settings"]
+    Validate --> Provider{"active_provider"}
+
+    Provider -- "openai" --> OpenAICompat["OpenAI-compatible client"]
+    Provider -- "ollama" --> OpenAICompat
+    Provider -- "lmstudio" --> OpenAICompat
+    Provider -- "openrouter" --> OpenAICompat
+    Provider -- "azure" --> Azure["AzureOpenAI client"]
+    Provider -- "bedrock" --> Bedrock["boto3 bedrock-runtime client"]
+
+    OpenAICompat --> Mode{"api_mode"}
+    Mode -- "responses" --> Responses["Responses API"]
+    Mode -- "chat" --> Chat["Chat Completions API"]
+    Mode -- "auto" --> TryResponses["Try Responses API"]
+    TryResponses --> ResponsesOK{"Supported?"}
+    ResponsesOK -- "Yes" --> Responses
+    ResponsesOK -- "No" --> Chat
+
+    Azure --> AzureChat["Azure Chat Completions\nmodel is deployment name"]
+    Bedrock --> BedrockAuth["Use region/profile\nor configured AWS credentials"]
+    BedrockAuth --> Converse["Bedrock Converse / ConverseStream"]
+
+    Responses --> Output["Return text deltas and response_id"]
+    Chat --> Output
+    AzureChat --> Output
+    Converse --> Output
+```
+
+### メッセージ送信から回答生成
+
+```mermaid
+flowchart TD
+    Submit["POST /threads/<thread_id>/messages/"] --> ValidateMessage{"message is blank?"}
+    ValidateMessage -- "Yes" --> BadRequest["Return 400\nmessage is required"]
+    ValidateMessage -- "No" --> SaveUser["Create user Message"]
+    SaveUser --> LoadConfig["Load RuntimeConfig"]
+    LoadConfig --> Slash{"Starts with / ?"}
+    Slash -- "Yes" --> SlashCommand["handle_slash_command()"]
+    SlashCommand --> SaveCommandReply["Create assistant Message\nstatus=complete"]
+    SaveCommandReply --> CommandJson["Return JSON content"]
+
+    Slash -- "No" --> HasModel{"config.model exists?"}
+    HasModel -- "No" --> ModelError["Create assistant Message\nstatus=error"]
+    ModelError --> ErrorJson["Return 400"]
+    HasModel -- "Yes" --> CreateAssistant["Create assistant Message\nstatus=pending"]
+    CreateAssistant --> StreamUrl["Return stream_url"]
+
+    StreamUrl --> SSE["GET stream_url"]
+    SSE --> BuildInstructions["Build base instructions\nplus memory summary if enabled"]
+    BuildInstructions --> GenerateEval["_generate_with_final_evaluation()"]
+    GenerateEval --> SaveAssistant["Save assistant content,\nstatus, provider response_id"]
+    SaveAssistant --> Done["Emit SSE done"]
+```
+
+### エージェント計画とツール実行
+
+```mermaid
+flowchart TD
+    GenerateOnce["_generate_once()"] --> BuildPlan["build_agent_plan()"]
+    BuildPlan --> WebSearch{"web_search enabled\nand current/external topic?"}
+    WebSearch -- "Yes" --> AddWeb["Add web_search step\ncurrently marked not implemented"]
+    WebSearch -- "No" --> RagCheck
+    AddWeb --> RagCheck{"rag enabled\nand local context likely?"}
+    RagCheck -- "Yes" --> AddRag["Add rag step"]
+    RagCheck -- "No" --> SandboxCheck
+    AddRag --> SandboxCheck{"sandbox enabled\nand computation/code likely?"}
+    SandboxCheck -- "Yes" --> AddSandbox["Add sandbox step"]
+    SandboxCheck -- "No" --> AnyStep{"Any tool step?"}
+    AddSandbox --> AnyStep
+    AnyStep -- "No" --> Direct["Add final step"]
+    AnyStep -- "Yes" --> MaybeRagLLM
+    Direct --> MaybeRagLLM["_apply_llm_rag_decision()\nonly for direct-answer plans with\nallowed local context sources"]
+    MaybeRagLLM --> AvoidFailed["_avoid_failed_plan()"]
+    AvoidFailed --> Execute["_execute_agent_plan()"]
+    Execute --> FinalMessage{"Tool returned final message?"}
+    FinalMessage -- "Yes" --> ReturnTool["Return tool result as assistant content"]
+    FinalMessage -- "No" --> LLMAnswer["Call stream_response()\nfor final answer"]
+```
+
+### RAG処理
+
+```mermaid
+flowchart TD
+    RagStep["RAG step"] --> ShouldSearch{"Explicit path/file request\nor search-like text?"}
+    ShouldSearch -- "No" --> NoSearch["Return without search"]
+    ShouldSearch -- "Yes" --> HasAccess{"Project has allowed\nread/write paths?"}
+    HasAccess -- "No" --> NoContext["Return no_context"]
+    HasAccess -- "Yes" --> BuildQuery["Build query from user text\nor LLM RAG decision"]
+    BuildQuery --> CollectFiles["Collect allowed files\nwith supported extensions"]
+    CollectFiles --> AutoContext{"Direct file/path requested?"}
+    AutoContext -- "Yes" --> AttachDirect["Attach direct file context\nup to configured char limit"]
+    AutoContext -- "No" --> ListRequest{"File/folder list request?"}
+    ListRequest -- "Yes" --> AttachListings["Attach allowed directory listings"]
+    ListRequest -- "No" --> BM25["Rank candidates by BM25-like score"]
+    BM25 --> Adequate{"Top score >= threshold?"}
+    Adequate -- "Yes" --> AttachRanked["Attach top_k ranked snippets"]
+    Adequate -- "No" --> Judge{"LLM candidate judge available?"}
+    Judge -- "Yes" --> LLMJudge["Ask LLM to select relevant files"]
+    Judge -- "No" --> NoContext
+    LLMJudge --> Selected{"Relevant files selected?"}
+    Selected -- "Yes" --> AttachSelected["Attach selected file context"]
+    Selected -- "No" --> NoContext
+    AttachDirect --> Context["Return has_context"]
+    AttachListings --> Context
+    AttachRanked --> Context
+    AttachSelected --> Context
+```
+
+### Sandbox処理
+
+```mermaid
+flowchart TD
+    SandboxStep["Sandbox step"] --> CanBuild{"Can build deterministic\nPython locally?"}
+    CanBuild -- "Yes" --> LocalProgram["Use extracted Python,\nCSV/stat program, math expression,\nor numeric/count task program"]
+    CanBuild -- "No" --> GenerateCode["generate_sandbox_code()\nvia active LLM provider"]
+    GenerateCode --> CodeExists{"Generated code exists?"}
+    CodeExists -- "No" --> ContinueNoCode["Continue to final answer\nwith sandbox skipped trace"]
+    CodeExists -- "Yes" --> LocalProgram
+    LocalProgram --> TempScript["Write script.py to temp dir"]
+    TempScript --> InstallLibs{"install_libraries_on_run\nand allowed_libraries?"}
+    InstallLibs -- "Yes" --> DockerNet["docker run with network\npip install allowed libs\nthen python /work/script.py"]
+    InstallLibs -- "No" --> DockerNoNet["docker run --network none\npython /work/script.py"]
+    DockerNet --> Result{"Return code 0?"}
+    DockerNoNet --> Result
+    Result -- "Yes" --> Success["Return Sandbox実行結果: 成功"]
+    Result -- "No" --> Failure{"No executable code?\nor execution failure?"}
+    Failure -- "No executable code" --> ContinueNoCode
+    Failure -- "Execution failed" --> FailMessage["Return Sandbox実行結果: 失敗\nstdout/stderr"]
+```
+
+### 最終評価リトライ
+
+```mermaid
+flowchart TD
+    Start["_generate_with_final_evaluation()"] --> Settings["Read config values,\nthen DB AppSetting overrides"]
+    Settings --> Enabled{"final_evaluation.enabled?"}
+    Enabled -- "No" --> OneAttempt["Run one attempt\nand return result"]
+    Enabled -- "Yes" --> Attempts["attempts = max_retries + 1"]
+    Attempts --> Generate["_generate_once()"]
+    Generate --> AssistantError{"assistant status is error?"}
+    AssistantError -- "Yes" --> ReturnError["Return error result"]
+    AssistantError -- "No" --> Evaluate["_evaluate_final_answer()"]
+    Evaluate --> Adequate{"adequate?"}
+    Adequate -- "Yes" --> ReturnPass["Return answer"]
+    Adequate -- "No" --> More{"Attempts left?"}
+    More -- "Yes" --> RecordFailure["Record failed plan\nand retry feedback"]
+    RecordFailure --> Replan["Replan with different path\nfor example add RAG or remove sandbox"]
+    Replan --> Generate
+    More -- "No" --> ReturnWarning["Return last answer\nwith final-evaluation warning"]
+```
+
+### スラッシュコマンドとファイルアクセス
+
+```mermaid
+flowchart TD
+    Slash["handle_slash_command()"] --> Command{"Command"}
+    Command -- "/status" --> Status["Return project, thread,\nprovider, model, config sources,\nfeature flags"]
+    Command -- "/model" --> Model["Return active model"]
+    Command -- "/features" --> Features["List/enable/disable FeatureFlag"]
+    Command -- "/memories" --> Memories["Toggle Thread.memory_enabled"]
+    Command -- "/compact" --> Compact["Summarize latest messages\ninto Thread.summary"]
+    Command -- "/resume" --> Resume["List recent project threads"]
+    Command -- "/fork" --> Fork["Copy current thread\nand messages to new thread"]
+    Command -- "/read" --> Read["Read file"]
+    Command -- "/ls" --> List["List folder"]
+    Command -- "/file or /files" --> File{"Path argument exists?"}
+    File -- "No" --> AccessList["List allowed access paths"]
+    File -- "Yes, directory" --> List
+    File -- "Yes, file" --> Read
+
+    Read --> NormalizeRead["Resolve path"]
+    List --> NormalizeList["Resolve path"]
+    NormalizeRead --> AllowedRead{"is_path_allowed(read)?"}
+    NormalizeList --> AllowedList{"is_path_allowed(read)?"}
+    AllowedRead -- "No" --> DenyRead["Return read denied"]
+    AllowedList -- "No" --> DenyList["Return list denied"]
+    AllowedRead -- "Yes" --> ReadText{"Exists, is file,\nUTF-8 text?"}
+    ReadText -- "Yes" --> ReturnText["Return text\nmax 12000 chars"]
+    ReadText -- "No" --> ReadError["Return specific error"]
+    AllowedList -- "Yes" --> IsDir{"Exists and is directory?"}
+    IsDir -- "Yes" --> ReturnList["Return up to 80 children"]
+    IsDir -- "No" --> ListError["Return specific error"]
+```
+
+### プロジェクト、スレッド、承認、アクセス許可
+
+```mermaid
+flowchart TD
+    UI["Dashboard form action"] --> Action{"Action"}
+    Action -- "Create Project" --> CreateProject["Create Project\nset as current\ncreate Main thread"]
+    Action -- "Switch Project" --> SwitchProject["Set selected Project current\nopen first or new Main thread"]
+    Action -- "Create Thread" --> CreateThread["Create Thread under Project"]
+    Action -- "Delete Thread" --> DeleteThread["Delete Thread"]
+    DeleteThread --> HasThread{"Project still has threads?"}
+    HasThread -- "Yes" --> RedirectThread["Redirect to latest thread"]
+    HasThread -- "No" --> RecreateMain["Create Main thread\nthen redirect"]
+    Action -- "Add Access Path" --> AddPath["Normalize path\nget_or_create ProjectAccessPath"]
+    Action -- "Delete Access Path" --> DeletePath["Delete ProjectAccessPath"]
+    Action -- "Create Approval" --> CreateApproval["Create ApprovalRequest\nstatus=pending"]
+    Action -- "Approve/Reject" --> ApprovalAction["Update ApprovalRequest.status"]
+    Action -- "Save Settings" --> SaveSettings["Clamp rag_top_k and final_evaluation retries\nsave AppSetting"]
+```

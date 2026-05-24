@@ -21,6 +21,7 @@ def handle_slash_command(thread: Thread, command_text: str, config: RuntimeConfi
             [
                 f"Project: {thread.project.name}",
                 f"Thread: {thread.title}",
+                f"Provider: {getattr(config, 'active_provider', 'openai') or 'none'}",
                 f"Model: {config.model or '未設定'}",
                 f"Config sources: {sources}",
                 f"Feature flags: {flag_text}",

@@ -16,6 +16,7 @@ from .access import normalize_access_path
 from .config import load_runtime_config
 from .models import AppSetting, ApprovalRequest, Automation, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .openai_client import complete_response, generate_sandbox_code, stream_response
+from .prompt_loader import load_prompt
 from .slash_commands import handle_slash_command
 from .tooling import (
     AgentPlan,
@@ -359,10 +360,7 @@ def stream_message(request, thread_id, message_id):
 
 
 def _build_instructions(thread: Thread) -> str:
-    lines = [
-        "You are a pragmatic local coding agent inside a Django web app.",
-        "Do not claim to have executed shell commands. If execution is needed, propose an approval request.",
-    ]
+    lines = [load_prompt("base_instructions.txt")]
     if thread.memory_enabled and thread.summary:
         lines.append("Thread memory summary:")
         lines.append(thread.summary)
@@ -665,22 +663,8 @@ def _has_allowed_context_sources(thread: Thread) -> bool:
 
 
 def _decide_rag_with_llm(config, user_text: str) -> LlmRagDecision:
-    instructions = (
-        "Decide whether answering the user likely requires searching allowed local files. "
-        "Do not return JSON. Return a short plain-text decision using these labels:\n"
-        "RAG_REQUIRED or NO_RAG\n"
-        "QUERY: concise search words if RAG_REQUIRED\n"
-        "REASON: short reason"
-    )
-    prompt = "\n".join(
-        [
-            "User question:",
-            user_text,
-            "",
-            "If the question asks about a specific named thing, fictional setting, private project, document, dataset, or local knowledge, prefer RAG_REQUIRED.",
-            "If it is general knowledge, greeting, or purely conversational, use NO_RAG.",
-        ]
-    )
+    instructions = load_prompt("rag_decision_instructions.txt")
+    prompt = load_prompt("rag_decision_prompt.txt", user_text=user_text)
     _log_tail("llm_prompt", prompt, purpose="rag_decision")
     try:
         raw = complete_response(config, prompt, instructions)
@@ -714,33 +698,18 @@ def _tool_enabled(config, name: str, default: bool = False) -> bool:
 
 def _prepend_retry_feedback(input_text: str, retry_feedback: list[str]) -> str:
     feedback = "\n".join(f"- {reason}" for reason in retry_feedback[-3:])
-    return (
-        "Previous answer attempts failed final evaluation for these reasons:\n"
-        f"{feedback}\n\n"
-        "Use a different approach and directly address those failures before giving the final answer.\n\n"
-        f"{input_text}"
-    )
+    prefix = load_prompt("retry_feedback_prefix.txt", feedback=feedback)
+    return f"{prefix}\n\n{input_text}"
 
 
 def _evaluate_final_answer(config, user_text: str, goal: str, evaluation_criteria: list[str], answer: str) -> dict[str, object]:
-    instructions = (
-        "You are a strict final answer evaluator. Determine whether the answer sufficiently answers the user question. "
-        "Return JSON if possible with keys adequate and reason. If JSON is not possible, use labels ADEQUATE or INADEQUATE and REASON."
-    )
-    prompt = "\n".join(
-        [
-            "User question:",
-            user_text,
-            "",
-            "Goal set before planning:",
-            goal,
-            "",
-            "Evaluation criteria set before planning:",
-            "\n".join(f"- {criterion}" for criterion in evaluation_criteria),
-            "",
-            "Candidate answer:",
-            answer,
-        ]
+    instructions = load_prompt("final_evaluation_instructions.txt")
+    prompt = load_prompt(
+        "final_evaluation_prompt.txt",
+        user_text=user_text,
+        goal=goal,
+        evaluation_criteria="\n".join(f"- {criterion}" for criterion in evaluation_criteria),
+        answer=answer,
     )
     _log_tail("llm_prompt", prompt, purpose="final_evaluation")
     try:
@@ -1156,14 +1125,8 @@ def _judge_rag_candidate_paths_with_llm(
         )
     if not snippets:
         return []
-    instructions = (
-        "You judge whether candidate files are relevant context for answering a user query. "
-        "Prefer JSON: {\"relevant_indexes\": [1, 2], \"reason\": \"short reason\"}. "
-        "If JSON is not possible, return RELEVANT_INDEXES: 1, 2 and REASON: short reason. "
-        "Include an index only if the file likely contains information useful for answering the query. "
-        "Do not include files that merely share generic words but do not help answer."
-    )
-    prompt = "\n\n".join(["User query:", query, "Candidate files:", *snippets])
+    instructions = load_prompt("rag_candidate_judge_instructions.txt")
+    prompt = load_prompt("rag_candidate_judge_prompt.txt", query=query, candidate_files="\n\n".join(snippets))
     _log_tail("llm_prompt", prompt, thread_id=thread.id, purpose="rag_candidate_judge")
     try:
         raw = complete_response(config, prompt, instructions).strip()

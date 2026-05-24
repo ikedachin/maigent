@@ -3,15 +3,11 @@ from collections.abc import Iterable
 from openai import OpenAI
 
 from .config import RuntimeConfig
+from .prompt_loader import load_prompt
 
 
 def generate_sandbox_code(config: RuntimeConfig, input_text: str) -> str:
-    instructions = (
-        "You generate Python 3 code for a Docker sandbox. "
-        "Return only executable Python code, no Markdown fences, no explanations. "
-        "Use only data included in the user message. Do not read local files, use network, or require user input. "
-        "Print the final answer as plain text. Prefer csv, io, statistics, pandas when useful."
-    )
+    instructions = load_prompt("sandbox_code_generation_instructions.txt")
     text = _complete_response(config, input_text, instructions)
     return _extract_code(text)
 

@@ -162,6 +162,11 @@ class ConfigTests(TestCase):
             (app / ".maigent" / "config.yaml").write_text(
                 "\n".join(
                     [
+                        "final_evaluation:",
+                        "  enabled: true",
+                        "  max_retries: 2",
+                        "  max_output_tokens: 72",
+                        "  reasoning_effort: low",
                         "tools:",
                         "  rag:",
                         "    enabled: true",
@@ -186,6 +191,10 @@ class ConfigTests(TestCase):
             self.assertEqual(config.sandbox_timeout_seconds, 300)
             self.assertTrue(config.sandbox_install_libraries_on_run)
             self.assertEqual(config.sandbox_allowed_libraries, ["numpy", "pandas"])
+            self.assertTrue(config.final_evaluation_enabled)
+            self.assertEqual(config.final_evaluation_max_retries, 2)
+            self.assertEqual(config.final_evaluation_max_output_tokens, 72)
+            self.assertEqual(config.final_evaluation_reasoning_effort, "low")
 
     def test_final_evaluation_config_clamps_retries(self):
         with TemporaryDirectory() as app_dir:
@@ -197,6 +206,8 @@ class ConfigTests(TestCase):
                         "[final_evaluation]",
                         "enabled = true",
                         "max_retries = 9",
+                        "max_output_tokens = 96",
+                        'reasoning_effort = "minimal"',
                     ]
                 ),
                 encoding="utf-8",
@@ -207,6 +218,8 @@ class ConfigTests(TestCase):
 
             self.assertTrue(config.final_evaluation_enabled)
             self.assertEqual(config.final_evaluation_max_retries, 3)
+            self.assertEqual(config.final_evaluation_max_output_tokens, 96)
+            self.assertEqual(config.final_evaluation_reasoning_effort, "minimal")
 
 
 @override_settings(STATICFILES_DIRS=[])
@@ -475,6 +488,8 @@ class ChatFlowTests(TestCase):
             sources = []
             final_evaluation_enabled = True
             final_evaluation_max_retries = 1
+            final_evaluation_max_output_tokens = 80
+            final_evaluation_reasoning_effort = "minimal"
 
             def tool_enabled(self, name, default=False):
                 return False
@@ -505,6 +520,8 @@ class ChatFlowTests(TestCase):
         self.assertIn("Goal set before planning:", first_evaluation_prompt)
         self.assertIn("Evaluation criteria set before planning:", first_evaluation_prompt)
         self.assertIn("The answer directly addresses the user's request.", first_evaluation_prompt)
+        self.assertEqual(mock_complete.call_args_list[0].kwargs["max_output_tokens"], 80)
+        self.assertEqual(mock_complete.call_args_list[0].kwargs["reasoning_effort"], "minimal")
 
     def test_failed_final_evaluation_uses_different_plan(self):
         class Config:

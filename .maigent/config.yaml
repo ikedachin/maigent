@@ -86,3 +86,15 @@ tools:
       - tabulate
       - xlsxwriter
       - xlrd
+
+tools:
+  tool_selector:
+    enabled: true
+    reasoning_effort: none
+    max_output_tokens: 160
+
+final_evaluation:
+  enabled: false
+  max_retries: 3
+  reasoning_effort: none
+  max_output_tokens: 160

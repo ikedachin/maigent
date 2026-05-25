@@ -966,7 +966,13 @@ def _evaluate_final_answer(config, user_text: str, goal: str, evaluation_criteri
     )
     _log_tail("llm_prompt", prompt, purpose="final_evaluation")
     try:
-        raw = complete_response(config, prompt, instructions).strip()
+        raw = complete_response(
+            config,
+            prompt,
+            instructions,
+            max_output_tokens=_final_evaluation_max_output_tokens(config),
+            reasoning_effort=_final_evaluation_reasoning_effort(config),
+        ).strip()
     except Exception as exc:
         logger.exception("final_evaluation_error")
         return {"adequate": False, "reason": f"評価に失敗しました: {exc}"}
@@ -987,6 +993,16 @@ def _evaluate_final_answer(config, user_text: str, goal: str, evaluation_criteri
 
 def _text_value(text: str) -> dict[str, str]:
     return {"value": str(text or "")}
+
+
+def _final_evaluation_max_output_tokens(config) -> int:
+    value = getattr(config, "final_evaluation_max_output_tokens", 160)
+    return value if isinstance(value, int) and value > 0 else 160
+
+
+def _final_evaluation_reasoning_effort(config) -> str:
+    value = str(getattr(config, "final_evaluation_reasoning_effort", "none")).strip().lower()
+    return value if value in {"none", "minimal", "low", "medium", "high"} else "none"
 
 
 def _extract_labeled_value(text: str, label: str) -> str:

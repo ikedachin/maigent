@@ -605,17 +605,6 @@ textarea:focus {
   flex-shrink: 0;
 }
 
-.message-runtime {
-  padding: 2px 6px;
-  border: 1px solid var(--line);
-  border-radius: 999px;
-  color: var(--ink);
-  background: var(--panel-soft);
-  font-size: 11px;
-  line-height: 1.35;
-  opacity: 0.74;
-}
-
 .copy-message-button {
   min-width: 68px;
   padding: 5px 8px;

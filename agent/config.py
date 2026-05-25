@@ -190,6 +190,18 @@ class RuntimeConfig:
         except (TypeError, ValueError):
             return 3
 
+    @property
+    def final_evaluation_max_output_tokens(self) -> int:
+        try:
+            return max(1, min(1024, int(self.final_evaluation.get("max_output_tokens", 160))))
+        except (TypeError, ValueError):
+            return 160
+
+    @property
+    def final_evaluation_reasoning_effort(self) -> str:
+        value = str(self.final_evaluation.get("reasoning_effort", "none")).strip().lower()
+        return value if value in {"none", "minimal", "low", "medium", "high"} else "none"
+
     def tool_enabled(self, name: str, default: bool = False) -> bool:
         config = self.tools.get(name, {})
         if not isinstance(config, dict):

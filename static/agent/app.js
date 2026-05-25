@@ -317,16 +317,15 @@ function formatElapsed(ms) {
 function setElapsedTime(node, elapsedMs) {
   const label = formatElapsed(elapsedMs);
   if (!label) return;
-  const actions = node.meta.querySelector(".message-actions");
-  if (!actions) return;
-  let runtime = actions.querySelector(".message-runtime");
-  if (!runtime) {
-    runtime = document.createElement("small");
-    runtime.className = "message-runtime";
-    actions.insertBefore(runtime, actions.querySelector("[data-copy-message]"));
-  }
-  runtime.textContent = label;
-  runtime.title = t("elapsedTime");
+  const status = node.meta.querySelector("[data-status]");
+  if (!status) return;
+  const statusKey = status.dataset.status || "complete";
+  status.textContent = `${t(statusKey)} · ${label}`;
+  status.title = t("elapsedTime");
+}
+
+function updateLiveElapsedTime(node, startedAt) {
+  setElapsedTime(node, performance.now() - startedAt);
 }
 
 function setActivity(active, key = "running") {
@@ -357,6 +356,16 @@ function scrollMessagesToBottom(behavior = "smooth") {
 
 function streamAssistant(url, node) {
   const source = new EventSource(url);
+  const startedAt = performance.now();
+  updateLiveElapsedTime(node, startedAt);
+  const elapsedTimer = window.setInterval(() => {
+    updateLiveElapsedTime(node, startedAt);
+  }, 250);
+
+  function stopElapsedTimer() {
+    window.clearInterval(elapsedTimer);
+  }
+
   source.onmessage = (event) => {
     const payload = JSON.parse(event.data);
     if (payload.progress_tail) {
@@ -373,15 +382,25 @@ function streamAssistant(url, node) {
       node.article.classList.add("error");
       node.pre.className = "";
       node.pre.textContent = payload.error;
-      node.meta.querySelector("small").textContent = t("error");
+      const status = node.meta.querySelector("[data-status]");
+      if (status) {
+        status.dataset.status = "error";
+        status.textContent = t("error");
+      }
       setElapsedTime(node, payload.elapsed_ms);
+      stopElapsedTimer();
       setActivity(false);
       source.close();
     }
     if (payload.done) {
-      node.meta.querySelector("small").textContent = t("complete");
+      const status = node.meta.querySelector("[data-status]");
+      if (status) {
+        status.dataset.status = "complete";
+        status.textContent = t("complete");
+      }
       setElapsedTime(node, payload.elapsed_ms);
       node.article.classList.remove("streaming");
+      stopElapsedTimer();
       setActivity(false);
       source.close();
     }
@@ -393,10 +412,16 @@ function streamAssistant(url, node) {
   source.onerror = () => {
     node.article.classList.add("error");
     node.pre.className = "";
-    node.meta.querySelector("small").textContent = t("error");
+    const status = node.meta.querySelector("[data-status]");
+    if (status) {
+      status.dataset.status = "error";
+      status.textContent = t("error");
+    }
+    setElapsedTime(node, performance.now() - startedAt);
     if (!node.pre.textContent.trim()) {
       node.pre.textContent = t("error");
     }
+    stopElapsedTimer();
     setActivity(false);
     source.close();
   };

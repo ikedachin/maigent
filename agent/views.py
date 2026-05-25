@@ -2,6 +2,7 @@ import json
 import logging
 import math
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from django.views.decorators.http import require_POST
 from .access import is_path_allowed
 from .access import normalize_access_path
 from .config import RuntimeConfig, load_runtime_config
+from .file_broker import write_allowed_text_file
 from .models import AgentRun, AgentTaskRecord, AppSetting, ApprovalRequest, Automation, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .openai_client import complete_response, generate_sandbox_code, stream_response
 from .prompt_loader import load_prompt
@@ -73,6 +75,13 @@ class FinalEvaluationSettings:
 class LlmRagDecision:
     should_search: bool
     query: str
+    reason: str
+
+
+@dataclass(frozen=True)
+class LlmToolPlanDecision:
+    steps: list[AgentPlanStep]
+    rag_query: str
     reason: str
 
 
@@ -390,6 +399,7 @@ def stream_message(request, thread_id, message_id):
     config = load_runtime_config(thread.project.path)
 
     def events():
+        started_at = time.monotonic()
         progress_lines: list[str] = []
 
         def emit_progress(message: str):
@@ -425,14 +435,16 @@ def stream_message(request, thread_id, message_id):
                 assistant.openai_response_id or "",
             )
             _log_tail("final_answer", assistant.content, thread_id=thread.id, assistant_id=assistant.id)
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
             yield f"data: {json.dumps({'delta': assistant.content})}\n\n"
-            yield f"data: {json.dumps({'done': True, 'message_id': assistant.id})}\n\n"
+            yield f"data: {json.dumps({'done': True, 'message_id': assistant.id, 'elapsed_ms': elapsed_ms})}\n\n"
         except Exception as exc:
             assistant.content = str(exc)
             assistant.status = "error"
             assistant.save(update_fields=["content", "status"])
             logger.exception("agent_error thread_id=%s assistant_id=%s", thread.id, assistant.id)
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            elapsed_ms = int((time.monotonic() - started_at) * 1000)
+            yield f"data: {json.dumps({'error': str(exc), 'elapsed_ms': elapsed_ms})}\n\n"
 
     response = StreamingHttpResponse(events(), content_type="text/event-stream")
     response["Cache-Control"] = "no-cache"
@@ -601,8 +613,10 @@ def _generate_once(
     user_message: Message | None = None,
     assistant_message: Message | None = None,
 ):
-    plan = build_agent_plan(user_text, config)
-    plan = _apply_llm_rag_decision(thread, user_text, config, plan)
+    plan = _build_agent_plan_with_llm_tool_selection(thread, user_text, config)
+    if not plan:
+        plan = build_agent_plan(user_text, config)
+        plan = _apply_llm_rag_decision(thread, user_text, config, plan)
     plan = _avoid_failed_plan(plan, config, failed_plans)
     if progress:
         yield _sse(progress(f"Goal: {plan.goal}"))
@@ -716,6 +730,133 @@ def _avoid_failed_plan(plan: AgentPlan, config, failed_plans: list[str]) -> Agen
         failed_plans,
     )
     return fallback
+
+
+def _build_agent_plan_with_llm_tool_selection(thread: Thread, user_text: str, config) -> AgentPlan | None:
+    if not _tool_selector_llm_enabled(config):
+        return None
+    tools = _available_tool_specs(thread, config)
+    if not tools:
+        return None
+    decision = _select_tools_with_llm(config, user_text, tools)
+    if not decision or not decision.steps:
+        return None
+    goal = build_agent_goal(user_text)
+    criteria = build_agent_evaluation_criteria(user_text)
+    tool_names = [step.tool for step in decision.steps]
+    if "rag" in tool_names:
+        rag_criterion = "If local file context may contain the answer, the answer must use RAG context or clearly state that allowed files do not contain enough information."
+        if rag_criterion not in criteria:
+            criteria.append(rag_criterion)
+    if "sandbox" in tool_names:
+        sandbox_criterion = "If exact computation or code execution is requested, the answer includes the computed result and does not rely on unsupported mental arithmetic."
+        if sandbox_criterion not in criteria:
+            criteria.append(sandbox_criterion)
+    plan = AgentPlan(
+        goal=goal,
+        evaluation_criteria=criteria,
+        summary=_summarize_revised_plan(decision.steps, "LLM-selected tools"),
+        steps=decision.steps,
+        rag_query=decision.rag_query,
+    )
+    logger.debug(
+        "agent_tool_selection thread_id=%s reason=%r tools=%s rag_query=%r",
+        thread.id,
+        decision.reason[:240],
+        [step.tool for step in plan.steps],
+        decision.rag_query,
+    )
+    return plan
+
+
+def _select_tools_with_llm(config, user_text: str, tools: list[dict[str, str]]) -> LlmToolPlanDecision | None:
+    instructions = load_prompt("tool_selection_instructions.txt")
+    prompt = load_prompt("tool_selection_prompt.txt", user_text=user_text, tools=json.dumps(tools, ensure_ascii=False))
+    _log_tail("llm_prompt", prompt, purpose="tool_selection")
+    payload = None
+    max_attempts = _tool_selector_max_retries(config) + 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = complete_response(
+                config,
+                prompt,
+                instructions,
+                max_output_tokens=_tool_selector_max_output_tokens(config),
+                reasoning_effort=_tool_selector_reasoning_effort(config),
+            )
+        except Exception:
+            logger.exception("tool_selection_error attempt=%s/%s", attempt, max_attempts)
+            continue
+        raw = str(response or "").strip()
+        if not raw:
+            logger.debug("tool_selection_empty_response attempt=%s/%s", attempt, max_attempts)
+            continue
+        _log_tail("tool_selection_raw", raw)
+        try:
+            payload = json.loads(_extract_json_object(raw))
+            break
+        except Exception:
+            logger.debug("tool_selection_parse_retry attempt=%s/%s raw=%r", attempt, max_attempts, raw[:240])
+            continue
+    if payload is None:
+        logger.debug("tool_selection_fallback reason=no_valid_response attempts=%s", max_attempts)
+        return None
+    steps = _parse_plan_tasks(payload.get("steps"))
+    if not steps:
+        return None
+    allowed = {tool["name"] for tool in tools}
+    steps = [step for step in steps if step.tool in allowed]
+    if not steps:
+        return None
+    if steps[-1].tool != "final":
+        steps.append(AgentPlanStep("final", "Answer with the available context and tool results."))
+    return LlmToolPlanDecision(
+        steps=steps,
+        rag_query=str(payload.get("rag_query") or "").strip(),
+        reason=str(payload.get("reason") or "LLM-selected tool plan"),
+    )
+
+
+def _available_tool_specs(thread: Thread, config) -> list[dict[str, str]]:
+    tools = [{"name": "final", "description": "Answer directly with the language model; use when no external context or code execution is needed."}]
+    if _tool_enabled(config, "rag", default=True) and _has_allowed_context_sources(thread):
+        tools.append({"name": "rag", "description": "Search allowed local files/folders for relevant context before answering."})
+    if _tool_enabled(config, "sandbox"):
+        tools.append({"name": "sandbox", "description": "Run deterministic Python in Docker for calculations, code execution, data processing, or artifact generation."})
+    if _tool_enabled(config, "web_search"):
+        tools.append({"name": "web_search", "description": "Collect current or external web information. Currently returns an unimplemented notice."})
+    return tools
+
+
+def _tool_selector_llm_enabled(config) -> bool:
+    return _tool_enabled(config, "tool_selector", default=isinstance(config, RuntimeConfig))
+
+
+def _tool_selector_max_output_tokens(config) -> int:
+    try:
+        tools = getattr(config, "tools", {})
+        selector = tools.get("tool_selector", {}) if isinstance(tools, dict) else {}
+        return max(32, min(512, int(selector.get("max_output_tokens", 160))))
+    except (TypeError, ValueError):
+        return 160
+
+
+def _tool_selector_reasoning_effort(config) -> str:
+    try:
+        tools = getattr(config, "tools", {})
+        selector = tools.get("tool_selector", {}) if isinstance(tools, dict) else {}
+        return str(selector.get("reasoning_effort", "none") or "none")
+    except AttributeError:
+        return "none"
+
+
+def _tool_selector_max_retries(config) -> int:
+    try:
+        tools = getattr(config, "tools", {})
+        selector = tools.get("tool_selector", {}) if isinstance(tools, dict) else {}
+        return max(0, int(selector.get("max_retries", 1)))
+    except (AttributeError, TypeError, ValueError):
+        return 1
 
 
 def _apply_llm_rag_decision(thread: Thread, user_text: str, config, plan: AgentPlan) -> AgentPlan:
@@ -1249,6 +1390,7 @@ def _execute_agent_task(
                 yield _sse(progress("Tool sandbox: execution failed or returned inadequate output."))
             return {"ok": False, "input_text": input_text, "final_message": _format_sandbox_message(result.ok, result.output)}
         plan_trace.append("Sandbox result: adequate")
+        artifact_message = _persist_sandbox_artifacts(thread, input_text, result.output)
         logger.debug(
             "agent_step_result thread_id=%s tool=sandbox status=adequate output_preview=%r",
             thread.id,
@@ -1256,8 +1398,85 @@ def _execute_agent_task(
         )
         if progress:
             yield _sse(progress("Tool sandbox: execution completed with adequate output."))
-        return {"ok": True, "input_text": input_text, "final_message": _format_sandbox_message(True, result.output)}
+        final_message = _format_sandbox_message(True, result.output)
+        if artifact_message:
+            final_message = f"{final_message}\n\n{artifact_message}"
+        return {"ok": True, "input_text": input_text, "final_message": final_message}
     return {"ok": True, "input_text": input_text, "final_message": ""}
+
+
+def _persist_sandbox_artifacts(thread: Thread, input_text: str, output: str) -> str:
+    requests = _extract_sandbox_artifact_requests(output)
+    if not requests:
+        requests = _implicit_sandbox_artifact_requests(input_text, output)
+    if not requests:
+        return ""
+    lines = ["Sandbox成果物の保存結果:"]
+    for request in requests:
+        result = write_allowed_text_file(
+            thread.project,
+            request["path"],
+            request["content"],
+            append=request.get("append", False),
+        )
+        prefix = "OK" if result.ok else "NG"
+        lines.append(f"- {prefix}: {result.message}")
+    return "\n".join(lines)
+
+
+def _extract_sandbox_artifact_requests(output: str) -> list[dict[str, object]]:
+    payloads: list[object] = []
+    for block in re.findall(r"```json\s*(.*?)```", output, flags=re.DOTALL | re.IGNORECASE):
+        try:
+            payloads.append(json.loads(block.strip()))
+        except json.JSONDecodeError:
+            continue
+    try:
+        payloads.append(json.loads(_extract_json_object(output)))
+    except Exception:
+        pass
+
+    requests: list[dict[str, object]] = []
+    for payload in payloads:
+        if not isinstance(payload, dict):
+            continue
+        artifacts = payload.get("maigent_artifacts", [])
+        if not isinstance(artifacts, list):
+            continue
+        for item in artifacts:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "").strip()
+            content = item.get("content")
+            if not path or content is None:
+                continue
+            requests.append(
+                {
+                    "path": path,
+                    "content": str(content),
+                    "append": bool(item.get("append", False)),
+                }
+            )
+    return requests[:5]
+
+
+def _implicit_sandbox_artifact_requests(input_text: str, output: str) -> list[dict[str, object]]:
+    if not _looks_like_save_request(input_text):
+        return []
+    paths = _extract_candidate_paths(input_text)
+    if not paths:
+        return []
+    content = output.strip()
+    if not content:
+        return []
+    return [{"path": paths[-1], "content": content + "\n", "append": False}]
+
+
+def _looks_like_save_request(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in text for marker in ["保存", "書き込", "出力", "作成"]) or any(
+        marker in lowered for marker in ["save", "write", "export", "create"]
+    )
 
 
 def _prepend_plan_trace(input_text: str, plan_trace: list[str]) -> str:
@@ -1287,6 +1506,11 @@ def _tool_settings(config) -> list[dict[str, str]]:
             "name": "dynamic_finalizer",
             "enabled": "on" if _tool_enabled(config, "dynamic_finalizer", default=isinstance(config, RuntimeConfig)) else "off",
             "detail": "LLM save/discard/add-tasks routing",
+        },
+        {
+            "name": "tool_selector",
+            "enabled": "on" if _tool_selector_llm_enabled(config) else "off",
+            "detail": f"LLM tool choice; max output: {_tool_selector_max_output_tokens(config)}; reasoning: {_tool_selector_reasoning_effort(config)}",
         },
     ]
 
@@ -1425,11 +1649,26 @@ def _extract_candidate_paths(text: str) -> list[str]:
     seen: set[str] = set()
     paths: list[str] = []
     for match in re.findall(pattern, text):
-        cleaned = match.rstrip("。、,.):;]")
+        cleaned = _clean_candidate_path(match)
         if cleaned and cleaned not in seen:
             seen.add(cleaned)
             paths.append(cleaned)
     return paths
+
+
+def _clean_candidate_path(value: str) -> str:
+    cleaned = value.rstrip("。、,.):;]")
+    extension_match = re.match(
+        r"^(.+\.(?:csv|tsv|txt|md|json|yaml|yml|py|html|xml|pdf|docx|xlsx|pptx|png|jpg|jpeg|svg))(?:[ぁ-んァ-ン一-龥].*)$",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if extension_match:
+        return extension_match.group(1)
+    for suffix in ["に保存してください", "へ保存してください", "に保存", "へ保存", "に書き込んで", "へ書き込んで"]:
+        if cleaned.endswith(suffix):
+            return cleaned[: -len(suffix)]
+    return cleaned
 
 
 def _looks_like_file_list_request(text: str) -> bool:

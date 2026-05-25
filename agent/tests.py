@@ -452,6 +452,7 @@ class ChatFlowTests(TestCase):
         self.assertIn("Criteria: The answer directly addresses the user's request.", body)
         self.assertIn("Plan: Direct answer; no tool use needed.", body)
         self.assertIn('"done": true', body)
+        self.assertIn('"elapsed_ms":', body)
         assistant = Message.objects.get(id=payload["assistant_id"])
         self.assertEqual(assistant.content, "hello")
         self.assertEqual(assistant.status, "complete")
@@ -579,6 +580,83 @@ class ChatFlowTests(TestCase):
         self.assertEqual(task.tool, "sandbox")
         self.assertEqual(task.status, "ok")
         self.assertIn("4", task.result)
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.load_runtime_config")
+    def test_sandbox_artifact_is_saved_by_host_broker(self, mock_config, mock_run_sandbox):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_config.return_value = Config()
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            output_path = root / "result.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+            mock_run_sandbox.return_value = SandboxResult(True, "4")
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"2 + 2を正確に計算して、結果を{output_path}に保存してください"},
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "4\n")
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertIn("Sandbox成果物の保存結果", assistant.content)
+        self.assertIn("OK:", assistant.content)
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.load_runtime_config")
+    def test_sandbox_artifact_json_is_saved_by_host_broker(self, mock_config, mock_run_sandbox):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_config.return_value = Config()
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            output_path = root / "artifact.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+            mock_run_sandbox.return_value = SandboxResult(
+                True,
+                "\n".join(
+                    [
+                        "artifact ready",
+                        "```json",
+                        json.dumps({"maigent_artifacts": [{"path": str(output_path), "content": "artifact\n", "append": False}]}),
+                        "```",
+                    ]
+                ),
+            )
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"Pythonで成果物を作成して{output_path}に保存してください"},
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "artifact\n")
 
     @patch("agent.tooling.subprocess.run")
     def test_sandbox_generates_program_for_natural_language_sum(self, mock_run):
@@ -933,6 +1011,67 @@ class ChatFlowTests(TestCase):
 
         self.assertEqual(decision.action, "replace")
         self.assertEqual([step.tool for step in decision.plan_queue], ["sandbox"])
+
+    @patch("agent.views.complete_response")
+    def test_llm_tool_selector_can_choose_rag_and_sandbox(self, mock_complete):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return name in {"tool_selector", "rag", "sandbox"} or default
+
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "numbers.txt").write_text("1\n2\n", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_complete.return_value = json.dumps(
+                {
+                    "steps": [
+                        {"tool": "rag", "purpose": "Find the numbers file."},
+                        {"tool": "sandbox", "purpose": "Compute the exact sum."},
+                    ],
+                    "rag_query": "numbers",
+                    "reason": "Needs file context and exact computation.",
+                }
+            )
+
+            from .views import _build_agent_plan_with_llm_tool_selection
+
+            plan = _build_agent_plan_with_llm_tool_selection(self.thread, "numbersファイルの合計を計算して", Config())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual([step.tool for step in plan.steps], ["rag", "sandbox", "final"])
+        self.assertEqual(plan.rag_query, "numbers")
+        kwargs = mock_complete.call_args.kwargs
+        self.assertEqual(kwargs["max_output_tokens"], 160)
+        self.assertEqual(kwargs["reasoning_effort"], "none")
+
+    @patch("agent.views.complete_response")
+    def test_llm_tool_selector_retries_empty_response(self, mock_complete):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return name in {"tool_selector", "rag"} or default
+
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "notes.txt").write_text("alpha", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_complete.side_effect = [
+                None,
+                json.dumps(
+                    {
+                        "steps": [{"tool": "rag", "purpose": "Search notes."}],
+                        "rag_query": "alpha",
+                        "reason": "Retry recovered.",
+                    }
+                ),
+            ]
+
+            from .views import _build_agent_plan_with_llm_tool_selection
+
+            plan = _build_agent_plan_with_llm_tool_selection(self.thread, "alphaについて教えて", Config())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual([step.tool for step in plan.steps], ["rag", "final"])
+        self.assertEqual(mock_complete.call_count, 2)
 
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
@@ -1468,3 +1607,23 @@ class OpenAIClientTests(TestCase):
             result = complete_response(config, "hello", "system")
 
         self.assertEqual(result, "bedrock ok")
+
+    def test_complete_response_passes_compact_response_options(self):
+        config = RuntimeConfig(values={"model": "gpt-test", "api_key": "key", "api_mode": "responses"}, sources=[])
+
+        class Responses:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                return type("Response", (), {"output_text": "ok"})()
+
+        class Client:
+            responses = Responses()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()):
+            from .openai_client import complete_response
+
+            result = complete_response(config, "hello", max_output_tokens=64, reasoning_effort="none")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(Client.responses.kwargs["max_output_tokens"], 64)
+        self.assertEqual(Client.responses.kwargs["reasoning"], {"effort": "none"})

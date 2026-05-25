@@ -12,8 +12,14 @@ def generate_sandbox_code(config: RuntimeConfig, input_text: str) -> str:
     return _extract_code(text)
 
 
-def complete_response(config: RuntimeConfig, input_text: str, instructions: str = "") -> str:
-    return _complete_response(config, input_text, instructions)
+def complete_response(
+    config: RuntimeConfig,
+    input_text: str,
+    instructions: str = "",
+    max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
+    return _complete_response(config, input_text, instructions, max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort)
 
 
 def stream_response(config: RuntimeConfig, input_text: str, instructions: str = "") -> Iterable[tuple[str, str]]:
@@ -68,31 +74,48 @@ def _stream_responses(client: OpenAI, config: RuntimeConfig, input_text: str, in
         yield "response_id", response_id
 
 
-def _complete_response(config: RuntimeConfig, input_text: str, instructions: str = "") -> str:
+def _complete_response(
+    config: RuntimeConfig,
+    input_text: str,
+    instructions: str = "",
+    max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
     _validate_config(config)
     provider = _active_provider(config)
     if provider == "azure":
         client = _build_azure_client(config)
-        return _complete_chat_completions(client, config, input_text, instructions)
+        return _complete_chat_completions(client, config, input_text, instructions, max_output_tokens=max_output_tokens)
     if provider == "bedrock":
-        return _complete_bedrock(config, input_text, instructions)
+        return _complete_bedrock(config, input_text, instructions, max_output_tokens=max_output_tokens)
 
     client = _build_openai_compatible_client(config)
 
     if config.api_mode == "chat":
-        return _complete_chat_completions(client, config, input_text, instructions)
+        return _complete_chat_completions(client, config, input_text, instructions, max_output_tokens=max_output_tokens)
     if config.api_mode == "responses":
-        return _complete_responses(client, config, input_text, instructions)
+        return _complete_responses(client, config, input_text, instructions, max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort)
     try:
-        return _complete_responses(client, config, input_text, instructions)
+        return _complete_responses(client, config, input_text, instructions, max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort)
     except Exception:
-        return _complete_chat_completions(client, config, input_text, instructions)
+        return _complete_chat_completions(client, config, input_text, instructions, max_output_tokens=max_output_tokens)
 
 
-def _complete_responses(client: OpenAI, config: RuntimeConfig, input_text: str, instructions: str = "") -> str:
+def _complete_responses(
+    client: OpenAI,
+    config: RuntimeConfig,
+    input_text: str,
+    instructions: str = "",
+    max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+) -> str:
     request = {"model": config.model, "input": input_text}
     if instructions:
         request["instructions"] = instructions
+    if max_output_tokens:
+        request["max_output_tokens"] = max_output_tokens
+    if reasoning_effort:
+        request["reasoning"] = {"effort": reasoning_effort}
     response = client.responses.create(**request)
     output_text = getattr(response, "output_text", "")
     if output_text:
@@ -106,12 +129,21 @@ def _complete_responses(client: OpenAI, config: RuntimeConfig, input_text: str, 
     return "".join(chunks)
 
 
-def _complete_chat_completions(client: OpenAI, config: RuntimeConfig, input_text: str, instructions: str = "") -> str:
+def _complete_chat_completions(
+    client: OpenAI,
+    config: RuntimeConfig,
+    input_text: str,
+    instructions: str = "",
+    max_output_tokens: int | None = None,
+) -> str:
     messages = []
     if instructions:
         messages.append({"role": "system", "content": instructions})
     messages.append({"role": "user", "content": input_text})
-    response = client.chat.completions.create(model=config.model, messages=messages, stream=False)
+    request = {"model": config.model, "messages": messages, "stream": False}
+    if max_output_tokens:
+        request["max_tokens"] = max_output_tokens
+    response = client.chat.completions.create(**request)
     choices = getattr(response, "choices", None) or []
     if not choices:
         return ""
@@ -220,12 +252,14 @@ def _bedrock_messages(input_text: str, instructions: str = "") -> tuple[list[dic
     return messages, system
 
 
-def _complete_bedrock(config: RuntimeConfig, input_text: str, instructions: str = "") -> str:
+def _complete_bedrock(config: RuntimeConfig, input_text: str, instructions: str = "", max_output_tokens: int | None = None) -> str:
     client = _bedrock_client(config)
     messages, system = _bedrock_messages(input_text, instructions)
     request = {"modelId": config.model, "messages": messages}
     if system:
         request["system"] = system
+    if max_output_tokens:
+        request["inferenceConfig"] = {"maxTokens": max_output_tokens}
     response = client.converse(**request)
     content = response.get("output", {}).get("message", {}).get("content", [])
     return "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))

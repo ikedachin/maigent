@@ -4,10 +4,10 @@ from django.utils import timezone
 
 from .access import is_path_allowed
 from .config import RuntimeConfig
+from .file_broker import file_write_enabled, write_allowed_text_file
 from .models import FeatureFlag, Message, Thread
 
 MAX_READ_CHARS = 12000
-FILE_WRITE_FEATURE_FLAG = "file_write"
 
 
 def handle_slash_command(thread: Thread, command_text: str, config: RuntimeConfig) -> str:
@@ -135,7 +135,7 @@ def _handle_file(thread: Thread, parts: list[str]) -> str:
 
 
 def _handle_write(thread: Thread, command_text: str, append: bool = False) -> str:
-    if not _file_write_enabled():
+    if not file_write_enabled():
         return (
             "ファイル書き込み機能が無効です。"
             "右側の機能フラグで file_write を有効化するか、/features enable file_write を実行してください。"
@@ -152,34 +152,8 @@ def _handle_write(thread: Thread, command_text: str, append: bool = False) -> st
         path_text = path_text.strip()
     if not path_text:
         return f"使い方: {command} <file-path> -- <content> または {command} <file-path> の次行に本文"
-    target = Path(path_text).expanduser()
-    try:
-        resolved = target.resolve()
-    except OSError as exc:
-        return f"書き込み先の確認に失敗しました: {exc}"
-    if not is_path_allowed(thread.project, str(resolved), write=True):
-        return "書き込みが許可されていません。右側のアクセス許可に、このファイルまたは親フォルダを読み書きで追加してください。"
-    if resolved.exists() and resolved.is_dir():
-        return f"書き込み先がフォルダです: {resolved}"
-    if not resolved.parent.exists():
-        return f"親フォルダが存在しません: {resolved.parent}"
-    if not resolved.parent.is_dir():
-        return f"親パスがフォルダではありません: {resolved.parent}"
-    try:
-        if append:
-            with resolved.open("a", encoding="utf-8") as handle:
-                handle.write(content)
-        else:
-            resolved.write_text(content, encoding="utf-8")
-    except OSError as exc:
-        return f"書き込みに失敗しました: {exc}"
-    action = "追記" if append else "書き込み"
-    return f"{action}しました: {resolved}\n文字数: {len(content)}"
-
-
-def _file_write_enabled() -> bool:
-    flag = FeatureFlag.objects.filter(name=FILE_WRITE_FEATURE_FLAG).first()
-    return True if flag is None else flag.enabled
+    result = write_allowed_text_file(thread.project, path_text, content, append=append)
+    return result.message
 
 
 def _handle_ls(thread: Thread, parts: list[str]) -> str:

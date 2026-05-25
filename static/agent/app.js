@@ -90,6 +90,7 @@ const translations = {
     partialProgress: "進行ログ（一部・最新3行）",
     error: "エラー",
     pending: "待機中",
+    elapsedTime: "実行時間",
     copy: "コピー",
     copied: "コピー済み",
     copyMessage: "メッセージをコピー",
@@ -180,6 +181,7 @@ const translations = {
     partialProgress: "Progress log (partial, latest 3 lines)",
     error: "error",
     pending: "pending",
+    elapsedTime: "Elapsed time",
     copy: "Copy",
     copied: "Copied",
     copyMessage: "Copy message",
@@ -304,6 +306,29 @@ function appendMessage(role, content, status) {
   return { article, pre, meta, progress };
 }
 
+function formatElapsed(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value < 0) return "";
+  if (value < 1000) return `${Math.max(1, Math.round(value))}ms`;
+  if (value < 10000) return `${(value / 1000).toFixed(1)}s`;
+  return `${Math.round(value / 1000)}s`;
+}
+
+function setElapsedTime(node, elapsedMs) {
+  const label = formatElapsed(elapsedMs);
+  if (!label) return;
+  const actions = node.meta.querySelector(".message-actions");
+  if (!actions) return;
+  let runtime = actions.querySelector(".message-runtime");
+  if (!runtime) {
+    runtime = document.createElement("small");
+    runtime.className = "message-runtime";
+    actions.insertBefore(runtime, actions.querySelector("[data-copy-message]"));
+  }
+  runtime.textContent = label;
+  runtime.title = t("elapsedTime");
+}
+
 function setActivity(active, key = "running") {
   const indicator = document.querySelector("[data-activity-indicator]");
   const text = indicator?.querySelector("[data-activity-text]");
@@ -349,11 +374,13 @@ function streamAssistant(url, node) {
       node.pre.className = "";
       node.pre.textContent = payload.error;
       node.meta.querySelector("small").textContent = t("error");
+      setElapsedTime(node, payload.elapsed_ms);
       setActivity(false);
       source.close();
     }
     if (payload.done) {
       node.meta.querySelector("small").textContent = t("complete");
+      setElapsedTime(node, payload.elapsed_ms);
       node.article.classList.remove("streaming");
       setActivity(false);
       source.close();

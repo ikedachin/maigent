@@ -28,6 +28,11 @@ final_evaluation:
   max_retries: 3
 
 tools:
+  tool_selector:
+    enabled: true
+    reasoning_effort: none
+    max_output_tokens: 160
+    max_retries: 1
   dynamic_replanner:
     enabled: true
   dynamic_finalizer:
@@ -38,7 +43,7 @@ tools:
 
 `final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。画面から保存した最終評価設定はDBの `AppSetting` に保存され、設定ファイル値より優先されます。
 
-エージェント実行は、初期プランを `AgentState.plan_queue` に入れ、1タスクごとに実行履歴を保存しながら進めます。`tools.dynamic_replanner.enabled` が `true` の場合、各タスク後にLLMリプランナーが `goal`、`plan_history`、`task_history`、現在の `plan_queue` を見て、キュー維持・差し替え・終了をJSONで判断します。`tools.dynamic_finalizer.enabled` が `true` の場合、終了時に成果物を保存相当で扱うか、破棄相当で終えるか、追加検証タスクを挿入するかをLLMで分岐します。設定未指定の `RuntimeConfig` ではどちらも有効です。
+エージェント実行は、初期プランを `AgentState.plan_queue` に入れ、1タスクごとに実行履歴を保存しながら進めます。`tools.tool_selector.enabled` が `true` の場合、LLMが利用可能tools一覧から `rag` / `sandbox` / `web_search` / `final` の実行順を短いJSONで選びます。この判定呼び出しは `reasoning_effort: none` と小さい `max_output_tokens` を指定して、低遅延・低コストに寄せています。空応答や不正JSONなどで失敗した場合は `max_retries` 回だけ再試行し、それでも失敗した場合は従来のルールベースプランへフォールバックします。`tools.dynamic_replanner.enabled` が `true` の場合、各タスク後にLLMリプランナーが `goal`、`plan_history`、`task_history`、現在の `plan_queue` を見て、キュー維持・差し替え・終了をJSONで判断します。`tools.dynamic_finalizer.enabled` が `true` の場合、終了時に成果物を保存相当で扱うか、破棄相当で終えるか、追加検証タスクを挿入するかをLLMで分岐します。設定未指定の `RuntimeConfig` ではこれらが有効です。
 
 YAMLローダーはこのアプリ内の簡易実装です。基本的なネスト、真偽値、整数、リストには対応しますが、一般的なYAMLの全機能を使う設定は `config.toml` を推奨します。
 
@@ -153,6 +158,8 @@ docker run --rm maigent-sandbox:py311 python --version
 ```
 
 `.maigent/config.yaml` の `tools.sandbox.image` が `maigent-sandbox:py311` を指していれば、このアプリはそのイメージを使います。標準の `docker/sandbox/Dockerfile` には、CSV/Excel処理、PDF/Word/PowerPoint処理、グラフ作成、HTML解析、HTTP取得で使う一般的な事務作業向けライブラリを事前インストールしています。ライブラリを追加する場合はDockerfileにも追記し、もう一度 `docker build -t maigent-sandbox:py311 docker/sandbox` を実行してください。実行時インストールが必要な場合だけ `.maigent/config.yaml` で `install_libraries_on_run: true` にします。
+
+Sandboxは許可フォルダを直接マウントしません。ファイル保存が必要な場合、sandbox内のプログラムはstdoutに `maigent_artifacts` JSONを出力し、Django側のbrokerが `file_write` feature flag と読み書き許可パスを検証してからホスト上に保存します。これにより、生成コードへ直接書き込み権限を渡さずに成果物だけを保存できます。
 
 ## Program flow
 
@@ -360,7 +367,10 @@ flowchart TD
     InstallLibs -- "No" --> DockerNoNet["docker run --network none\npython /work/script.py"]
     DockerNet --> Result{"Return code 0?"}
     DockerNoNet --> Result
-    Result -- "Yes" --> Success["Return Sandbox実行結果: 成功"]
+    Result -- "Yes" --> Artifact{"stdout contains\nmaigent_artifacts JSON?"}
+    Artifact -- "Yes" --> Broker["Host broker validates\nfile_write and write access\nthen saves artifacts"]
+    Artifact -- "No" --> Success["Return Sandbox実行結果: 成功"]
+    Broker --> Success
     Result -- "No" --> Failure{"No executable code?\nor execution failure?"}
     Failure -- "No executable code" --> ContinueNoCode
     Failure -- "Execution failed" --> FailMessage["Return Sandbox実行結果: 失敗\nstdout/stderr"]

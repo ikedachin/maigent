@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -8,7 +9,7 @@ from django.urls import reverse
 from .access import is_path_allowed, normalize_access_path
 from .config import RuntimeConfig, load_runtime_config
 from .openai_client import stream_response
-from .models import AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
+from .models import AgentRun, AgentTaskRecord, AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .tooling import (
     AgentPlan,
     AgentPlanStep,
@@ -21,6 +22,7 @@ from .tooling import (
     select_tool,
 )
 from .views import _avoid_failed_plan
+from .views import AgentState, TaskExecutionRecord, _replan_after_step, _route_final_output
 
 
 @override_settings(STATICFILES_DIRS=[])
@@ -454,6 +456,12 @@ class ChatFlowTests(TestCase):
         self.assertEqual(assistant.content, "hello")
         self.assertEqual(assistant.status, "complete")
         self.assertEqual(assistant.openai_response_id, "resp_1")
+        run = AgentRun.objects.get(assistant_message=assistant)
+        self.assertEqual(run.status, "complete")
+        self.assertEqual(run.user_message_id, payload["user_id"])
+        self.assertEqual(run.goal, "Answer the user's request: hello")
+        self.assertEqual(run.current_plan_queue, [])
+        self.assertEqual(run.final_message, "hello")
 
     @patch("agent.views.complete_response")
     @patch("agent.views.stream_response")
@@ -563,6 +571,14 @@ class ChatFlowTests(TestCase):
         self.assertIn("Sandbox実行結果: 成功", assistant.content)
         self.assertIn("4", assistant.content)
         mock_run_sandbox.assert_called_once()
+        run = AgentRun.objects.get(assistant_message=assistant)
+        self.assertEqual(run.status, "complete")
+        self.assertEqual(run.final_message, assistant.content)
+        task = AgentTaskRecord.objects.get(run=run)
+        self.assertEqual(task.sequence, 1)
+        self.assertEqual(task.tool, "sandbox")
+        self.assertEqual(task.status, "ok")
+        self.assertIn("4", task.result)
 
     @patch("agent.tooling.subprocess.run")
     def test_sandbox_generates_program_for_natural_language_sum(self, mock_run):
@@ -850,6 +866,73 @@ class ChatFlowTests(TestCase):
         plan = build_agent_plan("test.csvの全てのテストの点を足し合わせてください。", Config())
 
         self.assertEqual([step.tool for step in plan.steps], ["rag", "sandbox"])
+
+    @patch("agent.views.complete_response")
+    def test_dynamic_replanner_can_replace_remaining_queue(self, mock_complete):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return name == "dynamic_replanner"
+
+        state = AgentState.from_plan(
+            AgentPlan(
+                goal="Answer the user's request: calculate",
+                evaluation_criteria=["The answer includes the computed result."],
+                summary="rag -> sandbox -> final",
+                steps=[AgentPlanStep("sandbox", "Run calculation.")],
+            ),
+            "calculate",
+        )
+        state.task_history.append(
+            TaskExecutionRecord(
+                task=AgentPlanStep("rag", "Search context."),
+                ok=True,
+                input_before="calculate",
+                input_after="calculate with context",
+                result="completed",
+            )
+        )
+        mock_complete.return_value = json.dumps(
+            {
+                "action": "replace",
+                "reason": "Need debugging before sandbox.",
+                "tasks": [{"tool": "sandbox", "purpose": "Run a narrower debug calculation."}],
+            }
+        )
+
+        decision = _replan_after_step(Config(), state)
+
+        self.assertEqual(decision.action, "replace")
+        self.assertEqual([step.tool for step in decision.plan_queue], ["sandbox"])
+        self.assertIn("debug", decision.plan_queue[0].purpose)
+
+    @patch("agent.views.complete_response")
+    def test_dynamic_finalizer_can_add_validation_tasks(self, mock_complete):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return name == "dynamic_finalizer"
+
+        state = AgentState.from_plan(
+            AgentPlan(
+                goal="Answer the user's request: verify",
+                evaluation_criteria=["The answer is verified."],
+                summary="sandbox -> final",
+                steps=[],
+            ),
+            "verify",
+        )
+        state.final_message = "temporary artifact"
+        mock_complete.return_value = json.dumps(
+            {
+                "action": "add_tasks",
+                "reason": "Needs one more validation.",
+                "tasks": [{"tool": "sandbox", "purpose": "Validate the artifact."}],
+            }
+        )
+
+        decision = _route_final_output(Config(), state)
+
+        self.assertEqual(decision.action, "replace")
+        self.assertEqual([step.tool for step in decision.plan_queue], ["sandbox"])
 
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")

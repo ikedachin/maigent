@@ -2,9 +2,16 @@ providers:
   openai:
     enabled: true
     model: Qwen3.5-35B-A3B-GPTQ-Int4
-    api_key: apy_key
-    base_url: http://192.168.10.151:8000/v1
+    api_key: api_key
+    base_url: http://100.96.7.91:8000/v1
     api_mode: chat
+
+  # openai_memo:
+  #   enabled: false
+  #   model: Qwen3.5-35B-A3B-GPTQ-Int4
+  #   api_key: apy_key
+  #   base_url: http://192.168.10.151:8000/v1
+  #   api_mode: chat
 
   ollama:
     enabled: false

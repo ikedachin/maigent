@@ -13,8 +13,8 @@ from django.views.decorators.http import require_POST
 
 from .access import is_path_allowed
 from .access import normalize_access_path
-from .config import load_runtime_config
-from .models import AppSetting, ApprovalRequest, Automation, FeatureFlag, Message, Project, ProjectAccessPath, Thread
+from .config import RuntimeConfig, load_runtime_config
+from .models import AgentRun, AgentTaskRecord, AppSetting, ApprovalRequest, Automation, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .openai_client import complete_response, generate_sandbox_code, stream_response
 from .prompt_loader import load_prompt
 from .slash_commands import handle_slash_command
@@ -74,6 +74,52 @@ class LlmRagDecision:
     should_search: bool
     query: str
     reason: str
+
+
+@dataclass
+class TaskExecutionRecord:
+    task: AgentPlanStep
+    ok: bool
+    input_before: str
+    input_after: str
+    result: str
+    error: str = ""
+
+
+@dataclass
+class ReplanDecision:
+    action: str
+    reason: str
+    plan_queue: list[AgentPlanStep]
+    final_message: str = ""
+
+
+@dataclass
+class AgentState:
+    goal: str
+    evaluation_criteria: list[str]
+    plan_queue: list[AgentPlanStep]
+    plan_history: list[str]
+    task_history: list[TaskExecutionRecord]
+    input_text: str
+    run: AgentRun | None = None
+    final_message: str = ""
+    stopped: bool = False
+
+    @classmethod
+    def from_plan(cls, plan: AgentPlan, user_text: str, run: AgentRun | None = None):
+        return cls(
+            goal=plan.goal,
+            evaluation_criteria=list(plan.evaluation_criteria),
+            plan_queue=list(plan.steps),
+            plan_history=[plan.summary],
+            task_history=[],
+            input_text=user_text,
+            run=run,
+        )
+
+    def queue_summary(self) -> str:
+        return _summarize_revised_plan(self.plan_queue, "dynamic queue") if self.plan_queue else "(empty)"
 
 
 def _ensure_defaults() -> tuple[Project, Thread]:
@@ -358,7 +404,15 @@ def stream_message(request, thread_id, message_id):
         assistant.save(update_fields=["status"])
         try:
             instructions = _build_instructions(thread)
-            result = yield from _generate_with_final_evaluation(thread, latest_user.content, config, instructions, emit_progress)
+            result = yield from _generate_with_final_evaluation(
+                thread,
+                latest_user.content,
+                config,
+                instructions,
+                emit_progress,
+                user_message=latest_user,
+                assistant_message=assistant,
+            )
             assistant.content = result["content"]
             assistant.status = result["status"]
             assistant.openai_response_id = result["response_id"]
@@ -410,7 +464,15 @@ def _log_tail(label: str, text: object, **fields: object) -> None:
     logger.debug("%s_tail chars=%s tail=%r%s", label, len(value), value[-100:], metadata)
 
 
-def _generate_with_final_evaluation(thread: Thread, user_text: str, config, instructions: str, progress=None):
+def _generate_with_final_evaluation(
+    thread: Thread,
+    user_text: str,
+    config,
+    instructions: str,
+    progress=None,
+    user_message: Message | None = None,
+    assistant_message: Message | None = None,
+):
     settings = _get_final_evaluation_settings(config)
     logger.debug(
         "final_evaluation_settings thread_id=%s enabled=%s max_retries=%s",
@@ -436,7 +498,18 @@ def _generate_with_final_evaluation(thread: Thread, user_text: str, config, inst
         )
         if progress:
             yield _sse(progress(f"Attempt {attempt}/{attempts}: planning response path."))
-        result = yield from _generate_once(thread, user_text, config, instructions, attempt, failed_plans, retry_feedback, progress)
+        result = yield from _generate_once(
+            thread,
+            user_text,
+            config,
+            instructions,
+            attempt,
+            failed_plans,
+            retry_feedback,
+            progress,
+            user_message=user_message,
+            assistant_message=assistant_message,
+        )
         last_content = result["content"]
         last_status = result["status"]
         last_response_id = result["response_id"]
@@ -525,6 +598,8 @@ def _generate_once(
     failed_plans: list[str],
     retry_feedback: list[str],
     progress=None,
+    user_message: Message | None = None,
+    assistant_message: Message | None = None,
 ):
     plan = build_agent_plan(user_text, config)
     plan = _apply_llm_rag_decision(thread, user_text, config, plan)
@@ -542,8 +617,14 @@ def _generate_once(
         plan.summary,
         [f"{step.tool}:{step.purpose}" for step in plan.steps],
     )
-    plan_result = yield from _execute_agent_plan(thread, user_text, config, plan, progress)
+    run = _create_agent_run(thread, user_message, assistant_message, attempt, plan)
+    try:
+        plan_result = yield from _execute_agent_plan(thread, user_text, config, plan, progress, run=run)
+    except Exception as exc:
+        _finish_agent_run(run, "error", error=str(exc))
+        raise
     if plan_result["final_message"]:
+        _finish_agent_run(run, "complete" if plan_result["ok"] else "error", str(plan_result["final_message"]))
         return {
             "content": str(plan_result["final_message"]),
             "status": "complete" if plan_result["ok"] else "error",
@@ -562,11 +643,16 @@ def _generate_once(
     _log_tail("llm_prompt", input_text, thread_id=thread.id, attempt=attempt, purpose="answer_generation")
     if progress:
         yield _sse(progress("LLM: generating candidate answer."))
-    for kind, payload in stream_response(config, input_text, instructions):
-        if kind == "delta":
-            content_parts.append(payload)
-        elif kind == "response_id":
-            response_id = payload
+    try:
+        for kind, payload in stream_response(config, input_text, instructions):
+            if kind == "delta":
+                content_parts.append(payload)
+            elif kind == "response_id":
+                response_id = payload
+    except Exception as exc:
+        _finish_agent_run(run, "error", error=str(exc))
+        raise
+    _finish_agent_run(run, "complete", "".join(content_parts))
     return {
         "content": "".join(content_parts),
         "status": "complete",
@@ -791,98 +877,386 @@ def _extract_json_object(text: str) -> str:
     return match.group(0) if match else text
 
 
-def _execute_agent_plan(thread: Thread, user_text: str, config, plan: AgentPlan, progress=None):
-    input_text = user_text
+def _replan_after_step(config, state: AgentState) -> ReplanDecision:
+    if state.final_message:
+        return ReplanDecision("finish", "task produced a terminal result", list(state.plan_queue), state.final_message)
+    latest = state.task_history[-1] if state.task_history else None
+    if latest and latest.error:
+        return ReplanDecision("finish", "task failed with an unrecoverable error", list(state.plan_queue), latest.error)
+    if _dynamic_replanner_llm_enabled(config):
+        decision = _replan_after_step_with_llm(config, state)
+        if decision:
+            return decision
+    return ReplanDecision("keep", "current queue remains valid", list(state.plan_queue))
+
+
+def _replan_after_step_with_llm(config, state: AgentState) -> ReplanDecision | None:
+    instructions = load_prompt("dynamic_replanner_instructions.txt")
+    prompt = load_prompt(
+        "dynamic_replanner_prompt.txt",
+        goal=state.goal,
+        evaluation_criteria="\n".join(f"- {criterion}" for criterion in state.evaluation_criteria),
+        plan_history="\n".join(f"- {summary}" for summary in state.plan_history),
+        task_history=_format_task_history(state),
+        plan_queue=_format_plan_queue(state.plan_queue),
+    )
+    _log_tail("llm_prompt", prompt, purpose="dynamic_replanner")
+    try:
+        raw = complete_response(config, prompt, instructions).strip()
+    except Exception:
+        logger.exception("dynamic_replanner_error")
+        return None
+    _log_tail("dynamic_replanner_raw", raw)
+    try:
+        payload = json.loads(_extract_json_object(raw))
+    except Exception:
+        logger.debug("dynamic_replanner_parse_fallback raw=%r", raw[:240])
+        return None
+    action = str(payload.get("action") or "keep").strip().lower()
+    reason = str(payload.get("reason") or "LLM replanner decision")
+    if action == "finish":
+        return ReplanDecision("finish", reason, list(state.plan_queue), str(payload.get("final_message") or state.final_message))
+    if action == "replace":
+        tasks = _parse_plan_tasks(payload.get("tasks"))
+        if tasks:
+            return ReplanDecision("replace", reason, tasks)
+    return ReplanDecision("keep", reason, list(state.plan_queue))
+
+
+def _route_final_output(config, state: AgentState) -> ReplanDecision:
+    if state.plan_queue:
+        return ReplanDecision("keep", "remaining queue still has tasks", list(state.plan_queue))
+    if not state.task_history and not state.final_message:
+        return ReplanDecision("keep", "final routing: no tool artifacts yet", [])
+    if not _dynamic_finalizer_llm_enabled(config):
+        action = "discard" if state.final_message else "save"
+        return ReplanDecision("keep", f"final routing: {action}", [])
+    instructions = load_prompt("dynamic_finalizer_instructions.txt")
+    prompt = load_prompt(
+        "dynamic_finalizer_prompt.txt",
+        goal=state.goal,
+        task_history=_format_task_history(state),
+        artifacts=state.final_message or state.input_text[-4000:],
+    )
+    _log_tail("llm_prompt", prompt, purpose="dynamic_finalizer")
+    try:
+        raw = complete_response(config, prompt, instructions).strip()
+    except Exception:
+        logger.exception("dynamic_finalizer_error")
+        return ReplanDecision("keep", "final routing failed; finishing with current output", [])
+    _log_tail("dynamic_finalizer_raw", raw)
+    try:
+        payload = json.loads(_extract_json_object(raw))
+    except Exception:
+        return ReplanDecision("keep", "final routing was not parseable; finishing with current output", [])
+    action = str(payload.get("action") or "save").strip().lower()
+    reason = str(payload.get("reason") or f"final routing: {action}")
+    if action == "add_tasks":
+        tasks = _parse_plan_tasks(payload.get("tasks"))
+        if tasks:
+            return ReplanDecision("replace", reason, tasks)
+    return ReplanDecision("keep", reason, [])
+
+
+def _parse_plan_tasks(raw_tasks: object) -> list[AgentPlanStep]:
+    if not isinstance(raw_tasks, list):
+        return []
+    tasks: list[AgentPlanStep] = []
+    for item in raw_tasks:
+        if not isinstance(item, dict):
+            continue
+        tool = str(item.get("tool") or "").strip()
+        purpose = str(item.get("purpose") or "").strip()
+        if tool in {"rag", "sandbox", "web_search", "final"} and purpose:
+            tasks.append(AgentPlanStep(tool, purpose))
+    return tasks
+
+
+def _format_task_history(state: AgentState) -> str:
+    if not state.task_history:
+        return "(none)"
+    lines = []
+    for index, record in enumerate(state.task_history[-10:], start=1):
+        status = "ok" if record.ok else "error"
+        result = (record.result or record.error or "").replace("\n", " ")[:500]
+        lines.append(f"{index}. {record.task.tool}: {status}; purpose={record.task.purpose}; result={result}")
+    return "\n".join(lines)
+
+
+def _format_plan_queue(queue: list[AgentPlanStep]) -> str:
+    if not queue:
+        return "(empty)"
+    return "\n".join(f"{index}. {step.tool}: {step.purpose}" for index, step in enumerate(queue, start=1))
+
+
+def _dynamic_replanner_llm_enabled(config) -> bool:
+    return _tool_enabled(config, "dynamic_replanner", default=isinstance(config, RuntimeConfig))
+
+
+def _dynamic_finalizer_llm_enabled(config) -> bool:
+    return _tool_enabled(config, "dynamic_finalizer", default=isinstance(config, RuntimeConfig))
+
+
+def _create_agent_run(
+    thread: Thread,
+    user_message: Message | None,
+    assistant_message: Message | None,
+    attempt: int,
+    plan: AgentPlan,
+) -> AgentRun:
+    return AgentRun.objects.create(
+        thread=thread,
+        user_message=user_message,
+        assistant_message=assistant_message,
+        attempt=attempt,
+        status="running",
+        goal=plan.goal,
+        evaluation_criteria=list(plan.evaluation_criteria),
+        initial_plan_summary=plan.summary,
+        current_plan_queue=_serialize_plan_queue(plan.steps),
+        plan_history=[plan.summary],
+    )
+
+
+def _sync_agent_run_state(state: AgentState, status: str = "running", final_message: str = "", error: str = "") -> None:
+    if not state.run:
+        return
+    state.run.status = status
+    state.run.current_plan_queue = _serialize_plan_queue(state.plan_queue)
+    state.run.plan_history = list(state.plan_history)
+    if final_message:
+        state.run.final_message = _truncate_db_text(final_message)
+    if error:
+        state.run.error = _truncate_db_text(error)
+    state.run.save(update_fields=["status", "current_plan_queue", "plan_history", "final_message", "error", "updated_at"])
+
+
+def _record_agent_task(state: AgentState, record: TaskExecutionRecord) -> None:
+    if not state.run:
+        return
+    sequence = state.run.task_records.count() + 1
+    AgentTaskRecord.objects.create(
+        run=state.run,
+        sequence=sequence,
+        tool=record.task.tool,
+        purpose=record.task.purpose,
+        status="ok" if record.ok else "error",
+        input_before=_truncate_db_text(record.input_before),
+        input_after=_truncate_db_text(record.input_after),
+        result=_truncate_db_text(record.result),
+        error=_truncate_db_text(record.error),
+    )
+
+
+def _record_replan_decision(state: AgentState, decision: ReplanDecision) -> None:
+    if not state.run:
+        return
+    history = list(state.run.replan_history or [])
+    history.append(
+        {
+            "action": decision.action,
+            "reason": decision.reason,
+            "plan_queue": _serialize_plan_queue(decision.plan_queue),
+            "final_message": _truncate_db_text(decision.final_message, limit=2000),
+        }
+    )
+    state.run.replan_history = history
+    state.run.save(update_fields=["replan_history", "updated_at"])
+
+
+def _finish_agent_run(run: AgentRun | None, status: str, final_message: str = "", error: str = "") -> None:
+    if not run:
+        return
+    run.status = status
+    if final_message:
+        run.final_message = _truncate_db_text(final_message)
+    if error:
+        run.error = _truncate_db_text(error)
+    run.save(update_fields=["status", "final_message", "error", "updated_at"])
+
+
+def _serialize_plan_queue(queue: list[AgentPlanStep]) -> list[dict[str, str]]:
+    return [{"tool": step.tool, "purpose": step.purpose} for step in queue]
+
+
+def _truncate_db_text(text: object, limit: int = 12000) -> str:
+    value = str(text or "")
+    if len(value) <= limit:
+        return value
+    return value[:limit] + "\n[truncated]"
+
+
+def _execute_agent_plan(thread: Thread, user_text: str, config, plan: AgentPlan, progress=None, run: AgentRun | None = None):
+    state = AgentState.from_plan(plan, user_text, run=run)
+    _sync_agent_run_state(state)
     plan_trace = [
         f"Agent goal: {plan.goal}",
         "Agent evaluation criteria:",
         *[f"- {criterion}" for criterion in plan.evaluation_criteria],
         f"Agent plan: {plan.summary}",
     ]
-    for step in plan.steps:
-        logger.debug("agent_step_start thread_id=%s tool=%s purpose=%s", thread.id, step.tool, step.purpose)
+    while state.plan_queue and not state.stopped:
+        step = state.plan_queue.pop(0)
         if step.tool == "final":
+            _sync_agent_run_state(state)
             continue
+        input_before = state.input_text
+        outcome = yield from _execute_agent_task(thread, user_text, config, state.input_text, plan_trace, step, plan.rag_query, progress)
+        state.input_text = str(outcome["input_text"])
+        state.final_message = str(outcome["final_message"])
+        task_record = TaskExecutionRecord(
+            task=step,
+            ok=bool(outcome["ok"]),
+            input_before=input_before,
+            input_after=state.input_text,
+            result=state.final_message or "completed",
+            error="" if outcome["ok"] else state.final_message,
+        )
+        state.task_history.append(task_record)
+        _record_agent_task(state, task_record)
         if progress:
-            yield _sse(progress(f"Tool {step.tool}: {step.purpose}"))
-        if step.tool == "web_search":
-            logger.debug("agent_step_result thread_id=%s tool=web_search status=unimplemented", thread.id)
+            yield _sse(progress(f"Replanner: evaluating remaining queue after {step.tool}."))
+        decision = _replan_after_step(config, state)
+        _record_replan_decision(state, decision)
+        logger.debug(
+            "agent_replan thread_id=%s action=%s reason=%r queue=%s",
+            thread.id,
+            decision.action,
+            decision.reason[:240],
+            [f"{task.tool}:{task.purpose}" for task in decision.plan_queue],
+        )
+        if progress:
+            yield _sse(progress(f"Replanner: {decision.action} - {decision.reason}"))
+        if decision.action == "finish":
+            state.stopped = True
+            if decision.final_message:
+                state.final_message = decision.final_message
+        elif decision.action == "replace":
+            state.plan_queue = list(decision.plan_queue)
+            state.plan_history.append(_summarize_revised_plan(state.plan_queue, "dynamic replan"))
+        else:
+            state.plan_queue = list(decision.plan_queue)
+        _sync_agent_run_state(state)
+
+    finalization = _route_final_output(config, state)
+    _record_replan_decision(state, finalization)
+    if finalization.action == "replace" and finalization.plan_queue:
+        state.plan_queue = list(finalization.plan_queue)
+        state.plan_history.append(_summarize_revised_plan(state.plan_queue, "final output routing"))
+        _sync_agent_run_state(state)
+        logger.debug("agent_final_route action=add_tasks queue=%s", [step.tool for step in state.plan_queue])
+        if progress:
+            yield _sse(progress("Final routing: adding validation tasks before output."))
+        return (yield from _execute_agent_plan(
+            thread,
+            state.input_text,
+            config,
+            AgentPlan(
+                goal=state.goal,
+                evaluation_criteria=state.evaluation_criteria,
+                summary=state.queue_summary(),
+                steps=state.plan_queue,
+            ),
+            progress,
+            run=state.run,
+        ))
+    if state.final_message:
+        return {
+            "ok": not any(record.error for record in state.task_history),
+            "input_text": state.input_text,
+            "final_message": state.final_message,
+        }
+    if plan_trace and plan.steps[0].tool != "final":
+        state.input_text = _prepend_plan_trace(state.input_text, plan_trace)
+    return {"ok": True, "input_text": state.input_text, "final_message": ""}
+
+
+def _execute_agent_task(
+    thread: Thread,
+    user_text: str,
+    config,
+    input_text: str,
+    plan_trace: list[str],
+    step: AgentPlanStep,
+    preferred_rag_query: str = "",
+    progress=None,
+):
+    logger.debug("agent_step_start thread_id=%s tool=%s purpose=%s", thread.id, step.tool, step.purpose)
+    if progress:
+        yield _sse(progress(f"Tool {step.tool}: {step.purpose}"))
+    if step.tool == "web_search":
+        logger.debug("agent_step_result thread_id=%s tool=web_search status=unimplemented", thread.id)
+        return {
+            "ok": True,
+            "input_text": input_text,
+            "final_message": "Web検索ツールは計画で選択されましたが、まだ未実装です。",
+        }
+    if step.tool == "rag":
+        rag = _build_rag_input(thread, user_text, preferred_rag_query)
+        if rag.searched and not rag.has_context:
+            logger.debug("agent_step_result thread_id=%s tool=rag status=no_context query=%r", thread.id, rag.query)
+            if progress:
+                yield _sse(progress("Tool rag: no adequate context found."))
             return {
                 "ok": True,
                 "input_text": input_text,
-                "final_message": "Web検索ツールは計画で選択されましたが、まだ未実装です。",
+                "final_message": "許可済みファイル内に、この質問へ回答するための十分な情報が見つかりませんでした。",
             }
-        if step.tool == "rag":
-            rag = _build_rag_input(thread, user_text, plan.rag_query)
-            if rag.searched and not rag.has_context:
-                logger.debug("agent_step_result thread_id=%s tool=rag status=no_context query=%r", thread.id, rag.query)
-                if progress:
-                    yield _sse(progress("Tool rag: no adequate context found."))
-                return {
-                    "ok": True,
-                    "input_text": input_text,
-                    "final_message": "許可済みファイル内に、この質問へ回答するための十分な情報が見つかりませんでした。",
-                }
-            plan_trace.append(f"RAG result: adequate; query={rag.query or '(none)'}")
-            logger.debug("agent_step_result thread_id=%s tool=rag status=adequate query=%r", thread.id, rag.query)
+        plan_trace.append(f"RAG result: adequate; query={rag.query or '(none)'}")
+        logger.debug("agent_step_result thread_id=%s tool=rag status=adequate query=%r", thread.id, rag.query)
+        if progress:
+            yield _sse(progress(f"Tool rag: context found for query '{rag.query or '(none)'}'."))
+        return {"ok": True, "input_text": _prepend_plan_trace(rag.input_text, plan_trace), "final_message": ""}
+    if step.tool == "sandbox":
+        if not can_build_sandbox_program(input_text):
+            logger.debug("sandbox_code_generation_start thread_id=%s", thread.id)
             if progress:
-                yield _sse(progress(f"Tool rag: context found for query '{rag.query or '(none)'}'."))
-            input_text = _prepend_plan_trace(rag.input_text, plan_trace)
-            continue
-        if step.tool == "sandbox":
-            if not can_build_sandbox_program(input_text):
-                logger.debug("sandbox_code_generation_start thread_id=%s", thread.id)
-                if progress:
-                    yield _sse(progress("Tool sandbox: generating executable program."))
-                _log_tail("llm_prompt", input_text, thread_id=thread.id, purpose="sandbox_code_generation")
-                generated_code = generate_sandbox_code(config, input_text)
-                if not generated_code.strip():
-                    plan_trace.append("Sandbox result: skipped before execution; no executable program could be generated.")
-                    logger.debug(
-                        "agent_step_result thread_id=%s tool=sandbox status=no_executable_program",
-                        thread.id,
-                    )
-                    if progress:
-                        yield _sse(progress("Tool sandbox: skipped because no executable program was generated."))
-                    input_text = _prepend_plan_trace(input_text, plan_trace)
-                    continue
+                yield _sse(progress("Tool sandbox: generating executable program."))
+            _log_tail("llm_prompt", input_text, thread_id=thread.id, purpose="sandbox_code_generation")
+            generated_code = generate_sandbox_code(config, input_text)
+            if not generated_code.strip():
+                plan_trace.append("Sandbox result: skipped before execution; no executable program could be generated.")
                 logger.debug(
-                    "sandbox_code_generation_done thread_id=%s code_preview=%r",
-                    thread.id,
-                    generated_code[:240],
-                )
-                input_text = input_text + "\n\nGenerated sandbox program:\n```python\n" + generated_code + "\n```"
-            result = run_sandbox(input_text, config)
-            if not result.ok and "Pythonコードまたは計算式を特定できませんでした" in result.output:
-                plan_trace.append("Sandbox result: skipped; no executable code or numeric data was found.")
-                logger.debug(
-                    "agent_step_result thread_id=%s tool=sandbox status=skipped_no_code",
+                    "agent_step_result thread_id=%s tool=sandbox status=no_executable_program",
                     thread.id,
                 )
                 if progress:
-                    yield _sse(progress("Tool sandbox: skipped because executable code or numeric data was not found."))
-                input_text = _prepend_plan_trace(input_text, plan_trace)
-                continue
-            if not _is_sandbox_result_adequate(result.ok, result.output):
-                logger.debug(
-                    "agent_step_result thread_id=%s tool=sandbox status=failed output_preview=%r",
-                    thread.id,
-                    result.output[:240],
-                )
-                if progress:
-                    yield _sse(progress("Tool sandbox: execution failed or returned inadequate output."))
-                return {"ok": False, "input_text": input_text, "final_message": _format_sandbox_message(result.ok, result.output)}
-            plan_trace.append("Sandbox result: adequate")
+                    yield _sse(progress("Tool sandbox: skipped because no executable program was generated."))
+                return {"ok": True, "input_text": _prepend_plan_trace(input_text, plan_trace), "final_message": ""}
             logger.debug(
-                "agent_step_result thread_id=%s tool=sandbox status=adequate output_preview=%r",
+                "sandbox_code_generation_done thread_id=%s code_preview=%r",
+                thread.id,
+                generated_code[:240],
+            )
+            input_text = input_text + "\n\nGenerated sandbox program:\n```python\n" + generated_code + "\n```"
+        result = run_sandbox(input_text, config)
+        if not result.ok and "Pythonコードまたは計算式を特定できませんでした" in result.output:
+            plan_trace.append("Sandbox result: skipped; no executable code or numeric data was found.")
+            logger.debug(
+                "agent_step_result thread_id=%s tool=sandbox status=skipped_no_code",
+                thread.id,
+            )
+            if progress:
+                yield _sse(progress("Tool sandbox: skipped because executable code or numeric data was not found."))
+            return {"ok": True, "input_text": _prepend_plan_trace(input_text, plan_trace), "final_message": ""}
+        if not _is_sandbox_result_adequate(result.ok, result.output):
+            logger.debug(
+                "agent_step_result thread_id=%s tool=sandbox status=failed output_preview=%r",
                 thread.id,
                 result.output[:240],
             )
             if progress:
-                yield _sse(progress("Tool sandbox: execution completed with adequate output."))
-            return {"ok": True, "input_text": input_text, "final_message": _format_sandbox_message(True, result.output)}
-    if plan_trace and plan.steps[0].tool != "final":
-        input_text = _prepend_plan_trace(input_text, plan_trace)
+                yield _sse(progress("Tool sandbox: execution failed or returned inadequate output."))
+            return {"ok": False, "input_text": input_text, "final_message": _format_sandbox_message(result.ok, result.output)}
+        plan_trace.append("Sandbox result: adequate")
+        logger.debug(
+            "agent_step_result thread_id=%s tool=sandbox status=adequate output_preview=%r",
+            thread.id,
+            result.output[:240],
+        )
+        if progress:
+            yield _sse(progress("Tool sandbox: execution completed with adequate output."))
+        return {"ok": True, "input_text": input_text, "final_message": _format_sandbox_message(True, result.output)}
     return {"ok": True, "input_text": input_text, "final_message": ""}
 
 
@@ -903,6 +1277,16 @@ def _tool_settings(config) -> list[dict[str, str]]:
             "name": "sandbox",
             "enabled": "on" if config.tool_enabled("sandbox") else "off",
             "detail": f"{config.sandbox_image}; libs: {sandbox_libraries}",
+        },
+        {
+            "name": "dynamic_replanner",
+            "enabled": "on" if _tool_enabled(config, "dynamic_replanner", default=isinstance(config, RuntimeConfig)) else "off",
+            "detail": "LLM queue rewrite after each task",
+        },
+        {
+            "name": "dynamic_finalizer",
+            "enabled": "on" if _tool_enabled(config, "dynamic_finalizer", default=isinstance(config, RuntimeConfig)) else "off",
+            "detail": "LLM save/discard/add-tasks routing",
         },
     ]
 

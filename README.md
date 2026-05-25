@@ -26,11 +26,19 @@ api_mode: auto
 final_evaluation:
   enabled: false
   max_retries: 3
+
+tools:
+  dynamic_replanner:
+    enabled: true
+  dynamic_finalizer:
+    enabled: true
 ```
 
 `providers` を使わない場合は、上記のトップレベル設定をOpenAI互換APIとして扱います。`model` または `default_model` は必須です。`OPENAI_MODEL` はモデル未設定時のみ補完に使われます。APIキーはDBへ保存しません。
 
 `final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。画面から保存した最終評価設定はDBの `AppSetting` に保存され、設定ファイル値より優先されます。
+
+エージェント実行は、初期プランを `AgentState.plan_queue` に入れ、1タスクごとに実行履歴を保存しながら進めます。`tools.dynamic_replanner.enabled` が `true` の場合、各タスク後にLLMリプランナーが `goal`、`plan_history`、`task_history`、現在の `plan_queue` を見て、キュー維持・差し替え・終了をJSONで判断します。`tools.dynamic_finalizer.enabled` が `true` の場合、終了時に成果物を保存相当で扱うか、破棄相当で終えるか、追加検証タスクを挿入するかをLLMで分岐します。設定未指定の `RuntimeConfig` ではどちらも有効です。
 
 YAMLローダーはこのアプリ内の簡易実装です。基本的なネスト、真偽値、整数、リストには対応しますが、一般的なYAMLの全機能を使う設定は `config.toml` を推奨します。
 
@@ -294,8 +302,15 @@ flowchart TD
     AnyStep -- "Yes" --> MaybeRagLLM
     Direct --> MaybeRagLLM["_apply_llm_rag_decision()\nonly for direct-answer plans with\nallowed local context sources"]
     MaybeRagLLM --> AvoidFailed["_avoid_failed_plan()"]
-    AvoidFailed --> Execute["_execute_agent_plan()"]
-    Execute --> FinalMessage{"Tool returned final message?"}
+    AvoidFailed --> Execute["_execute_agent_plan()\ncreate AgentState with dynamic queue"]
+    Execute --> PopTask["Pop one task from plan_queue"]
+    PopTask --> RunTask["Run one tool task"]
+    RunTask --> Record["Append TaskExecutionRecord"]
+    Record --> Replan["_replan_after_step()\nkeep / replace / finish"]
+    Replan -- "keep/replace and queue remains" --> PopTask
+    Replan -- "finish or queue empty" --> FinalRoute["_route_final_output()\nsave / discard / add_tasks"]
+    FinalRoute -- "add_tasks" --> PopTask
+    FinalRoute --> FinalMessage{"Tool returned final message?"}
     FinalMessage -- "Yes" --> ReturnTool["Return tool result as assistant content"]
     FinalMessage -- "No" --> LLMAnswer["Call stream_response()\nfor final answer"]
 ```

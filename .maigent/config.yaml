@@ -1,11 +1,58 @@
-model: Qwen3.5-35B-A3B-GPTQ-Int4
-api_key: apy_key
-base_url: http://192.168.10.151:8000/v1
-api_mode: chat
+providers:
+  openai:
+    enabled: true
+    model: Qwen3.5-35B-A3B-GPTQ-Int4
+    api_key: api_key
+    # base_url: http://100.96.7.91:8000/v1
+    base_url: http://192.168.10.151:8000/v1
+    api_mode: chat
 
-final_evaluation:
-  enabled: true
-  max_retries: 3
+  # openai_memo:
+  #   enabled: false
+  #   model: Qwen3.5-35B-A3B-GPTQ-Int4
+  #   api_key: apy_key
+  #   base_url: http://192.168.10.151:8000/v1
+  #   api_mode: chat
+
+  ollama:
+    enabled: false
+    model: llama3.1
+    base_url: http://localhost:11434/v1
+    api_mode: chat
+
+  lmstudio:
+    enabled: false
+    model: local-model
+    base_url: http://localhost:1234/v1
+    api_mode: chat
+
+  openrouter:
+    enabled: false
+    model: openai/gpt-4o-mini
+    api_key: sk-or-...
+    base_url: https://openrouter.ai/api/v1
+    api_mode: chat
+    http_referer: http://localhost:8000
+    x_title: Maigent Agent Web
+
+  azure:
+    enabled: false
+    model: azure-deployment-name
+    api_key: azure-key-...
+    azure_endpoint: https://your-resource.openai.azure.com
+    api_version: 2024-02-15-preview
+    api_mode: chat
+
+  bedrock:
+    enabled: false
+    model: anthropic.claude-3-5-sonnet-20240620-v1:0
+    region: ap-northeast-1
+    profile: default
+    # profileの代わりにキーを設定する場合:
+    # aws_access_key_id: ...
+    # aws_secret_access_key: ...
+    # aws_session_token: ...
+
 
 tools:
   rag:
@@ -37,3 +84,43 @@ tools:
       - tabulate
       - xlsxwriter
       - xlrd
+
+# 各機能の設定
+llm:
+  max_retries: 1 # 個別設定がない時のデフォルト値
+
+final_evaluation:
+  enabled: true
+  max_retries: 3
+  llm_max_retries: 1
+  reasoning_effort: true
+  max_output_tokens: 1024
+
+tool_selector:
+  enabled: true
+  reasoning_effort: none
+  max_output_tokens: 1024
+  max_retries: 3
+
+dynamic_replanner:
+  enabled: true
+  reasoning_effort: true
+  max_output_tokens: 1024
+  llm_max_retries: 3
+
+dynamic_finalizer:
+  enabled: true
+  reasoning_effort: none
+  max_output_tokens: 512
+  llm_max_retries: 3
+
+sandbox_code_generation:
+  enabled: true
+  reasoning_effort: true
+  max_output_tokens: 32768
+  llm_max_retries: 3
+
+# terminalへのログ出力文字数（最後の何文字か。全部はfull）
+logging:
+  llm_tail_chars: full
+  # llm_tail_chars: 500

@@ -11,7 +11,28 @@ except ModuleNotFoundError:  # pragma: no cover
     import tomli as tomllib
 
 
-SENSITIVE_KEYS = {"api_key", "openai_api_key"}
+SENSITIVE_KEYS = {
+    "api_key",
+    "openai_api_key",
+    "openrouter_api_key",
+    "azure_api_key",
+    "azure_openai_api_key",
+    "aws_access_key_id",
+    "aws_secret_access_key",
+    "aws_session_token",
+}
+
+PROVIDER_ORDER = ["openai", "ollama", "lmstudio", "openrouter", "azure", "bedrock"]
+
+PROVIDER_ENV_KEYS = {
+    "openai": ("OPENAI_API_KEY", "OPENAI_BASE_URL"),
+    "openrouter": ("OPENROUTER_API_KEY", "OPENROUTER_BASE_URL"),
+    "azure": ("AZURE_OPENAI_API_KEY", "AZURE_OPENAI_ENDPOINT"),
+    "bedrock": ("AWS_BEARER_TOKEN_BEDROCK", ""),
+}
+
+OPENAI_COMPATIBLE_PROVIDERS = {"openai", "ollama", "lmstudio", "openrouter"}
+CONTROL_CONFIG_NAMES = {"initial_clarifier", "tool_selector", "dynamic_replanner", "dynamic_finalizer"}
 
 
 @dataclass(frozen=True)
@@ -21,28 +42,133 @@ class RuntimeConfig:
 
     @property
     def model(self) -> str:
-        return str(self.values.get("model") or self.values.get("default_model") or "").strip()
-
-    @property
-    def api_key(self) -> str:
+        provider = self.active_provider
+        if not provider:
+            return ""
+        provider_config = self.provider_config(provider)
         return str(
-            self.values.get("api_key")
-            or self.values.get("openai_api_key")
-            or os.environ.get("OPENAI_API_KEY", "")
+            provider_config.get("model")
+            or provider_config.get("default_model")
+            or self.values.get("model")
+            or self.values.get("default_model")
+            or ""
         ).strip()
 
     @property
+    def api_key(self) -> str:
+        provider = self.active_provider
+        if not provider:
+            return ""
+        provider_config = self.provider_config(provider)
+        env_key, _ = PROVIDER_ENV_KEYS.get(provider, ("", ""))
+        provider_keys = ["api_key", f"{provider}_api_key"]
+        if provider == "openai":
+            provider_keys.append("openai_api_key")
+        if provider == "azure":
+            provider_keys.append("azure_openai_api_key")
+        for key in provider_keys:
+            value = provider_config.get(key)
+            if value:
+                return str(value).strip()
+        for key in provider_keys:
+            value = self.values.get(key)
+            if value:
+                return str(value).strip()
+        return os.environ.get(env_key, "").strip()
+
+    @property
     def base_url(self) -> str:
+        provider = self.active_provider
+        if not provider:
+            return ""
+        provider_config = self.provider_config(provider)
+        _, env_key = PROVIDER_ENV_KEYS.get(provider, ("", ""))
+        default = {
+            "ollama": "http://localhost:11434/v1",
+            "lmstudio": "http://localhost:1234/v1",
+            "openrouter": "https://openrouter.ai/api/v1",
+        }.get(provider, "")
         return str(
-            self.values.get("base_url")
+            provider_config.get("base_url")
+            or provider_config.get("openai_base_url")
+            or self.values.get("base_url")
             or self.values.get("openai_base_url")
-            or os.environ.get("OPENAI_BASE_URL", "")
+            or os.environ.get(env_key, "")
+            or default
         ).strip()
 
     @property
     def api_mode(self) -> str:
-        value = str(self.values.get("api_mode") or self.values.get("openai_api_mode") or "auto").strip().lower()
+        provider = self.active_provider
+        provider_config = self.provider_config(provider) if provider else {}
+        default = "auto" if provider == "openai" else "chat"
+        value = str(provider_config.get("api_mode") or self.values.get("api_mode") or self.values.get("openai_api_mode") or default).strip().lower()
         return value if value in {"auto", "responses", "chat"} else "auto"
+
+    @property
+    def providers(self) -> dict[str, Any]:
+        providers = self.values.get("providers") or self.values.get("llm_providers") or {}
+        return providers if isinstance(providers, dict) else {}
+
+    @property
+    def active_provider(self) -> str:
+        providers = self.providers
+        for name in PROVIDER_ORDER:
+            config = providers.get(name, {})
+            if isinstance(config, dict) and _as_bool(config.get("enabled", False)):
+                return name
+        if providers:
+            return ""
+        return "openai"
+
+    def provider_config(self, name: str) -> dict[str, Any]:
+        providers = self.providers
+        config = providers.get(name, {})
+        return dict(config) if isinstance(config, dict) else {}
+
+    @property
+    def is_openai_compatible_provider(self) -> bool:
+        return self.active_provider in OPENAI_COMPATIBLE_PROVIDERS
+
+    @property
+    def azure_endpoint(self) -> str:
+        config = self.provider_config("azure")
+        return str(
+            config.get("azure_endpoint")
+            or config.get("endpoint")
+            or self.values.get("azure_endpoint")
+            or os.environ.get("AZURE_OPENAI_ENDPOINT", "")
+        ).strip()
+
+    @property
+    def azure_api_version(self) -> str:
+        config = self.provider_config("azure")
+        return str(config.get("api_version") or self.values.get("azure_api_version") or "2024-02-15-preview").strip()
+
+    @property
+    def bedrock_region(self) -> str:
+        config = self.provider_config("bedrock")
+        return str(config.get("region") or config.get("region_name") or self.values.get("aws_region") or os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION") or "").strip()
+
+    @property
+    def bedrock_profile(self) -> str:
+        config = self.provider_config("bedrock")
+        return str(config.get("profile") or config.get("profile_name") or self.values.get("aws_profile") or os.environ.get("AWS_PROFILE", "")).strip()
+
+    @property
+    def bedrock_credentials(self) -> dict[str, str]:
+        config = self.provider_config("bedrock")
+        mapping = {
+            "aws_access_key_id": "aws_access_key_id",
+            "aws_secret_access_key": "aws_secret_access_key",
+            "aws_session_token": "aws_session_token",
+        }
+        credentials = {}
+        for config_key, boto_key in mapping.items():
+            value = config.get(config_key) or self.values.get(config_key)
+            if value:
+                credentials[boto_key] = str(value).strip()
+        return credentials
 
     @property
     def tools(self) -> dict[str, Any]:
@@ -65,8 +191,43 @@ class RuntimeConfig:
         except (TypeError, ValueError):
             return 3
 
+    @property
+    def final_evaluation_max_output_tokens(self) -> int:
+        try:
+            return max(1, min(1024, int(self.final_evaluation.get("max_output_tokens", 160))))
+        except (TypeError, ValueError):
+            return 160
+
+    @property
+    def final_evaluation_reasoning_effort(self) -> str:
+        value = str(self.final_evaluation.get("reasoning_effort", "none")).strip().lower()
+        return value if value in {"none", "minimal", "low", "medium", "high"} else "none"
+
+    @property
+    def logging(self) -> dict[str, Any]:
+        logging_config = self.values.get("logging", {})
+        return logging_config if isinstance(logging_config, dict) else {}
+
+    @property
+    def llm_log_tail_chars(self) -> int | None:
+        value = self.logging.get("llm_tail_chars", 100)
+        if isinstance(value, str) and value.strip().lower() in {"full", "all", "unlimited"}:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 100
+        return None if parsed <= 0 else max(1, min(200000, parsed))
+
+    def control_config(self, name: str) -> dict[str, Any]:
+        config = self.values.get(name, {})
+        if isinstance(config, dict):
+            return config
+        legacy = self.tools.get(name, {})
+        return legacy if isinstance(legacy, dict) else {}
+
     def tool_enabled(self, name: str, default: bool = False) -> bool:
-        config = self.tools.get(name, {})
+        config = self.control_config(name) if name in CONTROL_CONFIG_NAMES else self.tools.get(name, {})
         if not isinstance(config, dict):
             return default
         return _as_bool(config.get("enabled", default))
@@ -108,13 +269,24 @@ class RuntimeConfig:
             return 20
 
     def redacted(self) -> dict[str, Any]:
-        safe = dict(self.values)
-        for key in SENSITIVE_KEYS:
-            if key in safe and safe[key]:
-                safe[key] = "********"
+        safe = _redact_sensitive(self.values)
         if os.environ.get("OPENAI_API_KEY") and not any(k in self.values for k in SENSITIVE_KEYS):
             safe["api_key"] = "******** (env)"
         return safe
+
+
+def _redact_sensitive(value: Any) -> Any:
+    if isinstance(value, dict):
+        redacted = {}
+        for key, item in value.items():
+            if key in SENSITIVE_KEYS and item:
+                redacted[key] = "********"
+            else:
+                redacted[key] = _redact_sensitive(item)
+        return redacted
+    if isinstance(value, list):
+        return [_redact_sensitive(item) for item in value]
+    return value
 
 
 def _read_toml(path: Path) -> dict[str, Any]:

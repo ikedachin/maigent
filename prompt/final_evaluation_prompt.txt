@@ -1,0 +1,11 @@
+User question:
+{{user_text}}
+
+Goal set before planning:
+{{goal}}
+
+Evaluation criteria set before planning:
+{{evaluation_criteria}}
+
+Candidate answer:
+{{answer}}

@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -6,21 +7,23 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from .access import is_path_allowed, normalize_access_path
-from .config import load_runtime_config
+from .config import RuntimeConfig, load_runtime_config
 from .openai_client import stream_response
-from .models import AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
+from .models import AgentRun, AgentTaskRecord, AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .tooling import (
     AgentPlan,
     AgentPlanStep,
     SandboxResult,
     _python_for_tabular_task,
     build_agent_plan,
+    evaluation_criterion,
     can_build_sandbox_program,
     requires_llm_sandbox_program,
     run_sandbox,
     select_tool,
 )
-from .views import _avoid_failed_plan
+from .views import _avoid_failed_plan, _evaluate_final_answer, _request_initial_clarification_if_needed
+from .views import AgentState, TaskExecutionRecord, _execute_agent_plan, _replan_after_step, _route_final_output
 
 
 @override_settings(STATICFILES_DIRS=[])
@@ -71,6 +74,88 @@ class ConfigTests(TestCase):
 
             self.assertEqual(config.api_mode, "chat")
 
+    def test_provider_config_selects_first_enabled_provider(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "openai": {"enabled": False, "model": "gpt"},
+                    "ollama": {"enabled": True, "model": "llama3.1"},
+                    "openrouter": {"enabled": True, "model": "openai/gpt-4o-mini", "api_key": "router-key"},
+                }
+            },
+            sources=[],
+        )
+
+        self.assertEqual(config.active_provider, "ollama")
+        self.assertEqual(config.model, "llama3.1")
+        self.assertEqual(config.base_url, "http://localhost:11434/v1")
+        self.assertEqual(config.api_mode, "chat")
+        self.assertEqual(config.api_key, "")
+
+    def test_openrouter_provider_uses_provider_api_key_and_redacts_it(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "openrouter": {
+                        "enabled": True,
+                        "model": "openai/gpt-4o-mini",
+                        "api_key": "router-key",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        self.assertEqual(config.active_provider, "openrouter")
+        self.assertEqual(config.api_key, "router-key")
+        self.assertEqual(config.base_url, "https://openrouter.ai/api/v1")
+        self.assertEqual(config.redacted()["providers"]["openrouter"]["api_key"], "********")
+
+    def test_bedrock_provider_exposes_credentials_and_redacts_them(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "bedrock": {
+                        "enabled": True,
+                        "model": "anthropic.model",
+                        "region": "ap-northeast-1",
+                        "aws_access_key_id": "access",
+                        "aws_secret_access_key": "secret",
+                        "aws_session_token": "token",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        self.assertEqual(
+            config.bedrock_credentials,
+            {
+                "aws_access_key_id": "access",
+                "aws_secret_access_key": "secret",
+                "aws_session_token": "token",
+            },
+        )
+        safe = config.redacted()["providers"]["bedrock"]
+        self.assertEqual(safe["aws_access_key_id"], "********")
+        self.assertEqual(safe["aws_secret_access_key"], "********")
+        self.assertEqual(safe["aws_session_token"], "********")
+
+    def test_all_providers_disabled_disables_model_resolution(self):
+        config = RuntimeConfig(
+            values={
+                "model": "legacy-model",
+                "providers": {
+                    "openai": {"enabled": False, "model": "gpt"},
+                    "bedrock": {"enabled": False, "model": "anthropic.model"},
+                },
+            },
+            sources=[],
+        )
+
+        self.assertEqual(config.active_provider, "")
+        self.assertEqual(config.model, "")
+
     def test_yaml_config_loads_tools_and_sandbox_libraries(self):
         with TemporaryDirectory() as app_dir:
             app = Path(app_dir)
@@ -78,6 +163,16 @@ class ConfigTests(TestCase):
             (app / ".maigent" / "config.yaml").write_text(
                 "\n".join(
                     [
+                        "final_evaluation:",
+                        "  enabled: true",
+                        "  max_retries: 2",
+                        "  llm_max_retries: 2",
+                        "  max_output_tokens: 72",
+                        "  reasoning_effort: low",
+                        "llm:",
+                        "  max_retries: 1",
+                        "logging:",
+                        "  llm_tail_chars: full",
                         "tools:",
                         "  rag:",
                         "    enabled: true",
@@ -89,6 +184,26 @@ class ConfigTests(TestCase):
                         "    allowed_libraries:",
                         "      - numpy",
                         "      - pandas",
+                        "tool_selector:",
+                        "  enabled: true",
+                        "  max_output_tokens: 96",
+                        "  reasoning_effort: none",
+                        "  max_retries: 2",
+                        "initial_clarifier:",
+                        "  enabled: true",
+                        "  max_output_tokens: 192",
+                        "  reasoning_effort: low",
+                        "  llm_max_retries: 2",
+                        "dynamic_replanner:",
+                        "  enabled: true",
+                        "  max_output_tokens: 128",
+                        "  llm_max_retries: 2",
+                        "  reasoning_effort: true",
+                        "dynamic_finalizer:",
+                        "  enabled: true",
+                        "  max_output_tokens: 80",
+                        "  llm_max_retries: 2",
+                        "  reasoning_effort: false",
                     ]
                 ),
                 encoding="utf-8",
@@ -102,6 +217,43 @@ class ConfigTests(TestCase):
             self.assertEqual(config.sandbox_timeout_seconds, 300)
             self.assertTrue(config.sandbox_install_libraries_on_run)
             self.assertEqual(config.sandbox_allowed_libraries, ["numpy", "pandas"])
+            self.assertTrue(config.final_evaluation_enabled)
+            self.assertEqual(config.final_evaluation_max_retries, 2)
+            self.assertEqual(config.final_evaluation_max_output_tokens, 72)
+            self.assertEqual(config.final_evaluation_reasoning_effort, "low")
+            self.assertIsNone(config.llm_log_tail_chars)
+            self.assertTrue(config.tool_enabled("tool_selector"))
+            self.assertTrue(config.tool_enabled("initial_clarifier"))
+            self.assertTrue(config.tool_enabled("dynamic_replanner"))
+            self.assertTrue(config.tool_enabled("dynamic_finalizer"))
+            self.assertEqual(config.control_config("tool_selector")["max_retries"], 2)
+            self.assertEqual(config.control_config("initial_clarifier")["max_output_tokens"], 192)
+            self.assertEqual(config.control_config("initial_clarifier")["llm_max_retries"], 2)
+            self.assertEqual(config.final_evaluation["llm_max_retries"], 2)
+            self.assertEqual(config.control_config("dynamic_replanner")["llm_max_retries"], 2)
+
+    def test_llm_log_tail_chars_clamps_numeric_config(self):
+        config = RuntimeConfig(values={"logging": {"llm_tail_chars": 250000}}, sources=[])
+
+        self.assertEqual(config.llm_log_tail_chars, 200000)
+
+    def test_log_tail_uses_configured_limit_or_full_text(self):
+        from .views import _log_tail
+
+        class TailConfig:
+            llm_log_tail_chars = 4
+
+        class FullConfig:
+            llm_log_tail_chars = None
+
+        with self.assertLogs("agent", level="DEBUG") as tail_logs:
+            _log_tail("sample", "abcdef", config=TailConfig())
+        self.assertIn("tail='cdef'", tail_logs.output[0])
+        self.assertNotIn("tail='abcdef'", tail_logs.output[0])
+
+        with self.assertLogs("agent", level="DEBUG") as full_logs:
+            _log_tail("sample", "abcdef", config=FullConfig())
+        self.assertIn("tail='abcdef'", full_logs.output[0])
 
     def test_final_evaluation_config_clamps_retries(self):
         with TemporaryDirectory() as app_dir:
@@ -113,6 +265,8 @@ class ConfigTests(TestCase):
                         "[final_evaluation]",
                         "enabled = true",
                         "max_retries = 9",
+                        "max_output_tokens = 96",
+                        'reasoning_effort = "minimal"',
                     ]
                 ),
                 encoding="utf-8",
@@ -123,6 +277,8 @@ class ConfigTests(TestCase):
 
             self.assertTrue(config.final_evaluation_enabled)
             self.assertEqual(config.final_evaluation_max_retries, 3)
+            self.assertEqual(config.final_evaluation_max_output_tokens, 96)
+            self.assertEqual(config.final_evaluation_reasoning_effort, "minimal")
 
 
 @override_settings(STATICFILES_DIRS=[])
@@ -161,6 +317,22 @@ class ChatFlowTests(TestCase):
         self.assertEqual(AppSetting.objects.get(key="rag_top_k").value, "10")
         self.assertEqual(AppSetting.objects.get(key="final_evaluation_enabled").value, "true")
         self.assertEqual(AppSetting.objects.get(key="final_evaluation_max_retries").value, "3")
+
+    def test_dashboard_creates_builtin_file_write_flag(self):
+        response = self.client.get(reverse("dashboard"))
+
+        self.assertEqual(response.status_code, 200)
+        flag = FeatureFlag.objects.get(name="file_write")
+        self.assertTrue(flag.enabled)
+
+    def test_update_feature_flag_toggles_flag(self):
+        flag = FeatureFlag.objects.create(name="file_write", enabled=True)
+
+        response = self.client.post(reverse("update_feature_flag", args=[flag.id]), {"action": "disable"})
+
+        self.assertEqual(response.status_code, 302)
+        flag.refresh_from_db()
+        self.assertFalse(flag.enabled)
 
     def test_slash_status_returns_assistant_message(self):
         FeatureFlag.objects.create(name="web_search", enabled=True)
@@ -243,6 +415,68 @@ class ChatFlowTests(TestCase):
         self.assertIn("note body", file_response.json()["content"])
         self.assertIn("[file] note.txt", folder_response.json()["content"])
 
+    def test_write_command_writes_allowed_file(self):
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            file_path = root / "created.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"/write {file_path} -- hello write"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("書き込みしました", response.json()["content"])
+            self.assertEqual(file_path.read_text(encoding="utf-8"), "hello write")
+
+    def test_write_command_rejects_disabled_file_write_flag(self):
+        FeatureFlag.objects.create(name="file_write", enabled=False)
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            file_path = root / "blocked.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"/write {file_path} -- blocked"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("ファイル書き込み機能が無効です", response.json()["content"])
+            self.assertFalse(file_path.exists())
+
+    def test_write_command_rejects_read_only_access(self):
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            file_path = root / "blocked.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"/write {file_path} -- blocked"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("書き込みが許可されていません", response.json()["content"])
+            self.assertFalse(file_path.exists())
+
+    def test_append_command_appends_allowed_file(self):
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            file_path = root / "note.txt"
+            file_path.write_text("first", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"/append {file_path} -- second"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("追記しました", response.json()["content"])
+            self.assertEqual(file_path.read_text(encoding="utf-8"), "firstsecond")
+
     def test_fork_command_copies_messages(self):
         Message.objects.create(thread=self.thread, role="user", content="before")
         response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/fork"})
@@ -290,10 +524,157 @@ class ChatFlowTests(TestCase):
         self.assertIn("Criteria: The answer directly addresses the user's request.", body)
         self.assertIn("Plan: Direct answer; no tool use needed.", body)
         self.assertIn('"done": true', body)
+        self.assertIn('"elapsed_ms":', body)
         assistant = Message.objects.get(id=payload["assistant_id"])
         self.assertEqual(assistant.content, "hello")
         self.assertEqual(assistant.status, "complete")
         self.assertEqual(assistant.openai_response_id, "resp_1")
+        run = AgentRun.objects.get(assistant_message=assistant)
+        self.assertEqual(run.status, "complete")
+        self.assertEqual(run.user_message_id, payload["user_id"])
+        self.assertEqual(run.goal, "Answer the user's request: hello")
+        self.assertEqual(run.current_plan_queue, [])
+        self.assertEqual(run.final_message, "hello")
+
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_streaming_includes_full_thread_conversation_history(self, mock_config, mock_stream):
+        mock_config.return_value.model = "test-model"
+        mock_config.return_value.api_key = "test-key"
+        mock_config.return_value.base_url = ""
+        mock_config.return_value.sources = []
+        mock_stream.return_value = iter([("delta", "ok")])
+        Message.objects.create(thread=self.thread, role="user", content="最初の条件はAです")
+        Message.objects.create(thread=self.thread, role="assistant", content="Aを覚えました")
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "それを使って答えて"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        b"".join(stream.streaming_content)
+
+        input_text = mock_stream.call_args.args[1]
+        self.assertIn("Thread conversation history:", input_text)
+        self.assertIn("user:\n最初の条件はAです", input_text)
+        self.assertIn("assistant:\nAを覚えました", input_text)
+        self.assertIn("Latest user message:\nそれを使って答えて", input_text)
+        self.assertEqual(input_text.count("それを使って答えて"), 1)
+        self.assertNotIn("pending", input_text)
+
+    @patch("agent.views.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_initial_clarifier_returns_questions_before_planning(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = False
+            initial_clarifier = {"max_output_tokens": 192, "reasoning_effort": "none", "llm_max_retries": 1}
+
+            def tool_enabled(self, name, default=False):
+                return name == "initial_clarifier"
+
+        mock_config.return_value = Config()
+        mock_complete.return_value = json.dumps(
+            {
+                "needs_clarification": True,
+                "reason": "対象が不明なため確認が必要です。",
+                "questions": ["どのファイルを対象にしますか？", "出力形式は何にしますか？", "期限はありますか？", "余分な質問"],
+            },
+            ensure_ascii=False,
+        )
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "いい感じにまとめて"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        body = b"".join(stream.streaming_content).decode()
+
+        self.assertNotIn("Goal:", body)
+        mock_stream.assert_not_called()
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertEqual(assistant.status, "complete")
+        self.assertIn("対象が不明なため確認が必要です。", assistant.content)
+        self.assertIn("1. どのファイルを対象にしますか？", assistant.content)
+        self.assertIn("3. 期限はありますか？", assistant.content)
+        self.assertIn("どのファイルを対象にしますか？", assistant.content)
+        self.assertNotIn("余分な質問", assistant.content)
+        self.assertEqual(AgentRun.objects.filter(assistant_message=assistant).count(), 0)
+        self.assertEqual(mock_complete.call_args.kwargs["max_output_tokens"], 192)
+        self.assertEqual(mock_complete.call_args.kwargs["reasoning_effort"], "none")
+
+    @patch("agent.views.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_initial_clarifier_allows_planning_when_no_clarification_needed(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = False
+            initial_clarifier = {"max_output_tokens": 192, "reasoning_effort": "none", "llm_max_retries": 1}
+
+            def tool_enabled(self, name, default=False):
+                return name == "initial_clarifier"
+
+        mock_config.return_value = Config()
+        mock_complete.return_value = '{"needs_clarification": false, "reason": "clear", "questions": []}'
+        mock_stream.return_value = iter([("delta", "planned answer")])
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        body = b"".join(stream.streaming_content).decode()
+
+        self.assertIn("Plan: Direct answer; no tool use needed.", body)
+        self.assertIn("planned answer", body)
+        mock_stream.assert_called_once()
+        self.assertEqual(mock_complete.call_count, 1)
+
+    @patch("agent.views.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_initial_clarifier_falls_back_on_invalid_or_empty_question_response(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = False
+            initial_clarifier = {"llm_max_retries": 0}
+
+            def tool_enabled(self, name, default=False):
+                return name == "initial_clarifier"
+
+        mock_config.return_value = Config()
+        mock_complete.return_value = '{"needs_clarification": true, "reason": "missing"}'
+        mock_stream.return_value = iter([("delta", "fallback answer")])
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        body = b"".join(stream.streaming_content).decode()
+
+        self.assertIn("fallback answer", body)
+        mock_stream.assert_called_once()
+
+    @patch("agent.views.complete_response")
+    def test_initial_clarifier_skips_obvious_actionable_tool_plan(self, mock_complete):
+        class Config:
+            initial_clarifier = {"enabled": True}
+
+            def tool_enabled(self, name, default=False):
+                return name in {"initial_clarifier", "rag", "sandbox"}
+
+        decision = _request_initial_clarification_if_needed(
+            Config(),
+            "Thread conversation history:\n\nLatest user message:\ntest.csvの点を科目ごとに計算してください。",
+            latest_user_text="test.csvの点を科目ごとに計算してください。",
+        )
+
+        self.assertIsNone(decision)
+        mock_complete.assert_not_called()
 
     @patch("agent.views.complete_response")
     @patch("agent.views.stream_response")
@@ -306,6 +687,9 @@ class ChatFlowTests(TestCase):
             sources = []
             final_evaluation_enabled = True
             final_evaluation_max_retries = 1
+            final_evaluation_max_output_tokens = 80
+            final_evaluation_reasoning_effort = "minimal"
+            final_evaluation = {"llm_max_retries": 1}
 
             def tool_enabled(self, name, default=False):
                 return False
@@ -316,6 +700,7 @@ class ChatFlowTests(TestCase):
             iter([("delta", "good answer"), ("response_id", "resp_2")]),
         ]
         mock_complete.side_effect = [
+            None,
             '{"adequate": false, "reason": "too vague"}',
             '{"adequate": true, "reason": "answers the question"}',
         ]
@@ -332,10 +717,69 @@ class ChatFlowTests(TestCase):
         self.assertEqual(assistant.content, "good answer")
         self.assertEqual(assistant.openai_response_id, "resp_2")
         self.assertEqual(mock_stream.call_count, 2)
-        first_evaluation_prompt = mock_complete.call_args_list[0].args[1]
+        self.assertEqual(mock_complete.call_count, 3)
+        first_evaluation_prompt = mock_complete.call_args_list[1].args[1]
         self.assertIn("Goal set before planning:", first_evaluation_prompt)
         self.assertIn("Evaluation criteria set before planning:", first_evaluation_prompt)
         self.assertIn("The answer directly addresses the user's request.", first_evaluation_prompt)
+        self.assertEqual(mock_complete.call_args_list[1].kwargs["max_output_tokens"], 80)
+        self.assertEqual(mock_complete.call_args_list[1].kwargs["reasoning_effort"], "minimal")
+
+    @patch("agent.views.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_final_evaluation_empty_response_keeps_current_answer(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = True
+            final_evaluation_max_retries = 3
+            final_evaluation_max_output_tokens = 80
+            final_evaluation_reasoning_effort = "minimal"
+            final_evaluation = {"llm_max_retries": 1}
+
+            def tool_enabled(self, name, default=False):
+                return False
+
+        mock_config.return_value = Config()
+        mock_stream.return_value = iter([("delta", "current answer"), ("response_id", "resp_1")])
+        mock_complete.side_effect = [None, ""]
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        body = b"".join(stream.streaming_content).decode()
+
+        self.assertIn("current answer", body)
+        self.assertIn("final evaluation could not be completed; keeping current answer", body)
+        self.assertNotIn("Revised direct answer after failed final evaluation", body)
+        self.assertEqual(mock_stream.call_count, 1)
+        self.assertEqual(mock_complete.call_count, 2)
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertEqual(assistant.content, "current answer")
+
+    @patch("agent.views.complete_response")
+    def test_final_evaluation_does_not_pass_incomplete_json(self, mock_complete):
+        class Config:
+            final_evaluation_max_output_tokens = 80
+            final_evaluation_reasoning_effort = "none"
+            final_evaluation = {"llm_max_retries": 0}
+
+        mock_complete.return_value = '{"adequate": true, "reason": "ユーザーの質問に対して、test'
+
+        result = _evaluate_final_answer(
+            Config(),
+            "User question",
+            "Answer the user's request.",
+            ["The answer directly addresses the request."],
+            "Candidate answer",
+        )
+
+        self.assertFalse(result["adequate"])
+        self.assertTrue(result["evaluation_failed"])
+        self.assertIn("JSON", result["reason"])
 
     def test_failed_final_evaluation_uses_different_plan(self):
         class Config:
@@ -403,6 +847,91 @@ class ChatFlowTests(TestCase):
         self.assertIn("Sandbox実行結果: 成功", assistant.content)
         self.assertIn("4", assistant.content)
         mock_run_sandbox.assert_called_once()
+        run = AgentRun.objects.get(assistant_message=assistant)
+        self.assertEqual(run.status, "complete")
+        self.assertEqual(run.final_message, assistant.content)
+        task = AgentTaskRecord.objects.get(run=run)
+        self.assertEqual(task.sequence, 1)
+        self.assertEqual(task.tool, "sandbox")
+        self.assertEqual(task.status, "ok")
+        self.assertIn("4", task.result)
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.load_runtime_config")
+    def test_sandbox_artifact_is_saved_by_host_broker(self, mock_config, mock_run_sandbox):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_config.return_value = Config()
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            output_path = root / "result.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+            mock_run_sandbox.return_value = SandboxResult(True, "4")
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"2 + 2を正確に計算して、結果を{output_path}に保存してください"},
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "4\n")
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertIn("Sandbox成果物の保存結果", assistant.content)
+        self.assertIn("OK:", assistant.content)
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.load_runtime_config")
+    def test_sandbox_artifact_json_is_saved_by_host_broker(self, mock_config, mock_run_sandbox):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_config.return_value = Config()
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            output_path = root / "artifact.txt"
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+            mock_run_sandbox.return_value = SandboxResult(
+                True,
+                "\n".join(
+                    [
+                        "artifact ready",
+                        "```json",
+                        json.dumps({"maigent_artifacts": [{"path": str(output_path), "content": "artifact\n", "append": False}]}),
+                        "```",
+                    ]
+                ),
+            )
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"Pythonで成果物を作成して{output_path}に保存してください"},
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+            self.assertEqual(output_path.read_text(encoding="utf-8"), "artifact\n")
 
     @patch("agent.tooling.subprocess.run")
     def test_sandbox_generates_program_for_natural_language_sum(self, mock_run):
@@ -622,6 +1151,24 @@ class ChatFlowTests(TestCase):
         self.assertTrue(requires_llm_sandbox_program(message))
         self.assertFalse(can_build_sandbox_program(message))
 
+    @patch("agent.tooling.subprocess.run")
+    def test_sandbox_executes_explicit_code_override_for_grouped_task(self, mock_run):
+        class Config:
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = "grouped result\n"
+        mock_run.return_value.stderr = ""
+        message = "test.csvのテストの点を科目ごとの平均点と合計点を教えてください。"
+
+        result = run_sandbox(message, Config(), code="print('grouped result')")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.output, "grouped result")
+        mock_run.assert_called_once()
+
     @patch("agent.views.stream_response")
     @patch("agent.views.run_sandbox")
     @patch("agent.views.load_runtime_config")
@@ -664,6 +1211,17 @@ class ChatFlowTests(TestCase):
         self.assertEqual([step.tool for step in plan.steps], ["final"])
         self.assertFalse(can_build_sandbox_program("正確に説明してください"))
 
+    def test_evaluation_criteria_are_loaded_from_prompt_file(self):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return True
+
+        plan = build_agent_plan("test.csvを要約して一覧にしてください", Config())
+
+        self.assertIn(evaluation_criterion("rag"), plan.evaluation_criteria)
+        self.assertIn(evaluation_criterion("summary"), plan.evaluation_criteria)
+        self.assertIn(evaluation_criterion("list"), plan.evaluation_criteria)
+
     def test_tool_selection_prefers_sandbox_for_calculation_when_enabled(self):
         class Config:
             def tool_enabled(self, name, default=False):
@@ -690,6 +1248,249 @@ class ChatFlowTests(TestCase):
         plan = build_agent_plan("test.csvの全てのテストの点を足し合わせてください。", Config())
 
         self.assertEqual([step.tool for step in plan.steps], ["rag", "sandbox"])
+
+    @patch("agent.views.complete_response")
+    def test_dynamic_replanner_can_replace_remaining_queue(self, mock_complete):
+        class Config:
+            dynamic_replanner = {
+                "enabled": True,
+                "reasoning_effort": True,
+                "max_output_tokens": 128,
+            }
+
+            def tool_enabled(self, name, default=False):
+                return name == "dynamic_replanner"
+
+        state = AgentState.from_plan(
+            AgentPlan(
+                goal="Answer the user's request: calculate",
+                evaluation_criteria=["The answer includes the computed result."],
+                summary="rag -> sandbox -> final",
+                steps=[AgentPlanStep("sandbox", "Run calculation.")],
+            ),
+            "calculate",
+        )
+        state.task_history.append(
+            TaskExecutionRecord(
+                task=AgentPlanStep("rag", "Search context."),
+                ok=True,
+                input_before="calculate",
+                input_after="calculate with context",
+                result="completed",
+            )
+        )
+        mock_complete.return_value = json.dumps(
+            {
+                "action": "replace",
+                "reason": "Need debugging before sandbox.",
+                "tasks": [{"tool": "sandbox", "purpose": "Run a narrower debug calculation."}],
+            }
+        )
+
+        decision = _replan_after_step(Config(), state)
+
+        self.assertEqual(decision.action, "replace")
+        self.assertEqual([step.tool for step in decision.plan_queue], ["sandbox"])
+        self.assertIn("debug", decision.plan_queue[0].purpose)
+        self.assertEqual(mock_complete.call_args.kwargs["max_output_tokens"], 128)
+        self.assertEqual(mock_complete.call_args.kwargs["reasoning_effort"], "medium")
+
+    @patch("agent.views.complete_response")
+    def test_dynamic_finalizer_can_add_validation_tasks(self, mock_complete):
+        class Config:
+            dynamic_finalizer = {
+                "enabled": True,
+                "reasoning_effort": "minimal",
+                "max_output_tokens": 80,
+            }
+
+            def tool_enabled(self, name, default=False):
+                return name == "dynamic_finalizer"
+
+        state = AgentState.from_plan(
+            AgentPlan(
+                goal="Answer the user's request: verify",
+                evaluation_criteria=["The answer is verified."],
+                summary="sandbox -> final",
+                steps=[],
+            ),
+            "verify",
+        )
+        state.final_message = "temporary artifact"
+        mock_complete.return_value = json.dumps(
+            {
+                "action": "add_tasks",
+                "reason": "Needs one more validation.",
+                "tasks": [{"tool": "sandbox", "purpose": "Validate the artifact."}],
+            }
+        )
+
+        decision = _route_final_output(Config(), state)
+
+        self.assertEqual(decision.action, "replace")
+        self.assertEqual([step.tool for step in decision.plan_queue], ["sandbox"])
+        self.assertEqual(mock_complete.call_args.kwargs["max_output_tokens"], 80)
+        self.assertEqual(mock_complete.call_args.kwargs["reasoning_effort"], "minimal")
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.views.complete_response")
+    def test_dynamic_finalizer_added_sandbox_task_is_executed(self, mock_complete, mock_generate_code, mock_run_sandbox):
+        class Config:
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+            dynamic_finalizer = {
+                "enabled": True,
+                "reasoning_effort": "minimal",
+                "max_output_tokens": 80,
+            }
+
+            def tool_enabled(self, name, default=False):
+                return name in {"dynamic_finalizer", "sandbox"}
+
+        mock_complete.side_effect = [
+            json.dumps(
+                {
+                    "action": "add_tasks",
+                    "reason": "Validate before final output.",
+                    "tasks": [{"tool": "sandbox", "purpose": "Validate the artifact."}],
+                }
+            ),
+            json.dumps({"action": "save", "reason": "Validated."}),
+        ]
+        mock_generate_code.return_value = "print('validated')"
+        mock_run_sandbox.return_value = SandboxResult(True, "validated")
+
+        plan = AgentPlan(
+            goal="Answer the user's request: verify",
+            evaluation_criteria=["The answer is verified."],
+            summary="web_search -> final",
+            steps=[AgentPlanStep("web_search", "Produce a temporary artifact.")],
+        )
+        runner = _execute_agent_plan(self.thread, "verify", Config(), plan)
+        while True:
+            try:
+                next(runner)
+            except StopIteration:
+                break
+
+        mock_generate_code.assert_called_once()
+        mock_run_sandbox.assert_called_once()
+        self.assertEqual(mock_complete.call_args_list[0].kwargs["max_output_tokens"], 80)
+        self.assertEqual(mock_complete.call_args_list[0].kwargs["reasoning_effort"], "minimal")
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.generate_sandbox_code")
+    def test_generated_sandbox_code_is_passed_directly_to_runner(self, mock_generate_code, mock_run_sandbox):
+        class Config:
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_generate_code.return_value = "print('computed')"
+        mock_run_sandbox.return_value = SandboxResult(True, "computed")
+        input_text = "\n".join(
+            [
+                "test.csvのテストの点を科目ごとの平均点と合計点を教えてください。",
+                "RAG context from allowed local files:",
+                "```text",
+                "名前,テストの種類,テストの点",
+                "佐藤太郎,国語,82",
+                "佐藤太郎,数学,76",
+                "```",
+            ]
+        )
+        plan = AgentPlan(
+            goal="Answer the user's request: grouped stats",
+            evaluation_criteria=["The answer includes computed grouped results."],
+            summary="sandbox -> final",
+            steps=[AgentPlanStep("sandbox", "Compute grouped statistics.")],
+        )
+
+        runner = _execute_agent_plan(self.thread, input_text, Config(), plan)
+        result = None
+        while True:
+            try:
+                next(runner)
+            except StopIteration as exc:
+                result = exc.value
+                break
+
+        self.assertTrue(result["ok"])
+        self.assertIn("Sandbox実行結果: 成功", result["final_message"])
+        self.assertEqual(mock_run_sandbox.call_args.kwargs["code"], "print('computed')")
+
+    @patch("agent.views.complete_response")
+    def test_llm_tool_selector_can_choose_rag_and_sandbox(self, mock_complete):
+        class Config:
+            tool_selector = {
+                "enabled": True,
+                "reasoning_effort": "low",
+                "max_output_tokens": 96,
+            }
+
+            def tool_enabled(self, name, default=False):
+                return name in {"tool_selector", "rag", "sandbox"} or default
+
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "numbers.txt").write_text("1\n2\n", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_complete.return_value = json.dumps(
+                {
+                    "steps": [
+                        {"tool": "rag", "purpose": "Find the numbers file."},
+                        {"tool": "sandbox", "purpose": "Compute the exact sum."},
+                    ],
+                    "rag_query": "numbers",
+                    "reason": "Needs file context and exact computation.",
+                }
+            )
+
+            from .views import _build_agent_plan_with_llm_tool_selection
+
+            plan = _build_agent_plan_with_llm_tool_selection(self.thread, "numbersファイルの合計を計算して", Config())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual([step.tool for step in plan.steps], ["rag", "sandbox", "final"])
+        self.assertEqual(plan.summary, "rag -> sandbox -> final (LLM-selected tools)")
+        self.assertEqual(plan.rag_query, "numbers")
+        kwargs = mock_complete.call_args.kwargs
+        self.assertEqual(kwargs["max_output_tokens"], 96)
+        self.assertEqual(kwargs["reasoning_effort"], "low")
+
+    @patch("agent.views.complete_response")
+    def test_llm_tool_selector_retries_empty_response(self, mock_complete):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return name in {"tool_selector", "rag"} or default
+
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "notes.txt").write_text("alpha", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_complete.side_effect = [
+                None,
+                json.dumps(
+                    {
+                        "steps": [{"tool": "rag", "purpose": "Search notes."}],
+                        "rag_query": "alpha",
+                        "reason": "Retry recovered.",
+                    }
+                ),
+            ]
+
+            from .views import _build_agent_plan_with_llm_tool_selection
+
+            plan = _build_agent_plan_with_llm_tool_selection(self.thread, "alphaについて教えて", Config())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual([step.tool for step in plan.steps], ["rag", "final"])
+        self.assertEqual(mock_complete.call_count, 2)
 
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
@@ -761,6 +1562,30 @@ class ChatFlowTests(TestCase):
         self.assertIn("fantasy_story.txt", input_text)
         self.assertIn("dragon castle forest", input_text)
         self.assertNotIn("budget.csv", input_text)
+
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_named_file_rag_prefers_exact_basename_match(self, mock_config, mock_stream):
+        mock_config.return_value.model = "test-model"
+        mock_config.return_value.api_key = "test-key"
+        mock_config.return_value.base_url = ""
+        mock_config.return_value.sources = []
+        mock_stream.return_value = iter([("delta", "ok")])
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "test.csv").write_text("名前,テストの点\nA,80\n", encoding="utf-8")
+            (root / "construct_prompt.md").write_text("test csv columns scores unrelated instructions", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+
+            create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "test.csvのテストの点を教えて"})
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+        input_text = mock_stream.call_args.args[1]
+        self.assertIn("test.csv", input_text)
+        self.assertIn("A,80", input_text)
+        self.assertNotIn("construct_prompt.md", input_text)
 
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
@@ -1125,3 +1950,156 @@ class OpenAIClientTests(TestCase):
             events = list(stream_response(Config(), "hello", "system"))
 
         self.assertEqual(events, [("delta", "ok"), ("response_id", "chat_1")])
+
+    def test_auto_complete_response_falls_back_to_chat_when_responses_is_empty(self):
+        class Config:
+            model = "model"
+            api_key = "key"
+            base_url = ""
+            api_mode = "auto"
+
+        class Responses:
+            def create(self, **kwargs):
+                return type("Response", (), {"output_text": "", "output": []})()
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                message = type("Message", (), {"content": "chat ok"})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Response", (), {"choices": [choice]})()
+
+        class Chat:
+            completions = ChatCompletions()
+
+        class Client:
+            responses = Responses()
+            chat = Chat()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()):
+            from .openai_client import complete_response
+
+            result = complete_response(Config(), "hello", "system", max_output_tokens=64)
+
+        self.assertEqual(result, "chat ok")
+        self.assertEqual(Client.chat.completions.kwargs["max_tokens"], 64)
+
+    def test_ollama_uses_openai_compatible_client_with_default_base_url_and_dummy_key(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "ollama": {
+                        "enabled": True,
+                        "model": "llama3.1",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                message = type("Message", (), {"content": "local ok"})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Response", (), {"choices": [choice]})()
+
+        class Chat:
+            completions = ChatCompletions()
+
+        class Client:
+            chat = Chat()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()) as mock_openai:
+            from .openai_client import complete_response
+
+            result = complete_response(config, "hello")
+
+        self.assertEqual(result, "local ok")
+        mock_openai.assert_called_once_with(api_key="ollama", base_url="http://localhost:11434/v1")
+
+    def test_azure_provider_uses_azure_client(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "azure": {
+                        "enabled": True,
+                        "model": "deployment",
+                        "api_key": "azure-key",
+                        "azure_endpoint": "https://example.openai.azure.com",
+                        "api_version": "2024-02-15-preview",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                message = type("Message", (), {"content": "azure ok"})()
+                choice = type("Choice", (), {"message": message})()
+                return type("Response", (), {"choices": [choice]})()
+
+        class Chat:
+            completions = ChatCompletions()
+
+        class Client:
+            chat = Chat()
+
+        with patch("agent.openai_client.AzureOpenAI", return_value=Client()) as mock_azure:
+            from .openai_client import complete_response
+
+            result = complete_response(config, "hello")
+
+        self.assertEqual(result, "azure ok")
+        mock_azure.assert_called_once_with(
+            api_key="azure-key",
+            azure_endpoint="https://example.openai.azure.com",
+            api_version="2024-02-15-preview",
+        )
+
+    def test_bedrock_provider_uses_converse(self):
+        config = RuntimeConfig(
+            values={
+                "providers": {
+                    "bedrock": {
+                        "enabled": True,
+                        "model": "anthropic.test-model",
+                        "region": "ap-northeast-1",
+                    }
+                }
+            },
+            sources=[],
+        )
+
+        class BedrockClient:
+            def converse(self, **kwargs):
+                self.kwargs = kwargs
+                return {"output": {"message": {"content": [{"text": "bedrock ok"}]}}}
+
+        with patch("agent.openai_client._bedrock_client", return_value=BedrockClient()):
+            from .openai_client import complete_response
+
+            result = complete_response(config, "hello", "system")
+
+        self.assertEqual(result, "bedrock ok")
+
+    def test_complete_response_passes_compact_response_options(self):
+        config = RuntimeConfig(values={"model": "gpt-test", "api_key": "key", "api_mode": "responses"}, sources=[])
+
+        class Responses:
+            def create(self, **kwargs):
+                self.kwargs = kwargs
+                return type("Response", (), {"output_text": "ok"})()
+
+        class Client:
+            responses = Responses()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()):
+            from .openai_client import complete_response
+
+            result = complete_response(config, "hello", max_output_tokens=64, reasoning_effort="none")
+
+        self.assertEqual(result, "ok")
+        self.assertEqual(Client.responses.kwargs["max_output_tokens"], 64)
+        self.assertEqual(Client.responses.kwargs["reasoning"], {"effort": "none"})

@@ -4,6 +4,7 @@ from django.utils import timezone
 
 from .access import is_path_allowed
 from .config import RuntimeConfig
+from .file_broker import file_write_enabled, write_allowed_text_file
 from .models import FeatureFlag, Message, Thread
 
 MAX_READ_CHARS = 12000
@@ -21,6 +22,7 @@ def handle_slash_command(thread: Thread, command_text: str, config: RuntimeConfi
             [
                 f"Project: {thread.project.name}",
                 f"Thread: {thread.title}",
+                f"Provider: {getattr(config, 'active_provider', 'openai') or 'none'}",
                 f"Model: {config.model or '未設定'}",
                 f"Config sources: {sources}",
                 f"Feature flags: {flag_text}",
@@ -38,6 +40,12 @@ def handle_slash_command(thread: Thread, command_text: str, config: RuntimeConfi
 
     if command in {"/file", "/files"}:
         return _handle_file(thread, parts)
+
+    if command == "/write":
+        return _handle_write(thread, command_text, append=False)
+
+    if command == "/append":
+        return _handle_write(thread, command_text, append=True)
 
     if command == "/compact":
         messages = thread.messages.order_by("-created_at")[:12]
@@ -124,6 +132,28 @@ def _handle_file(thread: Thread, parts: list[str]) -> str:
     lines.append("")
     lines.append("使い方: /file <path> または /read <file-path> / /ls <folder-path>")
     return "\n".join(lines)
+
+
+def _handle_write(thread: Thread, command_text: str, append: bool = False) -> str:
+    if not file_write_enabled():
+        return (
+            "ファイル書き込み機能が無効です。"
+            "右側の機能フラグで file_write を有効化するか、/features enable file_write を実行してください。"
+        )
+    command = "/append" if append else "/write"
+    body = command_text[len(command) :].lstrip()
+    path_text = ""
+    content = ""
+    if "\n" in body:
+        path_text, content = body.split("\n", 1)
+        path_text = path_text.strip()
+    elif " -- " in body:
+        path_text, content = body.split(" -- ", 1)
+        path_text = path_text.strip()
+    if not path_text:
+        return f"使い方: {command} <file-path> -- <content> または {command} <file-path> の次行に本文"
+    result = write_allowed_text_file(thread.project, path_text, content, append=append)
+    return result.message
 
 
 def _handle_ls(thread: Thread, parts: list[str]) -> str:

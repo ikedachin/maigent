@@ -139,3 +139,70 @@ class ApprovalRequest(models.Model):
 
     def __str__(self):
         return f"{self.status}: {self.command[:40]}"
+
+
+class AgentRun(models.Model):
+    STATUS_CHOICES = [
+        ("running", "Running"),
+        ("complete", "Complete"),
+        ("error", "Error"),
+    ]
+    thread = models.ForeignKey(Thread, related_name="agent_runs", on_delete=models.CASCADE)
+    user_message = models.ForeignKey(
+        Message,
+        related_name="agent_runs_as_user",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    assistant_message = models.ForeignKey(
+        Message,
+        related_name="agent_runs_as_assistant",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
+    attempt = models.PositiveIntegerField(default=1)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="running")
+    goal = models.TextField()
+    evaluation_criteria = models.JSONField(default=list, blank=True)
+    initial_plan_summary = models.TextField(blank=True)
+    current_plan_queue = models.JSONField(default=list, blank=True)
+    plan_history = models.JSONField(default=list, blank=True)
+    replan_history = models.JSONField(default=list, blank=True)
+    final_message = models.TextField(blank=True)
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"{self.status}: {self.goal[:40]}"
+
+
+class AgentTaskRecord(models.Model):
+    STATUS_CHOICES = [
+        ("ok", "OK"),
+        ("error", "Error"),
+    ]
+    run = models.ForeignKey(AgentRun, related_name="task_records", on_delete=models.CASCADE)
+    sequence = models.PositiveIntegerField()
+    tool = models.CharField(max_length=40)
+    purpose = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES)
+    input_before = models.TextField(blank=True)
+    input_after = models.TextField(blank=True)
+    result = models.TextField(blank=True)
+    error = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sequence", "created_at"]
+        constraints = [
+            models.UniqueConstraint(fields=["run", "sequence"], name="unique_agent_task_sequence"),
+        ]
+
+    def __str__(self):
+        return f"{self.run_id}:{self.sequence} {self.tool} {self.status}"

@@ -1,0 +1,16 @@
+Final goal:
+{{goal}}
+
+Evaluation criteria:
+{{evaluation_criteria}}
+
+Plan history:
+{{plan_history}}
+
+Task execution history:
+{{task_history}}
+
+Current plan_queue:
+{{plan_queue}}
+
+Decide whether to keep, replace, or finish.

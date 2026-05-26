@@ -69,6 +69,8 @@ const translations = {
     cmdFilePath: "ファイルなら読み取り、フォルダなら一覧表示",
     cmdRead: "許可済みファイルを読み取る",
     cmdLs: "許可済みフォルダの一覧を表示",
+    cmdWrite: "読み書き許可済みファイルへ書き込む",
+    cmdAppend: "読み書き許可済みファイルへ追記する",
     cmdExperimental: "試験的機能の状態を表示",
     cmdAgent: "エージェント設定の状態を表示",
     cmdTheme: "テーマ設定の状態を表示",
@@ -88,6 +90,7 @@ const translations = {
     partialProgress: "進行ログ（一部・最新3行）",
     error: "エラー",
     pending: "待機中",
+    elapsedTime: "実行時間",
     copy: "コピー",
     copied: "コピー済み",
     copyMessage: "メッセージをコピー",
@@ -157,6 +160,8 @@ const translations = {
     cmdFilePath: "Read a file or list a folder",
     cmdRead: "Read an allowed file",
     cmdLs: "List an allowed folder",
+    cmdWrite: "Write an allowed read/write file",
+    cmdAppend: "Append to an allowed read/write file",
     cmdExperimental: "Show experimental feature status",
     cmdAgent: "Show agent settings status",
     cmdTheme: "Show theme settings status",
@@ -176,6 +181,7 @@ const translations = {
     partialProgress: "Progress log (partial, latest 3 lines)",
     error: "error",
     pending: "pending",
+    elapsedTime: "Elapsed time",
     copy: "Copy",
     copied: "Copied",
     copyMessage: "Copy message",
@@ -300,6 +306,28 @@ function appendMessage(role, content, status) {
   return { article, pre, meta, progress };
 }
 
+function formatElapsed(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value < 0) return "";
+  if (value < 1000) return `${Math.max(1, Math.round(value))}ms`;
+  if (value < 10000) return `${(value / 1000).toFixed(1)}s`;
+  return `${Math.round(value / 1000)}s`;
+}
+
+function setElapsedTime(node, elapsedMs) {
+  const label = formatElapsed(elapsedMs);
+  if (!label) return;
+  const status = node.meta.querySelector("[data-status]");
+  if (!status) return;
+  const statusKey = status.dataset.status || "complete";
+  status.textContent = `${t(statusKey)} · ${label}`;
+  status.title = t("elapsedTime");
+}
+
+function updateLiveElapsedTime(node, startedAt) {
+  setElapsedTime(node, performance.now() - startedAt);
+}
+
 function setActivity(active, key = "running") {
   const indicator = document.querySelector("[data-activity-indicator]");
   const text = indicator?.querySelector("[data-activity-text]");
@@ -328,6 +356,16 @@ function scrollMessagesToBottom(behavior = "smooth") {
 
 function streamAssistant(url, node) {
   const source = new EventSource(url);
+  const startedAt = performance.now();
+  updateLiveElapsedTime(node, startedAt);
+  const elapsedTimer = window.setInterval(() => {
+    updateLiveElapsedTime(node, startedAt);
+  }, 250);
+
+  function stopElapsedTimer() {
+    window.clearInterval(elapsedTimer);
+  }
+
   source.onmessage = (event) => {
     const payload = JSON.parse(event.data);
     if (payload.progress_tail) {
@@ -344,13 +382,25 @@ function streamAssistant(url, node) {
       node.article.classList.add("error");
       node.pre.className = "";
       node.pre.textContent = payload.error;
-      node.meta.querySelector("small").textContent = t("error");
+      const status = node.meta.querySelector("[data-status]");
+      if (status) {
+        status.dataset.status = "error";
+        status.textContent = t("error");
+      }
+      setElapsedTime(node, payload.elapsed_ms);
+      stopElapsedTimer();
       setActivity(false);
       source.close();
     }
     if (payload.done) {
-      node.meta.querySelector("small").textContent = t("complete");
+      const status = node.meta.querySelector("[data-status]");
+      if (status) {
+        status.dataset.status = "complete";
+        status.textContent = t("complete");
+      }
+      setElapsedTime(node, payload.elapsed_ms);
       node.article.classList.remove("streaming");
+      stopElapsedTimer();
       setActivity(false);
       source.close();
     }
@@ -362,10 +412,16 @@ function streamAssistant(url, node) {
   source.onerror = () => {
     node.article.classList.add("error");
     node.pre.className = "";
-    node.meta.querySelector("small").textContent = t("error");
+    const status = node.meta.querySelector("[data-status]");
+    if (status) {
+      status.dataset.status = "error";
+      status.textContent = t("error");
+    }
+    setElapsedTime(node, performance.now() - startedAt);
     if (!node.pre.textContent.trim()) {
       node.pre.textContent = t("error");
     }
+    stopElapsedTimer();
     setActivity(false);
     source.close();
   };

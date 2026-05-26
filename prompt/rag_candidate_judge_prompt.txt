@@ -1,0 +1,5 @@
+User query:
+{{query}}
+
+Candidate files:
+{{candidate_files}}

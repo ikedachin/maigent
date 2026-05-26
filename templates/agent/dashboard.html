@@ -212,9 +212,19 @@
 
       <section class="panel">
         <h2 data-i18n="featureFlags">機能フラグ</h2>
-        <div class="chips">
+        <div class="feature-flag-list">
           {% for flag in feature_flags %}
-            <span class="chip {% if flag.enabled %}on{% endif %}">{{ flag.name }}</span>
+            <form class="feature-flag-item" method="post" action="{% url 'update_feature_flag' flag.id %}">
+              {% csrf_token %}
+              <input type="hidden" name="next" value="{{ request.path }}">
+              <div>
+                <span class="chip {% if flag.enabled %}on{% endif %}">{{ flag.name }}</span>
+                {% if flag.description %}<small>{{ flag.description }}</small>{% endif %}
+              </div>
+              <button class="secondary-light-button" type="submit" name="action" value="{% if flag.enabled %}disable{% else %}enable{% endif %}">
+                {% if flag.enabled %}OFF{% else %}ON{% endif %}
+              </button>
+            </form>
           {% empty %}
             <span class="muted" data-i18n="none">なし</span>
           {% endfor %}
@@ -276,6 +286,8 @@
           <div><code>/file /path/to/item</code><span data-i18n="cmdFilePath">ファイルなら読み取り、フォルダなら一覧表示</span></div>
           <div><code>/read /path/to/file</code><span data-i18n="cmdRead">許可済みファイルを読み取る</span></div>
           <div><code>/ls /path/to/folder</code><span data-i18n="cmdLs">許可済みフォルダの一覧を表示</span></div>
+          <div><code>/write /path/to/file -- text</code><span data-i18n="cmdWrite">読み書き許可済みファイルへ書き込む</span></div>
+          <div><code>/append /path/to/file -- text</code><span data-i18n="cmdAppend">読み書き許可済みファイルへ追記する</span></div>
           <div><code>/experimental</code><span data-i18n="cmdExperimental">試験的機能の状態を表示</span></div>
           <div><code>/agent</code><span data-i18n="cmdAgent">エージェント設定の状態を表示</span></div>
           <div><code>/theme</code><span data-i18n="cmdTheme">テーマ設定の状態を表示</span></div>

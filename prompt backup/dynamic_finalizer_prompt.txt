@@ -1,0 +1,10 @@
+Final goal:
+{{goal}}
+
+Task execution history:
+{{task_history}}
+
+Current artifacts or final message:
+{{artifacts}}
+
+Decide the final routing action.

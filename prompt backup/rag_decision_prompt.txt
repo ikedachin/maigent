@@ -1,0 +1,5 @@
+User question:
+{{user_text}}
+
+If the question asks about a specific named thing, fictional setting, private project, document, dataset, or local knowledge, prefer RAG_REQUIRED.
+If it is general knowledge, greeting, or purely conversational, use NO_RAG.

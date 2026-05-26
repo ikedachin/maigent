@@ -287,9 +287,9 @@ flowchart TD
     Mode -- "responses" --> Responses["Responses API"]
     Mode -- "chat" --> Chat["Chat Completions API"]
     Mode -- "auto" --> TryResponses["Try Responses API"]
-    TryResponses --> ResponsesOK{"Supported?"}
+    TryResponses --> ResponsesOK{"Supported and\nnon-empty output?"}
     ResponsesOK -- "Yes" --> Responses
-    ResponsesOK -- "No" --> Chat
+    ResponsesOK -- "No or empty" --> Chat
 
     Azure --> AzureChat["Azure Chat Completions\nmodel is deployment name"]
     Bedrock --> BedrockAuth["Use region/profile\nor configured AWS credentials"]
@@ -331,7 +331,17 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    GenerateOnce["_generate_once()"] --> BuildPlan["build_agent_plan()"]
+    GenerateOnce["_generate_once()"] --> Clarifier{"initial_clarifier enabled\nand not an obvious actionable tool plan?"}
+    Clarifier -- "Yes" --> ClarifyLLM["Ask LLM for missing-info JSON"]
+    ClarifyLLM --> NeedClarify{"needs_clarification\nand questions exist?"}
+    NeedClarify -- "Yes" --> ReturnQuestions["Return assistant message\nwith reason and up to 3 questions\nwithout creating AgentRun"]
+    NeedClarify -- "No / empty / invalid" --> ToolSelectorCheck
+    Clarifier -- "No" --> ToolSelectorCheck{"tool_selector enabled\nand tools available?"}
+    ToolSelectorCheck -- "Yes" --> SelectTools["Ask LLM for tool plan JSON\nrag / sandbox / web_search / final"]
+    SelectTools --> ValidTools{"Valid non-empty plan?"}
+    ValidTools -- "Yes" --> LLMPlan["Use LLM-selected plan\nand avoid duplicate final"]
+    ValidTools -- "No" --> BuildPlan
+    ToolSelectorCheck -- "No" --> BuildPlan["build_agent_plan()"]
     BuildPlan --> WebSearch{"web_search enabled\nand current/external topic?"}
     WebSearch -- "Yes" --> AddWeb["Add web_search step\ncurrently marked not implemented"]
     WebSearch -- "No" --> RagCheck
@@ -345,7 +355,8 @@ flowchart TD
     AnyStep -- "No" --> Direct["Add final step"]
     AnyStep -- "Yes" --> MaybeRagLLM
     Direct --> MaybeRagLLM["_apply_llm_rag_decision()\nonly for direct-answer plans with\nallowed local context sources"]
-    MaybeRagLLM --> AvoidFailed["_avoid_failed_plan()"]
+    LLMPlan --> AvoidFailed["_avoid_failed_plan()"]
+    MaybeRagLLM --> AvoidFailed
     AvoidFailed --> Execute["_execute_agent_plan()\ncreate AgentState with dynamic queue"]
     Execute --> PopTask["Pop one task from plan_queue"]
     PopTask --> RunTask["Run one tool task"]
@@ -396,8 +407,9 @@ flowchart TD
     CanBuild -- "Yes" --> LocalProgram["Use extracted Python,\nCSV/stat program, math expression,\nor numeric/count task program"]
     CanBuild -- "No" --> GenerateCode["generate_sandbox_code()\nvia active LLM provider"]
     GenerateCode --> CodeExists{"Generated code exists?"}
-    CodeExists -- "No" --> ContinueNoCode["Continue to final answer\nwith sandbox skipped trace"]
-    CodeExists -- "Yes" --> LocalProgram
+    CodeExists -- "No" --> NoProgram["Return Sandbox実行結果: 失敗\nno executable program generated"]
+    CodeExists -- "Yes" --> CodeOverride["Pass generated code directly to\nrun_sandbox(..., code=generated_code)"]
+    CodeOverride --> LocalProgram
     LocalProgram --> TempScript["Write script.py to temp dir"]
     TempScript --> InstallLibs{"install_libraries_on_run\nand allowed_libraries?"}
     InstallLibs -- "Yes" --> DockerNet["docker run with network\npip install allowed libs\nthen python /work/script.py"]
@@ -409,7 +421,7 @@ flowchart TD
     Artifact -- "No" --> Success["Return Sandbox実行結果: 成功"]
     Broker --> Success
     Result -- "No" --> Failure{"No executable code?\nor execution failure?"}
-    Failure -- "No executable code" --> ContinueNoCode
+    Failure -- "No executable code" --> NoCodeFail["Return Sandbox実行結果: 失敗\nno executable code or expression"]
     Failure -- "Execution failed" --> FailMessage["Return Sandbox実行結果: 失敗\nstdout/stderr"]
 ```
 
@@ -425,7 +437,9 @@ flowchart TD
     Generate --> AssistantError{"assistant status is error?"}
     AssistantError -- "Yes" --> ReturnError["Return error result"]
     AssistantError -- "No" --> Evaluate["_evaluate_final_answer()"]
-    Evaluate --> Adequate{"adequate?"}
+    Evaluate --> EvalFailed{"Evaluation LLM empty\nor malformed JSON?"}
+    EvalFailed -- "Yes" --> KeepCurrent["Keep current answer\nwithout replanning"]
+    EvalFailed -- "No" --> Adequate{"adequate?"}
     Adequate -- "Yes" --> ReturnPass["Return answer"]
     Adequate -- "No" --> More{"Attempts left?"}
     More -- "Yes" --> RecordFailure["Record failed plan\nand retry feedback"]

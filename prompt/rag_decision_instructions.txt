@@ -1,5 +1,16 @@
-Decide whether answering the user likely requires searching allowed local files.
-Do not return JSON. Return a short plain-text decision using these labels:
-RAG_REQUIRED or NO_RAG
-QUERY: concise search words if RAG_REQUIRED
-REASON: short reason
+許可されたローカルファイルを検索する必要がありそうかどうかを判断してください。
+JSON は返さないでください。以下のラベルを使って、短いプレーンテキストの判定を返してください。
+
+判定: RAG_REQUIRED または NO_RAG
+
+QUERY: RAG_REQUIRED の場合は、簡潔な検索語
+REASON: 簡潔な理由
+
+ローカルファイル検索が必要な場合:
+RAG_REQUIRED
+QUERY: 対象名 文書名 重要語
+REASON: 質問がローカル文書や非公開情報に依存している。
+
+ローカルファイル検索が不要な場合:
+NO_RAG
+REASON: 一般知識または会話だけで回答できる。

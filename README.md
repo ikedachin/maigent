@@ -26,6 +26,9 @@ api_mode: auto
 llm:
   max_retries: 1
 
+logging:
+  llm_tail_chars: 100
+
 final_evaluation:
   enabled: false
   max_retries: 3
@@ -44,6 +47,12 @@ tool_selector:
   reasoning_effort: none
   max_output_tokens: 160
   max_retries: 1
+
+initial_clarifier:
+  enabled: true
+  reasoning_effort: none
+  max_output_tokens: 192
+  llm_max_retries: 1
 
 dynamic_replanner:
   enabled: true
@@ -65,9 +74,13 @@ sandbox_code_generation:
 
 `llm.max_retries` は、空応答・`None`・例外が返ったLLM補助呼び出しの共通リトライ回数です。各セクションの `llm_max_retries` で個別に上書きできます。
 
+`logging.llm_tail_chars` は、LLMプロンプトやLLM応答をデバッグログへ出すときの末尾文字数です。標準は `100` です。全文を出す場合は `full`、`all`、`unlimited`、または `0` を指定します。
+
 `final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。最終評価のLLM呼び出しは `reasoning_effort`、`max_output_tokens`、`llm_max_retries` で軽量化と応答失敗時の再試行を設定できます。画面から保存した最終評価の有効/無効とリトライ回数はDBの `AppSetting` に保存され、設定ファイル値より優先されます。
 
-エージェント実行は、初期プランを `AgentState.plan_queue` に入れ、1タスクごとに実行履歴を保存しながら進めます。`tool_selector.enabled` が `true` の場合、LLMが利用可能tools一覧から `rag` / `sandbox` / `web_search` / `final` の実行順を短いJSONで選びます。この判定呼び出しは `reasoning_effort: none` と小さい `max_output_tokens` を指定して、低遅延・低コストに寄せています。空応答や不正JSONなどで失敗した場合は `max_retries` 回だけ再試行し、それでも失敗した場合は従来のルールベースプランへフォールバックします。`dynamic_replanner.enabled` が `true` の場合、各タスク後にLLMリプランナーが `goal`、`plan_history`、`task_history`、現在の `plan_queue` を見て、キュー維持・差し替え・終了をJSONで判断します。`dynamic_finalizer.enabled` が `true` の場合、終了時に成果物を保存相当で扱うか、破棄相当で終えるか、追加検証タスクを挿入するかをLLMで分岐します。設定未指定の `RuntimeConfig` ではこれらが有効です。
+プラン作成時の評価基準文は `prompt/evaluation_criteria.txt` から読み込みます。コード側は依頼内容に応じて `base`、`rag`、`sandbox`、`summary`、`list`、`rag_selected` の各セクションを選び、文面はプロンプトファイル側で調整できます。
+
+エージェント実行は、初期プランを `AgentState.plan_queue` に入れ、1タスクごとに実行履歴を保存しながら進めます。回答生成、sandboxコード生成、最終評価にはスレッド内の完了済み会話履歴をすべて入力し、最新ユーザーメッセージを明示します。プラン作成やRAG検索クエリの判定は最新ユーザーメッセージを基準にします。`initial_clarifier.enabled` が `true` の場合、初期プラン前にLLMが不足情報の有無をJSONで判定し、必要なら理由付きの確認質問を返して実行を止めます。`tool_selector.enabled` が `true` の場合、LLMが利用可能tools一覧から `rag` / `sandbox` / `web_search` / `final` の実行順を短いJSONで選びます。この判定呼び出しは `reasoning_effort: none` と小さい `max_output_tokens` を指定して、低遅延・低コストに寄せています。空応答や不正JSONなどで失敗した場合は `max_retries` 回だけ再試行し、それでも失敗した場合は従来のルールベースプランへフォールバックします。`dynamic_replanner.enabled` が `true` の場合、各タスク後にLLMリプランナーが `goal`、`plan_history`、`task_history`、現在の `plan_queue` を見て、キュー維持・差し替え・終了をJSONで判断します。`dynamic_finalizer.enabled` が `true` の場合、終了時に成果物を保存相当で扱うか、破棄相当で終えるか、追加検証タスクを挿入するかをLLMで分岐します。設定未指定の `RuntimeConfig` ではこれらが有効です。
 
 YAMLローダーはこのアプリ内の簡易実装です。基本的なネスト、真偽値、整数、リストには対応しますが、一般的なYAMLの全機能を使う設定は `config.toml` を推奨します。
 

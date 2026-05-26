@@ -32,7 +32,7 @@ PROVIDER_ENV_KEYS = {
 }
 
 OPENAI_COMPATIBLE_PROVIDERS = {"openai", "ollama", "lmstudio", "openrouter"}
-CONTROL_CONFIG_NAMES = {"tool_selector", "dynamic_replanner", "dynamic_finalizer"}
+CONTROL_CONFIG_NAMES = {"initial_clarifier", "tool_selector", "dynamic_replanner", "dynamic_finalizer"}
 
 
 @dataclass(frozen=True)
@@ -202,6 +202,22 @@ class RuntimeConfig:
     def final_evaluation_reasoning_effort(self) -> str:
         value = str(self.final_evaluation.get("reasoning_effort", "none")).strip().lower()
         return value if value in {"none", "minimal", "low", "medium", "high"} else "none"
+
+    @property
+    def logging(self) -> dict[str, Any]:
+        logging_config = self.values.get("logging", {})
+        return logging_config if isinstance(logging_config, dict) else {}
+
+    @property
+    def llm_log_tail_chars(self) -> int | None:
+        value = self.logging.get("llm_tail_chars", 100)
+        if isinstance(value, str) and value.strip().lower() in {"full", "all", "unlimited"}:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return 100
+        return None if parsed <= 0 else max(1, min(200000, parsed))
 
     def control_config(self, name: str) -> dict[str, Any]:
         config = self.values.get(name, {})

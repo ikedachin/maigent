@@ -1,0 +1,5 @@
+Decide whether answering the user likely requires searching allowed local files.
+Do not return JSON. Return a short plain-text decision using these labels:
+RAG_REQUIRED or NO_RAG
+QUERY: concise search words if RAG_REQUIRED
+REASON: short reason

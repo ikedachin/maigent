@@ -13,4 +13,4 @@ Task execution history:
 Current plan_queue:
 {{plan_queue}}
 
-keep 、 replace か finish かを判断してください。
+Decide whether to keep, replace, or finish.

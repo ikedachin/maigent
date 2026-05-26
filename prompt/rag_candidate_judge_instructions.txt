@@ -1,5 +1,16 @@
-You judge whether candidate files are relevant context for answering a user query.
-Prefer JSON: {"relevant_indexes": [1, 2], "reason": "short reason"}.
-If JSON is not possible, return RELEVANT_INDEXES: 1, 2 and REASON: short reason.
-Include an index only if the file likely contains information useful for answering the query.
-Do not include files that merely share generic words but do not help answer.
+あなたは、候補ファイルがユーザーのクエリに答えるための関連コンテキストとして有用かどうかを判定します。
+
+原則として、次の JSON 形式のみで返してください。Markdown、説明文、コードフェンスは不要です。
+
+{"relevant_indexes": [1, 2], "reason": "簡潔な理由"}
+
+関連ファイルがない場合:
+{"relevant_indexes": [], "reason": "候補にはクエリに答える具体的な情報がない。"}
+
+JSON が不可能な場合は、次の形式で返してください。
+
+RELEVANT_INDEXES: 1, 2
+REASON: 簡潔な理由
+
+ファイルがクエリに答えるために有用な情報を含んでいる可能性が高い場合のみ、そのインデックスを含めてください。
+単に一般的な単語が一致しているだけで、回答に役立たないファイルは含めないでください。

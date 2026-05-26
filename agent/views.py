@@ -27,6 +27,7 @@ from .tooling import (
     build_agent_goal,
     build_agent_plan,
     can_build_sandbox_program,
+    evaluation_criterion,
     run_sandbox,
 )
 
@@ -83,6 +84,13 @@ class LlmToolPlanDecision:
     steps: list[AgentPlanStep]
     rag_query: str
     reason: str
+
+
+@dataclass(frozen=True)
+class InitialClarification:
+    needed: bool
+    reason: str
+    questions: list[str]
 
 
 @dataclass
@@ -397,6 +405,7 @@ def stream_message(request, thread_id, message_id):
         return JsonResponse({"error": "no user message"}, status=400)
 
     config = load_runtime_config(thread.project.path)
+    conversation_input = _build_thread_conversation_input(thread, latest_user, assistant)
 
     def events():
         started_at = time.monotonic()
@@ -417,6 +426,7 @@ def stream_message(request, thread_id, message_id):
             result = yield from _generate_with_final_evaluation(
                 thread,
                 latest_user.content,
+                conversation_input,
                 config,
                 instructions,
                 emit_progress,
@@ -434,7 +444,7 @@ def stream_message(request, thread_id, message_id):
                 len(assistant.content),
                 assistant.openai_response_id or "",
             )
-            _log_tail("final_answer", assistant.content, thread_id=thread.id, assistant_id=assistant.id)
+            _log_tail("final_answer", assistant.content, config=config, thread_id=thread.id, assistant_id=assistant.id)
             elapsed_ms = int((time.monotonic() - started_at) * 1000)
             yield f"data: {json.dumps({'delta': assistant.content})}\n\n"
             yield f"data: {json.dumps({'done': True, 'message_id': assistant.id, 'elapsed_ms': elapsed_ms})}\n\n"
@@ -459,6 +469,29 @@ def _build_instructions(thread: Thread) -> str:
     return "\n".join(lines)
 
 
+def _build_thread_conversation_input(thread: Thread, latest_user: Message, assistant_message: Message | None = None) -> str:
+    messages = []
+    for message in thread.messages.order_by("created_at"):
+        if assistant_message and message.id == assistant_message.id:
+            continue
+        if message.id == latest_user.id:
+            continue
+        if message.role == "assistant" and message.status in {"pending", "streaming"} and not message.content.strip():
+            continue
+        content = message.content.strip()
+        if not content:
+            continue
+        messages.append(f"{message.role}:\n{content}")
+    history = "\n\n".join(messages)
+    return (
+        "Thread conversation history:\n"
+        f"{history}\n\n"
+        "Answer the latest user message using the full conversation history above.\n"
+        "Latest user message:\n"
+        f"{latest_user.content}"
+    )
+
+
 def _format_sandbox_message(ok: bool, output: str) -> str:
     status = "成功" if ok else "失敗"
     return f"Sandbox実行結果: {status}\n\n```text\n{output}\n```"
@@ -468,17 +501,27 @@ def _sse(payload: dict[str, object]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _log_tail(label: str, text: object, **fields: object) -> None:
+def _log_tail(label: str, text: object, config=None, **fields: object) -> None:
     value = str(text or "")
+    tail_chars = _llm_log_tail_chars(config)
+    preview = value if tail_chars is None else value[-tail_chars:]
     metadata = " ".join(f"{key}={value!r}" for key, value in fields.items())
     if metadata:
         metadata = " " + metadata
-    logger.debug("%s_tail chars=%s tail=%r%s", label, len(value), value[-100:], metadata)
+    logger.debug("%s_tail chars=%s tail=%r%s", label, len(value), preview, metadata)
+
+
+def _llm_log_tail_chars(config) -> int | None:
+    if config is None:
+        return 100
+    value = getattr(config, "llm_log_tail_chars", 100)
+    return value if value is None or isinstance(value, int) else 100
 
 
 def _generate_with_final_evaluation(
     thread: Thread,
     user_text: str,
+    input_text: str,
     config,
     instructions: str,
     progress=None,
@@ -513,6 +556,7 @@ def _generate_with_final_evaluation(
         result = yield from _generate_once(
             thread,
             user_text,
+            input_text,
             config,
             instructions,
             attempt,
@@ -545,11 +589,18 @@ def _generate_with_final_evaluation(
                 result["plan_summary"],
             )
             return result
+        if result.get("clarification_requested"):
+            logger.debug(
+                "final_evaluation_skipped thread_id=%s reason=clarification_requested plan=%r",
+                thread.id,
+                result["plan_summary"],
+            )
+            return result
         if progress:
             yield _sse(progress(f"Attempt {attempt}: evaluating answer completeness."))
         goal = str(result.get("goal") or build_agent_goal(user_text))
         evaluation_criteria = list(result.get("evaluation_criteria") or build_agent_evaluation_criteria(user_text))
-        evaluation = _evaluate_final_answer(config, user_text, goal, evaluation_criteria, last_content)
+        evaluation = _evaluate_final_answer(config, input_text, goal, evaluation_criteria, last_content)
         logger.debug(
             "final_evaluation_result thread_id=%s attempt=%s goal=%r criteria=%s adequate=%s reason=%r",
             thread.id,
@@ -616,6 +667,7 @@ def _generate_with_final_evaluation(
 def _generate_once(
     thread: Thread,
     user_text: str,
+    input_text: str,
     config,
     instructions: str,
     attempt: int,
@@ -625,6 +677,27 @@ def _generate_once(
     user_message: Message | None = None,
     assistant_message: Message | None = None,
 ):
+    clarification = _request_initial_clarification_if_needed(config, input_text, latest_user_text=user_text)
+    if clarification:
+        content = _format_initial_clarification_message(clarification)
+        if progress:
+            yield _sse(progress("Clarification: asking for missing information before planning."))
+        logger.debug(
+            "initial_clarification_requested thread_id=%s attempt=%s reason=%r questions=%s",
+            thread.id,
+            attempt,
+            clarification.reason[:240],
+            clarification.questions,
+        )
+        return {
+            "content": content,
+            "status": "complete",
+            "response_id": "",
+            "goal": build_agent_goal(user_text),
+            "evaluation_criteria": build_agent_evaluation_criteria(user_text),
+            "plan_summary": "Clarification requested before planning.",
+            "clarification_requested": True,
+        }
     plan = _build_agent_plan_with_llm_tool_selection(thread, user_text, config)
     if not plan:
         plan = build_agent_plan(user_text, config)
@@ -645,7 +718,7 @@ def _generate_once(
     )
     run = _create_agent_run(thread, user_message, assistant_message, attempt, plan)
     try:
-        plan_result = yield from _execute_agent_plan(thread, user_text, config, plan, progress, run=run)
+        plan_result = yield from _execute_agent_plan(thread, user_text, config, plan, progress, run=run, input_text=input_text)
     except Exception as exc:
         _finish_agent_run(run, "error", error=str(exc))
         raise
@@ -666,7 +739,7 @@ def _generate_once(
     content_parts: list[str] = []
     response_id = ""
     logger.debug("llm_start thread_id=%s attempt=%s input_chars=%s", thread.id, attempt, len(input_text))
-    _log_tail("llm_prompt", input_text, thread_id=thread.id, attempt=attempt, purpose="answer_generation")
+    _log_tail("llm_prompt", input_text, config=config, thread_id=thread.id, attempt=attempt, purpose="answer_generation")
     if progress:
         yield _sse(progress("LLM: generating candidate answer."))
     try:
@@ -757,11 +830,11 @@ def _build_agent_plan_with_llm_tool_selection(thread: Thread, user_text: str, co
     criteria = build_agent_evaluation_criteria(user_text)
     tool_names = [step.tool for step in decision.steps]
     if "rag" in tool_names:
-        rag_criterion = "If local file context may contain the answer, the answer must use RAG context or clearly state that allowed files do not contain enough information."
+        rag_criterion = evaluation_criterion("rag_selected")
         if rag_criterion not in criteria:
             criteria.append(rag_criterion)
     if "sandbox" in tool_names:
-        sandbox_criterion = "If exact computation or code execution is requested, the answer includes the computed result and does not rely on unsupported mental arithmetic."
+        sandbox_criterion = evaluation_criterion("sandbox")
         if sandbox_criterion not in criteria:
             criteria.append(sandbox_criterion)
     plan = AgentPlan(
@@ -781,10 +854,71 @@ def _build_agent_plan_with_llm_tool_selection(thread: Thread, user_text: str, co
     return plan
 
 
+def _request_initial_clarification_if_needed(config, user_text: str, latest_user_text: str = "") -> InitialClarification | None:
+    if not _initial_clarifier_llm_enabled(config):
+        return None
+    if _should_skip_initial_clarifier(latest_user_text or user_text, config):
+        logger.debug("initial_clarifier_skipped reason=actionable_tool_plan")
+        return None
+    decision = _decide_initial_clarification(config, user_text)
+    if not decision or not decision.needed or not decision.questions:
+        return None
+    return decision
+
+
+def _should_skip_initial_clarifier(user_text: str, config) -> bool:
+    text = user_text.strip()
+    if not text:
+        return False
+    plan = build_agent_plan(text, config)
+    planned_tools = {step.tool for step in plan.steps}
+    actionable_tools = {"rag", "sandbox", "web_search"}
+    return bool(planned_tools & actionable_tools)
+
+
+def _decide_initial_clarification(config, user_text: str) -> InitialClarification | None:
+    instructions = load_prompt("initial_clarifier_instructions.txt")
+    prompt = load_prompt("initial_clarifier_prompt.txt", user_text=user_text)
+    _log_tail("llm_prompt", prompt, config=config, purpose="initial_clarifier")
+    raw = _complete_response_with_retries(
+        config,
+        prompt,
+        instructions,
+        purpose="initial_clarifier",
+        config_name="initial_clarifier",
+        max_output_tokens=_initial_clarifier_max_output_tokens(config),
+        reasoning_effort=_initial_clarifier_reasoning_effort(config),
+        log_exceptions=False,
+    )
+    if not raw:
+        return None
+    _log_tail("initial_clarifier_raw", raw, config=config)
+    try:
+        payload = json.loads(_extract_json_object(raw))
+    except Exception:
+        logger.debug("initial_clarifier_parse_fallback raw=%r", raw[:240])
+        return None
+    questions_value = payload.get("questions", [])
+    if not isinstance(questions_value, list):
+        return None
+    questions = [str(question).strip() for question in questions_value if str(question).strip()][:3]
+    return InitialClarification(
+        needed=bool(payload.get("needs_clarification")),
+        reason=str(payload.get("reason") or "").strip(),
+        questions=questions,
+    )
+
+
+def _format_initial_clarification_message(clarification: InitialClarification) -> str:
+    reason = clarification.reason or "実行前に確認が必要です。"
+    questions = "\n".join(f"{index}. {question}" for index, question in enumerate(clarification.questions[:3], start=1))
+    return f"{reason}\n\n{questions}" if questions else reason
+
+
 def _select_tools_with_llm(config, user_text: str, tools: list[dict[str, str]]) -> LlmToolPlanDecision | None:
     instructions = load_prompt("tool_selection_instructions.txt")
     prompt = load_prompt("tool_selection_prompt.txt", user_text=user_text, tools=json.dumps(tools, ensure_ascii=False))
-    _log_tail("llm_prompt", prompt, purpose="tool_selection")
+    _log_tail("llm_prompt", prompt, config=config, purpose="tool_selection")
     payload = None
     max_attempts = _tool_selector_max_retries(config) + 1
     for attempt in range(1, max_attempts + 1):
@@ -802,7 +936,7 @@ def _select_tools_with_llm(config, user_text: str, tools: list[dict[str, str]]) 
         if not raw:
             logger.debug("tool_selection_empty_response attempt=%s/%s", attempt, max_attempts)
             continue
-        _log_tail("tool_selection_raw", raw)
+        _log_tail("tool_selection_raw", raw, config=config)
         try:
             payload = json.loads(_extract_json_object(raw))
             break
@@ -841,6 +975,18 @@ def _available_tool_specs(thread: Thread, config) -> list[dict[str, str]]:
 
 def _tool_selector_llm_enabled(config) -> bool:
     return _tool_enabled(config, "tool_selector", default=isinstance(config, RuntimeConfig))
+
+
+def _initial_clarifier_llm_enabled(config) -> bool:
+    return _tool_enabled(config, "initial_clarifier", default=isinstance(config, RuntimeConfig))
+
+
+def _initial_clarifier_max_output_tokens(config) -> int:
+    return _control_config_int(config, "initial_clarifier", "max_output_tokens", 192, minimum=32, maximum=2048)
+
+
+def _initial_clarifier_reasoning_effort(config) -> str:
+    return _control_config_reasoning_effort(config, "initial_clarifier", "reasoning_effort", "none")
 
 
 def _tool_selector_max_output_tokens(config) -> int:
@@ -914,11 +1060,11 @@ def _has_allowed_context_sources(thread: Thread) -> bool:
 def _decide_rag_with_llm(config, user_text: str) -> LlmRagDecision:
     instructions = load_prompt("rag_decision_instructions.txt")
     prompt = load_prompt("rag_decision_prompt.txt", user_text=user_text)
-    _log_tail("llm_prompt", prompt, purpose="rag_decision")
+    _log_tail("llm_prompt", prompt, config=config, purpose="rag_decision")
     raw = _complete_response_with_retries(config, prompt, instructions, purpose="rag_decision", config_name="rag_decision")
     if not raw:
         return LlmRagDecision(False, "", "decision failed: empty LLM response")
-    _log_tail("rag_decision_raw", raw)
+    _log_tail("rag_decision_raw", raw, config=config)
     value = _text_value(raw)
     normalized = value["value"].strip()
     upper = normalized.upper()
@@ -932,7 +1078,8 @@ def _summarize_revised_plan(steps: list[AgentPlanStep], suffix: str) -> str:
     names = [step.tool for step in steps]
     if names == ["final"]:
         return f"Revised direct answer ({suffix})."
-    return " -> ".join(names) + f" -> final ({suffix})"
+    summary_names = names if names and names[-1] == "final" else [*names, "final"]
+    return " -> ".join(summary_names) + f" ({suffix})"
 
 
 def _tool_enabled(config, name: str, default: bool = False) -> bool:
@@ -958,7 +1105,7 @@ def _evaluate_final_answer(config, user_text: str, goal: str, evaluation_criteri
         evaluation_criteria="\n".join(f"- {criterion}" for criterion in evaluation_criteria),
         answer=answer,
     )
-    _log_tail("llm_prompt", prompt, purpose="final_evaluation")
+    _log_tail("llm_prompt", prompt, config=config, purpose="final_evaluation")
     raw = _complete_response_with_retries(
         config,
         prompt,
@@ -970,16 +1117,19 @@ def _evaluate_final_answer(config, user_text: str, goal: str, evaluation_criteri
     )
     if not raw:
         return {"adequate": False, "reason": "評価に失敗しました: LLMから空の応答が返りました。", "evaluation_failed": True}
-    _log_tail("final_evaluation_raw", raw)
+    _log_tail("final_evaluation_raw", raw, config=config)
     normalized = _text_value(raw)["value"]
     try:
         payload = json.loads(_extract_json_object(normalized))
         return {"adequate": bool(payload.get("adequate")), "reason": str(payload.get("reason") or "")}
     except Exception:
+        if normalized.lstrip().startswith("{") or "adequate" in normalized.lower():
+            logger.debug("final_evaluation_parse_failed raw=%r", normalized[:240])
+            return {"adequate": False, "reason": "評価結果のJSONが不完全または不正でした。", "evaluation_failed": True}
         upper = normalized.upper()
-        if "INADEQUATE" in upper or "FAIL" in upper:
+        if re.search(r"\b(INADEQUATE|FAIL|FAILED)\b", upper):
             return {"adequate": False, "reason": _extract_labeled_value(normalized, "REASON") or normalized[:240]}
-        if "ADEQUATE" in upper or "PASS" in upper:
+        if re.search(r"\b(ADEQUATE|PASS|PASSED)\b", upper):
             return {"adequate": True, "reason": _extract_labeled_value(normalized, "REASON") or normalized[:240]}
         logger.debug("final_evaluation_parse_fallback raw=%r", normalized[:240])
         return {"adequate": False, "reason": "評価結果を解釈できませんでした。", "evaluation_failed": True}
@@ -1045,7 +1195,7 @@ def _llm_response_max_retries(config, config_name: str, default: int = 1) -> int
 
 
 def _config_mapping(config, name: str) -> dict:
-    if name in {"tool_selector", "dynamic_replanner", "dynamic_finalizer"}:
+    if name in {"initial_clarifier", "tool_selector", "dynamic_replanner", "dynamic_finalizer"}:
         return _control_config(config, name)
     try:
         value = getattr(config, name, {})
@@ -1103,7 +1253,7 @@ def _extract_json_object(text: str) -> str:
 
 def _replan_after_step(config, state: AgentState) -> ReplanDecision:
     if state.final_message:
-        return ReplanDecision("finish", "task produced a terminal result", list(state.plan_queue), state.final_message)
+        return ReplanDecision("finish", "task produced a terminal result", [], state.final_message)
     latest = state.task_history[-1] if state.task_history else None
     if latest and latest.error:
         return ReplanDecision("finish", "task failed with an unrecoverable error", list(state.plan_queue), latest.error)
@@ -1124,7 +1274,7 @@ def _replan_after_step_with_llm(config, state: AgentState) -> ReplanDecision | N
         task_history=_format_task_history(state),
         plan_queue=_format_plan_queue(state.plan_queue),
     )
-    _log_tail("llm_prompt", prompt, purpose="dynamic_replanner")
+    _log_tail("llm_prompt", prompt, config=config, purpose="dynamic_replanner")
     raw = _complete_response_with_retries(
         config,
         prompt,
@@ -1136,7 +1286,7 @@ def _replan_after_step_with_llm(config, state: AgentState) -> ReplanDecision | N
     )
     if not raw:
         return None
-    _log_tail("dynamic_replanner_raw", raw)
+    _log_tail("dynamic_replanner_raw", raw, config=config)
     try:
         payload = json.loads(_extract_json_object(raw))
     except Exception:
@@ -1168,7 +1318,7 @@ def _route_final_output(config, state: AgentState) -> ReplanDecision:
         task_history=_format_task_history(state),
         artifacts=state.final_message or state.input_text[-4000:],
     )
-    _log_tail("llm_prompt", prompt, purpose="dynamic_finalizer")
+    _log_tail("llm_prompt", prompt, config=config, purpose="dynamic_finalizer")
     raw = _complete_response_with_retries(
         config,
         prompt,
@@ -1180,7 +1330,7 @@ def _route_final_output(config, state: AgentState) -> ReplanDecision:
     )
     if not raw:
         return ReplanDecision("keep", "final routing failed; finishing with current output", [])
-    _log_tail("dynamic_finalizer_raw", raw)
+    _log_tail("dynamic_finalizer_raw", raw, config=config)
     try:
         payload = json.loads(_extract_json_object(raw))
     except Exception:
@@ -1358,8 +1508,16 @@ def _truncate_db_text(text: object, limit: int = 12000) -> str:
     return value[:limit] + "\n[truncated]"
 
 
-def _execute_agent_plan(thread: Thread, user_text: str, config, plan: AgentPlan, progress=None, run: AgentRun | None = None):
-    state = AgentState.from_plan(plan, user_text, run=run)
+def _execute_agent_plan(
+    thread: Thread,
+    user_text: str,
+    config,
+    plan: AgentPlan,
+    progress=None,
+    run: AgentRun | None = None,
+    input_text: str | None = None,
+):
+    state = AgentState.from_plan(plan, input_text or user_text, run=run)
     _sync_agent_run_state(state)
     plan_trace = [
         f"Agent goal: {plan.goal}",
@@ -1431,6 +1589,7 @@ def _execute_agent_plan(thread: Thread, user_text: str, config, plan: AgentPlan,
             ),
             progress,
             run=state.run,
+            input_text=state.input_text,
         ))
     if state.final_message:
         return {
@@ -1464,7 +1623,7 @@ def _execute_agent_task(
             "final_message": "Web検索ツールは計画で選択されましたが、まだ未実装です。",
         }
     if step.tool == "rag":
-        rag = _build_rag_input(thread, user_text, preferred_rag_query)
+        rag = _build_rag_input(thread, user_text, preferred_rag_query, input_text)
         if rag.searched and not rag.has_context:
             logger.debug("agent_step_result thread_id=%s tool=rag status=no_context query=%r", thread.id, rag.query)
             if progress:
@@ -1480,11 +1639,12 @@ def _execute_agent_task(
             yield _sse(progress(f"Tool rag: context found for query '{rag.query or '(none)'}'."))
         return {"ok": True, "input_text": _prepend_plan_trace(rag.input_text, plan_trace), "final_message": ""}
     if step.tool == "sandbox":
+        generated_code = ""
         if not can_build_sandbox_program(input_text):
             logger.debug("sandbox_code_generation_start thread_id=%s", thread.id)
             if progress:
                 yield _sse(progress("Tool sandbox: generating executable program."))
-            _log_tail("llm_prompt", input_text, thread_id=thread.id, purpose="sandbox_code_generation")
+            _log_tail("llm_prompt", input_text, config=config, thread_id=thread.id, purpose="sandbox_code_generation")
             generated_code = _generate_sandbox_code_with_retries(config, input_text)
             if not generated_code.strip():
                 plan_trace.append("Sandbox result: skipped before execution; no executable program could be generated.")
@@ -1494,14 +1654,18 @@ def _execute_agent_task(
                 )
                 if progress:
                     yield _sse(progress("Tool sandbox: skipped because no executable program was generated."))
-                return {"ok": True, "input_text": _prepend_plan_trace(input_text, plan_trace), "final_message": ""}
+                return {
+                    "ok": False,
+                    "input_text": _prepend_plan_trace(input_text, plan_trace),
+                    "final_message": _format_sandbox_message(False, "sandboxで実行するPythonコードを生成できませんでした。"),
+                }
             logger.debug(
                 "sandbox_code_generation_done thread_id=%s code_preview=%r",
                 thread.id,
                 generated_code[:240],
             )
             input_text = input_text + "\n\nGenerated sandbox program:\n```python\n" + generated_code + "\n```"
-        result = run_sandbox(input_text, config)
+        result = run_sandbox(input_text, config, code=generated_code)
         if not result.ok and "Pythonコードまたは計算式を特定できませんでした" in result.output:
             plan_trace.append("Sandbox result: skipped; no executable code or numeric data was found.")
             logger.debug(
@@ -1510,7 +1674,11 @@ def _execute_agent_task(
             )
             if progress:
                 yield _sse(progress("Tool sandbox: skipped because executable code or numeric data was not found."))
-            return {"ok": True, "input_text": _prepend_plan_trace(input_text, plan_trace), "final_message": ""}
+            return {
+                "ok": False,
+                "input_text": _prepend_plan_trace(input_text, plan_trace),
+                "final_message": _format_sandbox_message(False, result.output),
+            }
         if not _is_sandbox_result_adequate(result.ok, result.output):
             logger.debug(
                 "agent_step_result thread_id=%s tool=sandbox status=failed output_preview=%r",
@@ -1649,6 +1817,11 @@ def _tool_settings(config) -> list[dict[str, str]]:
             "detail": f"{config.sandbox_image}; libs: {sandbox_libraries}",
         },
         {
+            "name": "initial_clarifier",
+            "enabled": "on" if _initial_clarifier_llm_enabled(config) else "off",
+            "detail": f"LLM missing-info check; max output: {_initial_clarifier_max_output_tokens(config)}; reasoning: {_initial_clarifier_reasoning_effort(config)}",
+        },
+        {
             "name": "dynamic_replanner",
             "enabled": "on" if _tool_enabled(config, "dynamic_replanner", default=isinstance(config, RuntimeConfig)) else "off",
             "detail": "LLM queue rewrite after each task",
@@ -1694,20 +1867,21 @@ def _get_final_evaluation_settings(config) -> FinalEvaluationSettings:
     return FinalEvaluationSettings(enabled=enabled, max_retries=max(0, min(3, max_retries)))
 
 
-def _build_rag_input(thread: Thread, user_text: str, preferred_query: str = "") -> RagResult:
+def _build_rag_input(thread: Thread, user_text: str, preferred_query: str = "", answer_text: str = "") -> RagResult:
+    answer_text = answer_text or user_text
     if not preferred_query.strip() and not _should_search(user_text):
         logger.debug("rag_decision thread_id=%s search=false", thread.id)
-        return RagResult(input_text=user_text, searched=False, has_context=False)
+        return RagResult(input_text=answer_text, searched=False, has_context=False)
     top_k = _get_rag_top_k()
     query = preferred_query.strip() or _build_answer_query(user_text)
     logger.debug("rag_decision thread_id=%s search=true query=%r top_k=%s", thread.id, query, top_k)
     attachments = _collect_allowed_path_context(thread, user_text, top_k=top_k, answer_query=query)
     if not attachments:
         logger.debug("rag_result thread_id=%s status=no_context query=%r", thread.id, query)
-        return RagResult(input_text=user_text, searched=True, has_context=False, query=query)
+        return RagResult(input_text=answer_text, searched=True, has_context=False, query=query)
     logger.debug("rag_result thread_id=%s status=has_context query=%r attachments=%s", thread.id, query, len(attachments))
     input_text = (
-        user_text
+        answer_text
         + f"\n\nRAG search query: {query}"
         + "\n\nRAG context from allowed local files:\n"
         + "\n\n".join(attachments)
@@ -1865,6 +2039,17 @@ def _collect_relevant_allowed_files(thread: Thread, text: str, top_k: int = DEFA
     if not terms:
         return []
     docs = _collect_candidate_documents(thread)
+    named_files = _extract_named_file_tokens(text)
+    if named_files:
+        exact_matches = [path for path, _doc_text in docs if path.name.lower() in named_files]
+        if exact_matches:
+            logger.debug(
+                "rag_named_file_match thread_id=%s names=%s paths=%s",
+                thread.id,
+                sorted(named_files),
+                [str(path) for path in exact_matches[:top_k]],
+            )
+            return [_read_context_file_limited(path, AUTO_CONTEXT_FILE_CHARS) for path in exact_matches[:top_k]]
     ranked = _rank_bm25(terms, docs)
     logger.debug(
         "bm25_rank thread_id=%s query_terms=%s candidates=%s ranked_top=%s",
@@ -1879,6 +2064,11 @@ def _collect_relevant_allowed_files(thread: Thread, text: str, top_k: int = DEFA
     logger.debug("bm25_adequacy thread_id=%s adequate=true", thread.id)
     relevant = [(score, path) for score, path in ranked if score >= RAG_MIN_BM25_SCORE]
     return [_read_context_file_limited(path, AUTO_CONTEXT_FILE_CHARS) for score, path in relevant[:top_k]]
+
+
+def _extract_named_file_tokens(text: str) -> set[str]:
+    pattern = r"[a-z0-9_.-]+\.(?:csv|tsv|txt|md|json|yaml|yml|py|html|xml|pdf|docx|xlsx|pptx)"
+    return {match.lower() for match in re.findall(pattern, text.lower())}
 
 
 def _collect_llm_judged_relevant_files(
@@ -1927,7 +2117,7 @@ def _judge_rag_candidate_paths_with_llm(
         return []
     instructions = load_prompt("rag_candidate_judge_instructions.txt")
     prompt = load_prompt("rag_candidate_judge_prompt.txt", query=query, candidate_files="\n\n".join(snippets))
-    _log_tail("llm_prompt", prompt, thread_id=thread.id, purpose="rag_candidate_judge")
+    _log_tail("llm_prompt", prompt, config=config, thread_id=thread.id, purpose="rag_candidate_judge")
     raw = _complete_response_with_retries(
         config,
         prompt,
@@ -1937,7 +2127,7 @@ def _judge_rag_candidate_paths_with_llm(
     )
     if not raw:
         return []
-    _log_tail("rag_candidate_judge_raw", raw, thread_id=thread.id)
+    _log_tail("rag_candidate_judge_raw", raw, config=config, thread_id=thread.id)
     indexes = _parse_integer_list_from_text(raw)
     if not indexes:
         return []

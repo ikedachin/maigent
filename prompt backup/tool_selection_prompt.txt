@@ -1,0 +1,7 @@
+User request:
+{{user_text}}
+
+Available tools:
+{{tools}}
+
+Return the JSON decision.

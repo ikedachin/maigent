@@ -96,9 +96,19 @@ def _complete_response(
     if config.api_mode == "responses":
         return _complete_responses(client, config, input_text, instructions, max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort)
     try:
-        return _complete_responses(client, config, input_text, instructions, max_output_tokens=max_output_tokens, reasoning_effort=reasoning_effort)
+        response = _complete_responses(
+            client,
+            config,
+            input_text,
+            instructions,
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+        )
+        if response.strip():
+            return response
     except Exception:
-        return _complete_chat_completions(client, config, input_text, instructions, max_output_tokens=max_output_tokens)
+        pass
+    return _complete_chat_completions(client, config, input_text, instructions, max_output_tokens=max_output_tokens)
 
 
 def _complete_responses(

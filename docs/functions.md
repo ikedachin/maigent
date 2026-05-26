@@ -19,17 +19,19 @@
 
 1. ユーザーがメッセージを送信する
 2. `load_runtime_config()` で設定を読み込む
-3. `tool_selector` が有効ならLLMに初期ツール列を選ばせる
-4. 失敗した場合は `build_agent_plan()` でルールベースプランを作る
-5. `AgentState.plan_queue` にタスクを入れる
-6. 先頭タスクを1つ実行する
-7. タスク結果を `AgentTaskRecord` に保存する
-8. `dynamic_replanner` が有効なら残りキューを維持/置換/終了する
-9. キューが空になったら `dynamic_finalizer` が成果物の扱いを判断する
-10. 必要なら追加タスクを実行する
-11. 回答候補を生成する
-12. `final_evaluation` が有効なら回答を評価し、不十分なら再プランする
-13. `Message` と `AgentRun` に結果を保存する
+3. 完了済み会話履歴を時系列でまとめ、最新ユーザーメッセージを明示したLLM入力を作る
+4. `initial_clarifier` が有効なら会話履歴込みの入力で不足情報の有無を判定させ、必要なら質問を返して停止する
+5. `tool_selector` が有効なら最新ユーザーメッセージを基準に初期ツール列を選ばせる
+6. 失敗した場合は `build_agent_plan()` でルールベースプランを作る
+7. `AgentState.plan_queue` にタスクを入れる
+8. 先頭タスクを1つ実行する
+9. タスク結果を `AgentTaskRecord` に保存する
+10. `dynamic_replanner` が有効なら残りキューを維持/置換/終了する
+11. キューが空になったら `dynamic_finalizer` が成果物の扱いを判断する
+12. 必要なら追加タスクを実行する
+13. 回答候補を生成する
+14. `final_evaluation` が有効なら会話履歴込みで回答を評価し、不十分なら再プランする
+15. `Message` と `AgentRun` に結果を保存する
 
 ## 状態管理
 
@@ -41,7 +43,7 @@
 
 - `goal`: 最終ゴール
 - `evaluation_criteria`: 最終評価基準
-- `input_text`: 現在のLLM入力
+- `input_text`: 現在のLLM入力。初期値はスレッド内の会話履歴と最新ユーザーメッセージ
 - `plan_queue`: これから実行するタスクキュー
 - `plan_history`: 初期プランやリプランの履歴
 - `task_history`: 実行済みタスクの結果履歴
@@ -252,4 +254,3 @@ Dockerコンテナ内でPythonコードを実行します。
 2. `.maigent/config.yaml.sample` に例を追加する
 3. `docs/yaml.md` を更新する
 4. 設定読み込みテストを追加する
-

@@ -7,4 +7,4 @@ Task execution history:
 Current artifacts or final message:
 {{artifacts}}
 
-最終的なルーティングアクション（Final routing action）を判断してください。
+Decide the final routing action.

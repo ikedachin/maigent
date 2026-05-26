@@ -3,7 +3,8 @@ providers:
     enabled: true
     model: Qwen3.5-35B-A3B-GPTQ-Int4
     api_key: api_key
-    base_url: http://100.96.7.91:8000/v1
+    # base_url: http://100.96.7.91:8000/v1
+    base_url: http://192.168.10.151:8000/v1
     api_mode: chat
 
   # openai_memo:
@@ -118,3 +119,8 @@ sandbox_code_generation:
   reasoning_effort: true
   max_output_tokens: 32768
   llm_max_retries: 3
+
+# terminalへのログ出力文字数（最後の何文字か。全部はfull）
+logging:
+  llm_tail_chars: full
+  # llm_tail_chars: 500

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import RuntimeConfig
+from .prompt_loader import load_prompt
 
 logger = logging.getLogger("agent")
 
@@ -96,20 +97,54 @@ def build_agent_goal(message: str) -> str:
 
 
 def build_agent_evaluation_criteria(message: str) -> list[str]:
-    criteria = [
-        "The answer directly addresses the user's request.",
-        "The answer is specific enough to be useful and does not dodge the question.",
-    ]
+    criteria = evaluation_criteria_section("base")
     lowered = message.lower()
     if _looks_like_rag_task(message):
-        criteria.append("If local file context is needed, the answer is grounded in the allowed file contents or clearly says enough information was not found.")
+        criteria.append(evaluation_criterion("rag"))
     if _looks_like_sandbox_task(message):
-        criteria.append("If exact computation or code execution is requested, the answer includes the computed result and does not rely on unsupported mental arithmetic.")
+        criteria.append(evaluation_criterion("sandbox"))
     if any(marker in lowered or marker in message for marker in ["要約", "summary", "summarize"]):
-        criteria.append("If a summary is requested, the answer captures the main points without inventing unsupported details.")
+        criteria.append(evaluation_criterion("summary"))
     if any(marker in lowered or marker in message for marker in ["一覧", "list", "列挙"]):
-        criteria.append("If a list is requested, the answer provides the requested items in a clear list or states why they cannot be listed.")
-    return criteria
+        criteria.append(evaluation_criterion("list"))
+    return _dedupe_criteria(criteria)
+
+
+def evaluation_criterion(name: str) -> str:
+    return " ".join(evaluation_criteria_section(name))
+
+
+def evaluation_criteria_section(name: str) -> list[str]:
+    sections = _load_evaluation_criteria_sections()
+    return list(sections.get(name, []))
+
+
+def _load_evaluation_criteria_sections() -> dict[str, list[str]]:
+    sections: dict[str, list[str]] = {}
+    current = ""
+    for raw_line in load_prompt("evaluation_criteria.txt").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        section_match = re.fullmatch(r"\[([a-zA-Z0-9_-]+)\]", line)
+        if section_match:
+            current = section_match.group(1)
+            sections.setdefault(current, [])
+            continue
+        if current:
+            sections.setdefault(current, []).append(line.removeprefix("-").strip())
+    return sections
+
+
+def _dedupe_criteria(criteria: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for criterion in criteria:
+        value = criterion.strip()
+        if value and value not in seen:
+            seen.add(value)
+            deduped.append(value)
+    return deduped
 
 
 def select_tool(message: str, config: RuntimeConfig) -> ToolDecision:
@@ -145,8 +180,8 @@ def _config_tool_enabled(config: RuntimeConfig, name: str, default: bool = False
     return value if isinstance(value, bool) else default
 
 
-def run_sandbox(message: str, config: RuntimeConfig) -> SandboxResult:
-    code = build_sandbox_program(message)
+def run_sandbox(message: str, config: RuntimeConfig, code: str = "") -> SandboxResult:
+    code = code.strip() if code else build_sandbox_program(message)
     if not code:
         logger.debug("sandbox_skip reason=no_code")
         return SandboxResult(False, "sandboxで実行できるPythonコードまたは計算式を特定できませんでした。")

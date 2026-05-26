@@ -1,5 +1,6 @@
 User question:
 {{user_text}}
 
-If the question asks about a specific named thing, fictional setting, private project, document, dataset, or local knowledge, prefer RAG_REQUIRED.
-If it is general knowledge, greeting, or purely conversational, use NO_RAG.
+質問が、特定の名前付きのもの、架空設定、非公開プロジェクト、文書、データセット、またはローカル知識について尋ねている場合は、RAG_REQUIRED を優先してください。
+
+一般知識、挨拶、または純粋な会話である場合は、NO_RAG を使用してください。

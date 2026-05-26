@@ -34,6 +34,9 @@ providers:
 llm:
   max_retries: 1
 
+logging:
+  llm_tail_chars: 100
+
 final_evaluation:
   enabled: true
   max_retries: 3
@@ -60,6 +63,12 @@ tool_selector:
   reasoning_effort: none
   max_output_tokens: 1024
   max_retries: 1
+
+initial_clarifier:
+  enabled: true
+  reasoning_effort: none
+  max_output_tokens: 192
+  llm_max_retries: 1
 
 dynamic_replanner:
   enabled: true
@@ -118,6 +127,27 @@ providers:
 - `auto`: Responses APIを試し、失敗時にChat Completionsへフォールバック
 - `responses`: Responses APIを使う
 - `chat`: Chat Completions APIを使う
+
+## Logging configuration
+
+LLMプロンプトやLLM応答をデバッグログへ出すときの表示量を設定できます。
+
+```yaml
+logging:
+  llm_tail_chars: 100
+```
+
+項目:
+- `llm_tail_chars`: ログへ表示する末尾文字数。標準は `100`
+
+全文表示する場合:
+
+```yaml
+logging:
+  llm_tail_chars: full
+```
+
+`full` の代わりに `all`、`unlimited`、または `0` 以下の数値も使えます。
 
 ### providers.ollama
 
@@ -350,6 +380,26 @@ tool_selector:
 - `max_retries` はtool selector専用の既存設定です
 - `llm_max_retries` と併用すると試行回数が増えるため、低遅延にしたい場合は片方を小さくしてください
 
+## initial_clarifier
+
+初期プラン前に、不足情報があるかをLLMで判定する設定です。
+
+```yaml
+initial_clarifier:
+  enabled: true
+  reasoning_effort: none
+  max_output_tokens: 192
+  llm_max_retries: 1
+```
+
+項目:
+- `enabled`: 初期確認判定を有効化するか
+- `reasoning_effort`: reasoning effort
+- `max_output_tokens`: 最大出力トークン数
+- `llm_max_retries`: 空応答/None/例外時の再試行回数
+
+質問が必要と判定された場合は、理由と最大3問の確認事項を返してエージェント実行を止めます。
+
 ## dynamic_replanner
 
 1タスク実行後の動的リプラン設定です。
@@ -474,4 +524,3 @@ uv run python manage.py shell -c "from agent.config import load_runtime_config; 
 ```bash
 uv run python manage.py test agent
 ```
-

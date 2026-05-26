@@ -1,4 +1,5 @@
-Previous answer attempts failed final evaluation for these reasons:
+以前の回答試行は、以下の理由で最終評価に失敗しました。
+
 {{feedback}}
 
-Use a different approach and directly address those failures before giving the final answer.
+別のアプローチを使用し、最終回答を出す前に、それらの失敗点に直接対処してください。

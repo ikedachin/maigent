@@ -1,0 +1,4 @@
+User request and conversation context:
+{{user_text}}
+
+あなたは最新のユーザー依頼に対して確認が必要な項目があるかどうかを判断してください。

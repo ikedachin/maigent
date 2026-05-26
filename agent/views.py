@@ -571,6 +571,18 @@ def _generate_with_final_evaluation(
                 str(evaluation["reason"])[:240],
             )
             return result
+        if evaluation.get("evaluation_failed"):
+            if progress:
+                yield _sse(progress(f"Attempt {attempt}: final evaluation could not be completed; keeping current answer."))
+            logger.debug(
+                "agent_attempt_done thread_id=%s attempt=%s status=%s plan=%r final_evaluation=failed_to_evaluate reason=%r next_action=keep_current_answer",
+                thread.id,
+                attempt,
+                last_status,
+                result["plan_summary"],
+                str(evaluation["reason"])[:240],
+            )
+            return result
         last_reason = evaluation["reason"]
         failed_plans.append(result["plan_summary"])
         retry_feedback.append(str(last_reason))
@@ -776,18 +788,17 @@ def _select_tools_with_llm(config, user_text: str, tools: list[dict[str, str]]) 
     payload = None
     max_attempts = _tool_selector_max_retries(config) + 1
     for attempt in range(1, max_attempts + 1):
-        try:
-            response = complete_response(
-                config,
-                prompt,
-                instructions,
-                max_output_tokens=_tool_selector_max_output_tokens(config),
-                reasoning_effort=_tool_selector_reasoning_effort(config),
-            )
-        except Exception:
-            logger.exception("tool_selection_error attempt=%s/%s", attempt, max_attempts)
-            continue
-        raw = str(response or "").strip()
+        raw = _complete_response_with_retries(
+            config,
+            prompt,
+            instructions,
+            purpose="tool_selection",
+            config_name="tool_selector",
+            max_output_tokens=_tool_selector_max_output_tokens(config),
+            reasoning_effort=_tool_selector_reasoning_effort(config),
+            max_retries=0,
+            log_exceptions=True,
+        )
         if not raw:
             logger.debug("tool_selection_empty_response attempt=%s/%s", attempt, max_attempts)
             continue
@@ -833,30 +844,15 @@ def _tool_selector_llm_enabled(config) -> bool:
 
 
 def _tool_selector_max_output_tokens(config) -> int:
-    try:
-        tools = getattr(config, "tools", {})
-        selector = tools.get("tool_selector", {}) if isinstance(tools, dict) else {}
-        return max(32, min(512, int(selector.get("max_output_tokens", 160))))
-    except (TypeError, ValueError):
-        return 160
+    return _control_config_int(config, "tool_selector", "max_output_tokens", 160, minimum=32, maximum=2048)
 
 
 def _tool_selector_reasoning_effort(config) -> str:
-    try:
-        tools = getattr(config, "tools", {})
-        selector = tools.get("tool_selector", {}) if isinstance(tools, dict) else {}
-        return str(selector.get("reasoning_effort", "none") or "none")
-    except AttributeError:
-        return "none"
+    return _control_config_reasoning_effort(config, "tool_selector", "reasoning_effort", "none")
 
 
 def _tool_selector_max_retries(config) -> int:
-    try:
-        tools = getattr(config, "tools", {})
-        selector = tools.get("tool_selector", {}) if isinstance(tools, dict) else {}
-        return max(0, int(selector.get("max_retries", 1)))
-    except (AttributeError, TypeError, ValueError):
-        return 1
+    return _control_config_int(config, "tool_selector", "max_retries", 1, minimum=0, maximum=5)
 
 
 def _apply_llm_rag_decision(thread: Thread, user_text: str, config, plan: AgentPlan) -> AgentPlan:
@@ -919,11 +915,9 @@ def _decide_rag_with_llm(config, user_text: str) -> LlmRagDecision:
     instructions = load_prompt("rag_decision_instructions.txt")
     prompt = load_prompt("rag_decision_prompt.txt", user_text=user_text)
     _log_tail("llm_prompt", prompt, purpose="rag_decision")
-    try:
-        raw = complete_response(config, prompt, instructions)
-    except Exception as exc:
-        logger.exception("rag_llm_decision_error")
-        return LlmRagDecision(False, "", f"decision failed: {exc}")
+    raw = _complete_response_with_retries(config, prompt, instructions, purpose="rag_decision", config_name="rag_decision")
+    if not raw:
+        return LlmRagDecision(False, "", "decision failed: empty LLM response")
     _log_tail("rag_decision_raw", raw)
     value = _text_value(raw)
     normalized = value["value"].strip()
@@ -965,17 +959,17 @@ def _evaluate_final_answer(config, user_text: str, goal: str, evaluation_criteri
         answer=answer,
     )
     _log_tail("llm_prompt", prompt, purpose="final_evaluation")
-    try:
-        raw = complete_response(
-            config,
-            prompt,
-            instructions,
-            max_output_tokens=_final_evaluation_max_output_tokens(config),
-            reasoning_effort=_final_evaluation_reasoning_effort(config),
-        ).strip()
-    except Exception as exc:
-        logger.exception("final_evaluation_error")
-        return {"adequate": False, "reason": f"評価に失敗しました: {exc}"}
+    raw = _complete_response_with_retries(
+        config,
+        prompt,
+        instructions,
+        purpose="final_evaluation",
+        config_name="final_evaluation",
+        max_output_tokens=_final_evaluation_max_output_tokens(config),
+        reasoning_effort=_final_evaluation_reasoning_effort(config),
+    )
+    if not raw:
+        return {"adequate": False, "reason": "評価に失敗しました: LLMから空の応答が返りました。", "evaluation_failed": True}
     _log_tail("final_evaluation_raw", raw)
     normalized = _text_value(raw)["value"]
     try:
@@ -988,11 +982,84 @@ def _evaluate_final_answer(config, user_text: str, goal: str, evaluation_criteri
         if "ADEQUATE" in upper or "PASS" in upper:
             return {"adequate": True, "reason": _extract_labeled_value(normalized, "REASON") or normalized[:240]}
         logger.debug("final_evaluation_parse_fallback raw=%r", normalized[:240])
-        return {"adequate": False, "reason": "評価結果を解釈できませんでした。"}
+        return {"adequate": False, "reason": "評価結果を解釈できませんでした。", "evaluation_failed": True}
 
 
 def _text_value(text: str) -> dict[str, str]:
     return {"value": str(text or "")}
+
+
+def _complete_response_with_retries(
+    config,
+    prompt: str,
+    instructions: str,
+    *,
+    purpose: str,
+    config_name: str,
+    max_output_tokens: int | None = None,
+    reasoning_effort: str | None = None,
+    max_retries: int | None = None,
+    log_exceptions: bool = True,
+) -> str:
+    retries = _llm_response_max_retries(config, config_name) if max_retries is None else max_retries
+    attempts = max(1, retries + 1)
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            response = complete_response(
+                config,
+                prompt,
+                instructions,
+                max_output_tokens=max_output_tokens,
+                reasoning_effort=reasoning_effort,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            if log_exceptions:
+                logger.exception("%s_error attempt=%s/%s", purpose, attempt, attempts)
+            else:
+                logger.debug("%s_error attempt=%s/%s error=%r", purpose, attempt, attempts, last_error[:240])
+            continue
+        raw = str(response or "").strip()
+        if raw:
+            if attempt > 1:
+                logger.debug("%s_retry_succeeded attempt=%s/%s", purpose, attempt, attempts)
+            return raw
+        logger.debug("%s_empty_response attempt=%s/%s", purpose, attempt, attempts)
+    if last_error:
+        logger.debug("%s_failed_after_retries attempts=%s last_error=%r", purpose, attempts, last_error[:240])
+    else:
+        logger.debug("%s_failed_after_retries attempts=%s reason=empty_response", purpose, attempts)
+    return ""
+
+
+def _llm_response_max_retries(config, config_name: str, default: int = 1) -> int:
+    value = _config_mapping_int(config, config_name, "llm_max_retries", None)
+    if value is None:
+        value = _config_mapping_int(config, config_name, "response_max_retries", None)
+    if value is None and config_name != "final_evaluation":
+        value = _config_mapping_int(config, config_name, "max_retries", None)
+    if value is None:
+        value = _config_mapping_int(config, "llm", "max_retries", default)
+    return max(0, min(5, value if isinstance(value, int) else default))
+
+
+def _config_mapping(config, name: str) -> dict:
+    if name in {"tool_selector", "dynamic_replanner", "dynamic_finalizer"}:
+        return _control_config(config, name)
+    try:
+        value = getattr(config, name, {})
+    except AttributeError:
+        value = {}
+    return value if isinstance(value, dict) else {}
+
+
+def _config_mapping_int(config, name: str, key: str, default: int | None) -> int | None:
+    try:
+        value = _config_mapping(config, name).get(key, default)
+        return None if value is None else int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _final_evaluation_max_output_tokens(config) -> int:
@@ -1058,10 +1125,16 @@ def _replan_after_step_with_llm(config, state: AgentState) -> ReplanDecision | N
         plan_queue=_format_plan_queue(state.plan_queue),
     )
     _log_tail("llm_prompt", prompt, purpose="dynamic_replanner")
-    try:
-        raw = complete_response(config, prompt, instructions).strip()
-    except Exception:
-        logger.exception("dynamic_replanner_error")
+    raw = _complete_response_with_retries(
+        config,
+        prompt,
+        instructions,
+        purpose="dynamic_replanner",
+        config_name="dynamic_replanner",
+        max_output_tokens=_control_config_int(config, "dynamic_replanner", "max_output_tokens", 160),
+        reasoning_effort=_control_config_reasoning_effort(config, "dynamic_replanner", "reasoning_effort", "none"),
+    )
+    if not raw:
         return None
     _log_tail("dynamic_replanner_raw", raw)
     try:
@@ -1096,10 +1169,16 @@ def _route_final_output(config, state: AgentState) -> ReplanDecision:
         artifacts=state.final_message or state.input_text[-4000:],
     )
     _log_tail("llm_prompt", prompt, purpose="dynamic_finalizer")
-    try:
-        raw = complete_response(config, prompt, instructions).strip()
-    except Exception:
-        logger.exception("dynamic_finalizer_error")
+    raw = _complete_response_with_retries(
+        config,
+        prompt,
+        instructions,
+        purpose="dynamic_finalizer",
+        config_name="dynamic_finalizer",
+        max_output_tokens=_control_config_int(config, "dynamic_finalizer", "max_output_tokens", 160),
+        reasoning_effort=_control_config_reasoning_effort(config, "dynamic_finalizer", "reasoning_effort", "none"),
+    )
+    if not raw:
         return ReplanDecision("keep", "final routing failed; finishing with current output", [])
     _log_tail("dynamic_finalizer_raw", raw)
     try:
@@ -1152,6 +1231,42 @@ def _dynamic_replanner_llm_enabled(config) -> bool:
 
 def _dynamic_finalizer_llm_enabled(config) -> bool:
     return _tool_enabled(config, "dynamic_finalizer", default=isinstance(config, RuntimeConfig))
+
+
+def _control_config(config, name: str) -> dict:
+    try:
+        getter = getattr(config, "control_config", None)
+        if callable(getter):
+            value = getter(name)
+            return value if isinstance(value, dict) else {}
+        direct = getattr(config, name, {})
+        if isinstance(direct, dict):
+            return direct
+        tools = getattr(config, "tools", {})
+        legacy = tools.get(name, {}) if isinstance(tools, dict) else {}
+        return legacy if isinstance(legacy, dict) else {}
+    except AttributeError:
+        return {}
+
+
+def _control_config_int(config, name: str, key: str, default: int, minimum: int = 1, maximum: int = 1024) -> int:
+    try:
+        value = _control_config(config, name).get(key, default)
+        return max(minimum, min(maximum, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _control_config_reasoning_effort(config, name: str, key: str, default: str = "none") -> str:
+    value = _control_config(config, name).get(key, default)
+    if isinstance(value, bool):
+        return "medium" if value else "none"
+    normalized = str(value).strip().lower()
+    if normalized in {"true", "on", "yes"}:
+        return "medium"
+    if normalized in {"false", "off", "no"}:
+        return "none"
+    return normalized if normalized in {"none", "minimal", "low", "medium", "high"} else default
 
 
 def _create_agent_run(
@@ -1370,7 +1485,7 @@ def _execute_agent_task(
             if progress:
                 yield _sse(progress("Tool sandbox: generating executable program."))
             _log_tail("llm_prompt", input_text, thread_id=thread.id, purpose="sandbox_code_generation")
-            generated_code = generate_sandbox_code(config, input_text)
+            generated_code = _generate_sandbox_code_with_retries(config, input_text)
             if not generated_code.strip():
                 plan_trace.append("Sandbox result: skipped before execution; no executable program could be generated.")
                 logger.debug(
@@ -1419,6 +1534,26 @@ def _execute_agent_task(
             final_message = f"{final_message}\n\n{artifact_message}"
         return {"ok": True, "input_text": input_text, "final_message": final_message}
     return {"ok": True, "input_text": input_text, "final_message": ""}
+
+
+def _generate_sandbox_code_with_retries(config, input_text: str) -> str:
+    attempts = _llm_response_max_retries(config, "sandbox_code_generation") + 1
+    last_error = ""
+    for attempt in range(1, attempts + 1):
+        try:
+            generated_code = str(generate_sandbox_code(config, input_text) or "").strip()
+        except Exception as exc:
+            last_error = str(exc)
+            logger.exception("sandbox_code_generation_error attempt=%s/%s", attempt, attempts)
+            continue
+        if generated_code:
+            if attempt > 1:
+                logger.debug("sandbox_code_generation_retry_succeeded attempt=%s/%s", attempt, attempts)
+            return generated_code
+        logger.debug("sandbox_code_generation_empty_response attempt=%s/%s", attempt, attempts)
+    if last_error:
+        logger.debug("sandbox_code_generation_failed_after_retries attempts=%s last_error=%r", attempts, last_error[:240])
+    return ""
 
 
 def _persist_sandbox_artifacts(thread: Thread, input_text: str, output: str) -> str:
@@ -1793,10 +1928,14 @@ def _judge_rag_candidate_paths_with_llm(
     instructions = load_prompt("rag_candidate_judge_instructions.txt")
     prompt = load_prompt("rag_candidate_judge_prompt.txt", query=query, candidate_files="\n\n".join(snippets))
     _log_tail("llm_prompt", prompt, thread_id=thread.id, purpose="rag_candidate_judge")
-    try:
-        raw = complete_response(config, prompt, instructions).strip()
-    except Exception:
-        logger.exception("rag_llm_judge_error thread_id=%s", thread.id)
+    raw = _complete_response_with_retries(
+        config,
+        prompt,
+        instructions,
+        purpose="rag_candidate_judge",
+        config_name="rag_candidate_judge",
+    )
+    if not raw:
         return []
     _log_tail("rag_candidate_judge_raw", raw, thread_id=thread.id)
     indexes = _parse_integer_list_from_text(raw)

@@ -22,7 +22,7 @@ from .tooling import (
     select_tool,
 )
 from .views import _avoid_failed_plan
-from .views import AgentState, TaskExecutionRecord, _replan_after_step, _route_final_output
+from .views import AgentState, TaskExecutionRecord, _execute_agent_plan, _replan_after_step, _route_final_output
 
 
 @override_settings(STATICFILES_DIRS=[])
@@ -165,8 +165,11 @@ class ConfigTests(TestCase):
                         "final_evaluation:",
                         "  enabled: true",
                         "  max_retries: 2",
+                        "  llm_max_retries: 2",
                         "  max_output_tokens: 72",
                         "  reasoning_effort: low",
+                        "llm:",
+                        "  max_retries: 1",
                         "tools:",
                         "  rag:",
                         "    enabled: true",
@@ -178,6 +181,21 @@ class ConfigTests(TestCase):
                         "    allowed_libraries:",
                         "      - numpy",
                         "      - pandas",
+                        "tool_selector:",
+                        "  enabled: true",
+                        "  max_output_tokens: 96",
+                        "  reasoning_effort: none",
+                        "  max_retries: 2",
+                        "dynamic_replanner:",
+                        "  enabled: true",
+                        "  max_output_tokens: 128",
+                        "  llm_max_retries: 2",
+                        "  reasoning_effort: true",
+                        "dynamic_finalizer:",
+                        "  enabled: true",
+                        "  max_output_tokens: 80",
+                        "  llm_max_retries: 2",
+                        "  reasoning_effort: false",
                     ]
                 ),
                 encoding="utf-8",
@@ -195,6 +213,12 @@ class ConfigTests(TestCase):
             self.assertEqual(config.final_evaluation_max_retries, 2)
             self.assertEqual(config.final_evaluation_max_output_tokens, 72)
             self.assertEqual(config.final_evaluation_reasoning_effort, "low")
+            self.assertTrue(config.tool_enabled("tool_selector"))
+            self.assertTrue(config.tool_enabled("dynamic_replanner"))
+            self.assertTrue(config.tool_enabled("dynamic_finalizer"))
+            self.assertEqual(config.control_config("tool_selector")["max_retries"], 2)
+            self.assertEqual(config.final_evaluation["llm_max_retries"], 2)
+            self.assertEqual(config.control_config("dynamic_replanner")["llm_max_retries"], 2)
 
     def test_final_evaluation_config_clamps_retries(self):
         with TemporaryDirectory() as app_dir:
@@ -490,6 +514,7 @@ class ChatFlowTests(TestCase):
             final_evaluation_max_retries = 1
             final_evaluation_max_output_tokens = 80
             final_evaluation_reasoning_effort = "minimal"
+            final_evaluation = {"llm_max_retries": 1}
 
             def tool_enabled(self, name, default=False):
                 return False
@@ -500,6 +525,7 @@ class ChatFlowTests(TestCase):
             iter([("delta", "good answer"), ("response_id", "resp_2")]),
         ]
         mock_complete.side_effect = [
+            None,
             '{"adequate": false, "reason": "too vague"}',
             '{"adequate": true, "reason": "answers the question"}',
         ]
@@ -516,12 +542,48 @@ class ChatFlowTests(TestCase):
         self.assertEqual(assistant.content, "good answer")
         self.assertEqual(assistant.openai_response_id, "resp_2")
         self.assertEqual(mock_stream.call_count, 2)
-        first_evaluation_prompt = mock_complete.call_args_list[0].args[1]
+        self.assertEqual(mock_complete.call_count, 3)
+        first_evaluation_prompt = mock_complete.call_args_list[1].args[1]
         self.assertIn("Goal set before planning:", first_evaluation_prompt)
         self.assertIn("Evaluation criteria set before planning:", first_evaluation_prompt)
         self.assertIn("The answer directly addresses the user's request.", first_evaluation_prompt)
-        self.assertEqual(mock_complete.call_args_list[0].kwargs["max_output_tokens"], 80)
-        self.assertEqual(mock_complete.call_args_list[0].kwargs["reasoning_effort"], "minimal")
+        self.assertEqual(mock_complete.call_args_list[1].kwargs["max_output_tokens"], 80)
+        self.assertEqual(mock_complete.call_args_list[1].kwargs["reasoning_effort"], "minimal")
+
+    @patch("agent.views.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_final_evaluation_empty_response_keeps_current_answer(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = True
+            final_evaluation_max_retries = 3
+            final_evaluation_max_output_tokens = 80
+            final_evaluation_reasoning_effort = "minimal"
+            final_evaluation = {"llm_max_retries": 1}
+
+            def tool_enabled(self, name, default=False):
+                return False
+
+        mock_config.return_value = Config()
+        mock_stream.return_value = iter([("delta", "current answer"), ("response_id", "resp_1")])
+        mock_complete.side_effect = [None, ""]
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        body = b"".join(stream.streaming_content).decode()
+
+        self.assertIn("current answer", body)
+        self.assertIn("final evaluation could not be completed; keeping current answer", body)
+        self.assertNotIn("Revised direct answer after failed final evaluation", body)
+        self.assertEqual(mock_stream.call_count, 1)
+        self.assertEqual(mock_complete.call_count, 2)
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertEqual(assistant.content, "current answer")
 
     def test_failed_final_evaluation_uses_different_plan(self):
         class Config:
@@ -965,6 +1027,12 @@ class ChatFlowTests(TestCase):
     @patch("agent.views.complete_response")
     def test_dynamic_replanner_can_replace_remaining_queue(self, mock_complete):
         class Config:
+            dynamic_replanner = {
+                "enabled": True,
+                "reasoning_effort": True,
+                "max_output_tokens": 128,
+            }
+
             def tool_enabled(self, name, default=False):
                 return name == "dynamic_replanner"
 
@@ -999,10 +1067,18 @@ class ChatFlowTests(TestCase):
         self.assertEqual(decision.action, "replace")
         self.assertEqual([step.tool for step in decision.plan_queue], ["sandbox"])
         self.assertIn("debug", decision.plan_queue[0].purpose)
+        self.assertEqual(mock_complete.call_args.kwargs["max_output_tokens"], 128)
+        self.assertEqual(mock_complete.call_args.kwargs["reasoning_effort"], "medium")
 
     @patch("agent.views.complete_response")
     def test_dynamic_finalizer_can_add_validation_tasks(self, mock_complete):
         class Config:
+            dynamic_finalizer = {
+                "enabled": True,
+                "reasoning_effort": "minimal",
+                "max_output_tokens": 80,
+            }
+
             def tool_enabled(self, name, default=False):
                 return name == "dynamic_finalizer"
 
@@ -1028,10 +1104,66 @@ class ChatFlowTests(TestCase):
 
         self.assertEqual(decision.action, "replace")
         self.assertEqual([step.tool for step in decision.plan_queue], ["sandbox"])
+        self.assertEqual(mock_complete.call_args.kwargs["max_output_tokens"], 80)
+        self.assertEqual(mock_complete.call_args.kwargs["reasoning_effort"], "minimal")
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.views.complete_response")
+    def test_dynamic_finalizer_added_sandbox_task_is_executed(self, mock_complete, mock_generate_code, mock_run_sandbox):
+        class Config:
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+            dynamic_finalizer = {
+                "enabled": True,
+                "reasoning_effort": "minimal",
+                "max_output_tokens": 80,
+            }
+
+            def tool_enabled(self, name, default=False):
+                return name in {"dynamic_finalizer", "sandbox"}
+
+        mock_complete.side_effect = [
+            json.dumps(
+                {
+                    "action": "add_tasks",
+                    "reason": "Validate before final output.",
+                    "tasks": [{"tool": "sandbox", "purpose": "Validate the artifact."}],
+                }
+            ),
+            json.dumps({"action": "save", "reason": "Validated."}),
+        ]
+        mock_generate_code.return_value = "print('validated')"
+        mock_run_sandbox.return_value = SandboxResult(True, "validated")
+
+        plan = AgentPlan(
+            goal="Answer the user's request: verify",
+            evaluation_criteria=["The answer is verified."],
+            summary="web_search -> final",
+            steps=[AgentPlanStep("web_search", "Produce a temporary artifact.")],
+        )
+        runner = _execute_agent_plan(self.thread, "verify", Config(), plan)
+        while True:
+            try:
+                next(runner)
+            except StopIteration:
+                break
+
+        mock_generate_code.assert_called_once()
+        mock_run_sandbox.assert_called_once()
+        self.assertEqual(mock_complete.call_args_list[0].kwargs["max_output_tokens"], 80)
+        self.assertEqual(mock_complete.call_args_list[0].kwargs["reasoning_effort"], "minimal")
 
     @patch("agent.views.complete_response")
     def test_llm_tool_selector_can_choose_rag_and_sandbox(self, mock_complete):
         class Config:
+            tool_selector = {
+                "enabled": True,
+                "reasoning_effort": "low",
+                "max_output_tokens": 96,
+            }
+
             def tool_enabled(self, name, default=False):
                 return name in {"tool_selector", "rag", "sandbox"} or default
 
@@ -1058,8 +1190,8 @@ class ChatFlowTests(TestCase):
         self.assertEqual([step.tool for step in plan.steps], ["rag", "sandbox", "final"])
         self.assertEqual(plan.rag_query, "numbers")
         kwargs = mock_complete.call_args.kwargs
-        self.assertEqual(kwargs["max_output_tokens"], 160)
-        self.assertEqual(kwargs["reasoning_effort"], "none")
+        self.assertEqual(kwargs["max_output_tokens"], 96)
+        self.assertEqual(kwargs["reasoning_effort"], "low")
 
     @patch("agent.views.complete_response")
     def test_llm_tool_selector_retries_empty_response(self, mock_complete):

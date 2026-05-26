@@ -32,6 +32,7 @@ PROVIDER_ENV_KEYS = {
 }
 
 OPENAI_COMPATIBLE_PROVIDERS = {"openai", "ollama", "lmstudio", "openrouter"}
+CONTROL_CONFIG_NAMES = {"tool_selector", "dynamic_replanner", "dynamic_finalizer"}
 
 
 @dataclass(frozen=True)
@@ -202,8 +203,15 @@ class RuntimeConfig:
         value = str(self.final_evaluation.get("reasoning_effort", "none")).strip().lower()
         return value if value in {"none", "minimal", "low", "medium", "high"} else "none"
 
+    def control_config(self, name: str) -> dict[str, Any]:
+        config = self.values.get(name, {})
+        if isinstance(config, dict):
+            return config
+        legacy = self.tools.get(name, {})
+        return legacy if isinstance(legacy, dict) else {}
+
     def tool_enabled(self, name: str, default: bool = False) -> bool:
-        config = self.tools.get(name, {})
+        config = self.control_config(name) if name in CONTROL_CONFIG_NAMES else self.tools.get(name, {})
         if not isinstance(config, dict):
             return default
         return _as_bool(config.get("enabled", default))

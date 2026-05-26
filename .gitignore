@@ -8,6 +8,7 @@ db.sqlite3
 
 # 設定ファイル
 .maigent/*
+.maigent/config.yaml
 !.maigent/config.yaml.sample
 
 # memo

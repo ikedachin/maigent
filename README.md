@@ -23,29 +23,51 @@ api_key: sk-...
 base_url: https://api.openai.com/v1
 api_mode: auto
 
+llm:
+  max_retries: 1
+
 final_evaluation:
   enabled: false
   max_retries: 3
+  llm_max_retries: 1
   reasoning_effort: none
   max_output_tokens: 160
 
 tools:
-  tool_selector:
+  rag:
     enabled: true
-    reasoning_effort: none
-    max_output_tokens: 160
-    max_retries: 1
-  dynamic_replanner:
+  sandbox:
     enabled: true
-  dynamic_finalizer:
-    enabled: true
+
+tool_selector:
+  enabled: true
+  reasoning_effort: none
+  max_output_tokens: 160
+  max_retries: 1
+
+dynamic_replanner:
+  enabled: true
+  reasoning_effort: true
+  max_output_tokens: 1024
+  llm_max_retries: 1
+
+dynamic_finalizer:
+  enabled: true
+  reasoning_effort: none
+  max_output_tokens: 160
+  llm_max_retries: 1
+
+sandbox_code_generation:
+  llm_max_retries: 1
 ```
 
 `providers` を使わない場合は、上記のトップレベル設定をOpenAI互換APIとして扱います。`model` または `default_model` は必須です。`OPENAI_MODEL` はモデル未設定時のみ補完に使われます。APIキーはDBへ保存しません。
 
-`final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。最終評価のLLM呼び出しは `reasoning_effort` と `max_output_tokens` で軽量化できます。画面から保存した最終評価の有効/無効とリトライ回数はDBの `AppSetting` に保存され、設定ファイル値より優先されます。
+`llm.max_retries` は、空応答・`None`・例外が返ったLLM補助呼び出しの共通リトライ回数です。各セクションの `llm_max_retries` で個別に上書きできます。
 
-エージェント実行は、初期プランを `AgentState.plan_queue` に入れ、1タスクごとに実行履歴を保存しながら進めます。`tools.tool_selector.enabled` が `true` の場合、LLMが利用可能tools一覧から `rag` / `sandbox` / `web_search` / `final` の実行順を短いJSONで選びます。この判定呼び出しは `reasoning_effort: none` と小さい `max_output_tokens` を指定して、低遅延・低コストに寄せています。空応答や不正JSONなどで失敗した場合は `max_retries` 回だけ再試行し、それでも失敗した場合は従来のルールベースプランへフォールバックします。`tools.dynamic_replanner.enabled` が `true` の場合、各タスク後にLLMリプランナーが `goal`、`plan_history`、`task_history`、現在の `plan_queue` を見て、キュー維持・差し替え・終了をJSONで判断します。`tools.dynamic_finalizer.enabled` が `true` の場合、終了時に成果物を保存相当で扱うか、破棄相当で終えるか、追加検証タスクを挿入するかをLLMで分岐します。設定未指定の `RuntimeConfig` ではこれらが有効です。
+`final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。最終評価のLLM呼び出しは `reasoning_effort`、`max_output_tokens`、`llm_max_retries` で軽量化と応答失敗時の再試行を設定できます。画面から保存した最終評価の有効/無効とリトライ回数はDBの `AppSetting` に保存され、設定ファイル値より優先されます。
+
+エージェント実行は、初期プランを `AgentState.plan_queue` に入れ、1タスクごとに実行履歴を保存しながら進めます。`tool_selector.enabled` が `true` の場合、LLMが利用可能tools一覧から `rag` / `sandbox` / `web_search` / `final` の実行順を短いJSONで選びます。この判定呼び出しは `reasoning_effort: none` と小さい `max_output_tokens` を指定して、低遅延・低コストに寄せています。空応答や不正JSONなどで失敗した場合は `max_retries` 回だけ再試行し、それでも失敗した場合は従来のルールベースプランへフォールバックします。`dynamic_replanner.enabled` が `true` の場合、各タスク後にLLMリプランナーが `goal`、`plan_history`、`task_history`、現在の `plan_queue` を見て、キュー維持・差し替え・終了をJSONで判断します。`dynamic_finalizer.enabled` が `true` の場合、終了時に成果物を保存相当で扱うか、破棄相当で終えるか、追加検証タスクを挿入するかをLLMで分岐します。設定未指定の `RuntimeConfig` ではこれらが有効です。
 
 YAMLローダーはこのアプリ内の簡易実装です。基本的なネスト、真偽値、整数、リストには対応しますが、一般的なYAMLの全機能を使う設定は `config.toml` を推奨します。
 

@@ -2,9 +2,16 @@ providers:
   openai:
     enabled: true
     model: Qwen3.5-35B-A3B-GPTQ-Int4
-    api_key: apy_key
-    base_url: http://192.168.10.151:8000/v1
+    api_key: api_key
+    base_url: http://localhost:8000/v1
     api_mode: chat
+
+  # openai_memo:
+  #   enabled: false
+  #   model: Qwen3.5-35B-A3B-GPTQ-Int4
+  #   api_key: apy_key
+  #   base_url: http://localhost:8000/v1
+  #   api_mode: chat
 
   ollama:
     enabled: false
@@ -45,9 +52,6 @@ providers:
     # aws_secret_access_key: ...
     # aws_session_token: ...
 
-final_evaluation:
-  enabled: true
-  max_retries: 3
 
 tools:
   rag:
@@ -80,14 +84,37 @@ tools:
       - xlsxwriter
       - xlrd
 
-tools:
-  tool_selector:
-    enabled: true
-    reasoning_effort: none
-    max_output_tokens: 160
+# 各機能の設定
+llm:
+  max_retries: 1 # 個別設定がない時のデフォルト値
 
 final_evaluation:
-  enabled: false
+  enabled: true
   max_retries: 3
+  llm_max_retries: 1
+  reasoning_effort: true
+  max_output_tokens: 1024
+
+tool_selector:
+  enabled: true
   reasoning_effort: none
-  max_output_tokens: 160
+  max_output_tokens: 1024
+  max_retries: 3
+
+dynamic_replanner:
+  enabled: true
+  reasoning_effort: true
+  max_output_tokens: 1024
+  llm_max_retries: 3
+
+dynamic_finalizer:
+  enabled: true
+  reasoning_effort: none
+  max_output_tokens: 512
+  llm_max_retries: 3
+
+sandbox_code_generation:
+  enabled: true
+  reasoning_effort: true
+  max_output_tokens: 32768
+  llm_max_retries: 3

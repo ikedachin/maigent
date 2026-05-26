@@ -148,7 +148,7 @@ def _complete_chat_completions(
     if not choices:
         return ""
     message = getattr(choices[0], "message", None)
-    return getattr(message, "content", "") if message else ""
+    return (getattr(message, "content", "") if message else "") or ""
 
 
 def _stream_chat_completions(client: OpenAI, config: RuntimeConfig, input_text: str, instructions: str = "") -> Iterable[tuple[str, str]]:

@@ -57,7 +57,7 @@ initial_clarifier:
 dynamic_replanner:
   enabled: true
   reasoning_effort: true
-  max_output_tokens: 1024
+  max_output_tokens: 160
   llm_max_retries: 1
 
 dynamic_finalizer:

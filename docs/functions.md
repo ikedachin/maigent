@@ -174,7 +174,7 @@ Dockerコンテナ内でPythonコードを実行します。
 
 対象例:
 - `final_evaluation`
-- `tool_selector`
+- `initial_clarifier`
 - `dynamic_replanner`
 - `dynamic_finalizer`
 - `rag_decision`
@@ -256,6 +256,5 @@ Dockerコンテナ内でPythonコードを実行します。
 ## 新しい設定を追加する方法
 
 1. `agent/config.py` にプロパティまたは `control_config()` の読み取りを追加する
-2. `.maigent/config.yaml.sample` に例を追加する
-3. `docs/yaml.md` を更新する
-4. 設定読み込みテストを追加する
+2. `README.md` や `docs/yaml.md` に設定例を追加する
+3. 設定読み込みテストを追加する

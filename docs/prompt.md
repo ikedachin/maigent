@@ -75,7 +75,6 @@ JSONを期待するプロンプトでは、実装側が `_extract_json_object()`
 - `tool_selector.max_output_tokens`
 - `tool_selector.reasoning_effort`
 - `tool_selector.max_retries`
-- `tool_selector.llm_max_retries`
 
 ## rag_decision_instructions.txt / rag_decision_prompt.txt
 

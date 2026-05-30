@@ -631,11 +631,22 @@ textarea:focus {
   background: var(--copied-user-bg);
 }
 
-.message pre {
+.message-body {
   margin: 0;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
   font-family: inherit;
+}
+
+.message-image {
+  display: block;
+  max-width: min(100%, 720px);
+  max-height: 520px;
+  margin: 10px 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  object-fit: contain;
+  background: var(--panel-soft);
 }
 
 .message-progress {

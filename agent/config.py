@@ -227,10 +227,20 @@ class RuntimeConfig:
         return legacy if isinstance(legacy, dict) else {}
 
     def tool_enabled(self, name: str, default: bool = False) -> bool:
+        if name not in CONTROL_CONFIG_NAMES and name not in self.tools:
+            return False
         config = self.control_config(name) if name in CONTROL_CONFIG_NAMES else self.tools.get(name, {})
         if not isinstance(config, dict):
             return default
         return _as_bool(config.get("enabled", default))
+
+    @property
+    def enabled_tool_names(self) -> set[str]:
+        return {
+            str(name)
+            for name, config in self.tools.items()
+            if isinstance(config, dict) and _as_bool(config.get("enabled", False))
+        }
 
     @property
     def sandbox_image(self) -> str:

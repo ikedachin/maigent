@@ -196,7 +196,9 @@ docker run --rm maigent-sandbox:py311 python --version
 
 `.maigent/config.yaml` の `tools.sandbox.image` が `maigent-sandbox:py311` を指していれば、このアプリはそのイメージを使います。標準の `docker/sandbox/Dockerfile` には、CSV/Excel処理、PDF/Word/PowerPoint処理、グラフ作成、HTML解析、HTTP取得で使う一般的な事務作業向けライブラリを事前インストールしています。ライブラリを追加する場合はDockerfileにも追記し、もう一度 `docker build -t maigent-sandbox:py311 docker/sandbox` を実行してください。実行時インストールが必要な場合だけ `.maigent/config.yaml` で `install_libraries_on_run: true` にします。
 
-Sandboxは許可フォルダを直接マウントしません。ファイル保存が必要な場合、sandbox内のプログラムはstdoutに `maigent_artifacts` JSONを出力し、Django側のbrokerが `file_write` feature flag と読み書き許可パスを検証してからホスト上に保存します。これにより、生成コードへ直接書き込み権限を渡さずに成果物だけを保存できます。
+Sandboxは許可フォルダを直接マウントしません。ファイル保存が必要な場合、sandbox内のプログラムはstdoutに `maigent_sandbox_result` JSONを出力し、Django側のbrokerが `file_write` feature flag とプロジェクトの書き出し先フォルダを検証してからホスト上に保存します。書き込みはブラウザで指定した書き出し先フォルダ配下に限定され、相対パスはそのフォルダ内として解決されます。これにより、生成コードへ直接書き込み権限を渡さずに成果物だけを保存できます。旧 `maigent_artifacts` 形式は互換用に読み取ります。
+
+RAGで選ばれたCSV/TSV/JSON/TXT/Markdownファイルは、sandboxコード生成時に `rag_1` などのDatasetとして型付きメタ情報を提示します。生成コードはデータ本文を再転記せず、ホスト側が注入する `load_dataset("rag_1")`、`dataset_text("rag_1")`、`dataset_meta("rag_1")` を使います。これにより、CSV区切り文字や列名がLLMの再転記で壊れる問題を避けます。
 
 ## Program flow
 
@@ -416,7 +418,7 @@ flowchart TD
     InstallLibs -- "No" --> DockerNoNet["docker run --network none\npython /work/script.py"]
     DockerNet --> Result{"Return code 0?"}
     DockerNoNet --> Result
-    Result -- "Yes" --> Artifact{"stdout contains\nmaigent_artifacts JSON?"}
+    Result -- "Yes" --> Artifact{"stdout contains typed\nmaigent_sandbox_result?"}
     Artifact -- "Yes" --> Broker["Host broker validates\nfile_write and write access\nthen saves artifacts"]
     Artifact -- "No" --> Success["Return Sandbox実行結果: 成功"]
     Broker --> Success
@@ -484,9 +486,11 @@ flowchart TD
     Write --> WriteFlag{"FeatureFlag file_write enabled?"}
     Append --> WriteFlag
     WriteFlag -- "No" --> DenyWriteFlag["Return feature disabled"]
-    WriteFlag -- "Yes" --> NormalizeWrite["Resolve path"]
-    NormalizeWrite --> AllowedWrite{"is_path_allowed(write)?"}
-    AllowedWrite -- "No" --> DenyWrite["Return write denied"]
+    WriteFlag -- "Yes" --> OutputRoot{"Project output folder configured\nand exists?"}
+    OutputRoot -- "No" --> DenyWrite["Return write denied"]
+    OutputRoot -- "Yes" --> NormalizeWrite["Resolve relative path under output folder\nor absolute path"]
+    NormalizeWrite --> AllowedWrite{"Target is inside output folder?"}
+    AllowedWrite -- "No" --> DenyWrite
     AllowedWrite -- "Yes" --> WriteTarget{"Parent exists\nand target is not directory?"}
     WriteTarget -- "No" --> WriteError["Return specific error"]
     WriteTarget -- "Yes" --> WriteFile["Write or append UTF-8 text"]

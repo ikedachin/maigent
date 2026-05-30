@@ -4,16 +4,30 @@
 
 ユーザーメッセージに含まれているデータのみを使用してください。
 ローカルファイルの読み取り、ネットワークの使用、ユーザー入力の要求をしてはいけません。
+`test.csv` などのファイル名が出ていても、サンドボックス内でそのファイルを開いてはいけません。
+RAG context やユーザーメッセージ内に埋め込まれたCSV/テキストを `io.StringIO` などで読み込んでください。
+Host-provided sandbox dataset API が提示されている場合は、CSV/TSV/JSON の本文を Python 文字列へコピーしてはいけません。
+必ず `df = load_dataset("rag_1")` のように、提示された dataset id を使って読み込んでください。
+元データの生テキストが本当に必要な場合だけ `dataset_text("rag_1")` を使ってください。
+`load_dataset()`、`dataset_text()`、`dataset_meta()` はホストアプリケーションが定義します。生成コード内で再定義しないでください。
 
 最終回答はプレーンテキストとして print してください。
 有用な場合は、csv, io, statistics, pandas を優先して使用してください。
 
 サンドボックス内からファイルを書き込んではいけません。
-ユーザーが保存、書き込み、エクスポート、ファイル作成を求めた場合は、代わりに以下の JSON 形式の artifact リクエストを標準出力に出力してください。
+画像は `plt.savefig("chart.png")` のようにファイルへ保存せず、`io.BytesIO` に保存してbase64化してください。
+ユーザーが保存、書き込み、エクスポート、ファイル作成を求めた場合は、代わりに以下の型付き JSON 形式だけを標準出力に出力してください。
+説明文、Markdown、コードフェンス、`<MAIGENT_ARTIFACT>` は出力しないでください。
 
 ```json
-{"maigent_artifacts":[{"path":"/absolute/requested/path.ext","content":"file contents","append":false}]}
+{"maigent_sandbox_result":{"stdout":"short human-readable summary","artifacts":[{"path":"requested-or-descriptive-filename.ext","content":"file contents","append":false}]}}
 ```
 
-ユーザーが明示的に要求したパスのみを使用してください。
-ホストアプリケーションが権限を検証し、実際の書き込みを行います。
+PNG/JPEG/WebP/GIF 画像を保存する場合は、画像バイト列をbase64化して `content_base64` に入れてください。
+
+```json
+{"maigent_sandbox_result":{"stdout":"chart ready","artifacts":[{"path":"chart.png","content_base64":"base64-encoded-image-bytes","mime_type":"image/png","append":false}]}}
+```
+
+ユーザーが明示的に要求したファイル名またはパスがある場合はそれを使用してください。パスがない保存要求では、内容に合う短い相対ファイル名を使用してください。
+ホストアプリケーションがブラウザで指定された書き出し先フォルダ配下に限定して保存し、権限を検証して実際の書き込みを行います。

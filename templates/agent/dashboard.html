@@ -106,7 +106,8 @@
                 <button type="button" class="copy-message-button" data-copy-message data-i18n="copy" data-i18n-title="copyMessage" title="コピー">コピー</button>
               </div>
             </div>
-            <pre>{{ message.content }}</pre>
+            <div class="message-body" data-message-body></div>
+            <script type="application/json" data-message-content>"{{ message.content|escapejs }}"</script>
           </article>
         {% empty %}
           <div class="empty-state" data-i18n="emptyState">メッセージまたはスラッシュコマンドで開始してください。</div>
@@ -211,6 +212,23 @@
       </section>
 
       <section class="panel">
+        <h2 data-i18n="outputFolder">書き出し先</h2>
+        <form class="stack-form" method="post" action="{% url 'update_output_path' current_project.id %}">
+          {% csrf_token %}
+          <div class="path-picker-row">
+            <input name="output_path" value="{{ current_project.output_path }}" placeholder="/path/to/output-folder" data-output-path-input data-i18n-placeholder="outputPathPlaceholder">
+            <button type="button" class="secondary-light-button" data-open-directory-picker data-picker-target="output" data-i18n="browse">選択</button>
+          </div>
+          <button type="submit" data-i18n="saveOutputFolder">書き出し先を保存</button>
+        </form>
+        {% if current_project.output_path %}
+          <p class="muted"><span data-i18n="outputFolderHelp">ファイル書き出しはこのフォルダ配下に限定されます。</span></p>
+        {% else %}
+          <p class="muted" data-i18n="noOutputFolder">書き出し先フォルダは未設定です。</p>
+        {% endif %}
+      </section>
+
+      <section class="panel">
         <h2 data-i18n="featureFlags">機能フラグ</h2>
         <div class="feature-flag-list">
           {% for flag in feature_flags %}
@@ -301,7 +319,7 @@
       <div class="modal-header">
         <div>
           <h2 id="directory-picker-title" data-i18n="selectRepository">リポジトリを選択</h2>
-          <p data-i18n="selectRepositoryHelp">フォルダをクリックして移動し、現在のフォルダをプロジェクトパスに設定できます。</p>
+          <p data-i18n="selectRepositoryHelp">フォルダをクリックして移動し、現在のフォルダを入力欄に設定できます。</p>
         </div>
         <button type="button" class="icon-button modal-close" data-close-directory-picker aria-label="Close">×</button>
       </div>

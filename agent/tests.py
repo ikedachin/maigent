@@ -1,3 +1,4 @@
+import base64
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,6 +15,9 @@ from .tooling import (
     AgentPlan,
     AgentPlanStep,
     SandboxResult,
+    _parse_typed_sandbox_output,
+    _prepend_sandbox_datasets,
+    make_sandbox_dataset,
     _python_for_tabular_task,
     build_agent_plan,
     evaluation_criterion,
@@ -22,7 +26,19 @@ from .tooling import (
     run_sandbox,
     select_tool,
 )
-from .views import _avoid_failed_plan, _evaluate_final_answer, _request_initial_clarification_if_needed
+from .views import (
+    _allowed_plan_tools,
+    _avoid_failed_plan,
+    _evaluate_final_answer,
+    _generate_sandbox_code_with_retries,
+    _parse_plan_tasks,
+    _persist_sandbox_artifacts,
+    _request_initial_clarification_if_needed,
+    _sandbox_code_policy_violation,
+    _serialize_plan_queue,
+    _sandbox_datasets_from_rag_context,
+    _strip_sandbox_artifact_payloads,
+)
 from .views import AgentState, TaskExecutionRecord, _execute_agent_plan, _replan_after_step, _route_final_output
 
 
@@ -231,6 +247,40 @@ class ConfigTests(TestCase):
             self.assertEqual(config.control_config("initial_clarifier")["llm_max_retries"], 2)
             self.assertEqual(config.final_evaluation["llm_max_retries"], 2)
             self.assertEqual(config.control_config("dynamic_replanner")["llm_max_retries"], 2)
+            self.assertEqual(config.enabled_tool_names, {"rag", "sandbox"})
+            self.assertFalse(config.tool_enabled("web_search"))
+
+    def test_runtime_config_tools_must_be_declared_in_yaml_tools(self):
+        config = RuntimeConfig(values={"tools": {"sandbox": {"enabled": True}}}, sources=[])
+
+        self.assertEqual(config.enabled_tool_names, {"sandbox"})
+        self.assertTrue(config.tool_enabled("sandbox"))
+        self.assertFalse(config.tool_enabled("rag", default=True))
+        self.assertFalse(config.tool_enabled("web_search", default=True))
+
+    def test_plan_task_parser_and_storage_filter_to_allowed_tools(self):
+        allowed = {"sandbox", "final"}
+        tasks = _parse_plan_tasks(
+            [
+                {"tool": "rag", "purpose": "Search context."},
+                {"tool": "sandbox", "purpose": "Run calculation."},
+                {"tool": "unknown", "purpose": "Do not run."},
+                {"tool": "final", "purpose": "Answer."},
+            ],
+            allowed,
+        )
+
+        self.assertEqual([task.tool for task in tasks], ["sandbox", "final"])
+        serialized = _serialize_plan_queue(
+            [AgentPlanStep("rag", "Search context."), AgentPlanStep("sandbox", "Run calculation.")],
+            allowed,
+        )
+        self.assertEqual(serialized, [{"tool": "sandbox", "purpose": "Run calculation."}])
+
+    def test_allowed_plan_tools_uses_yaml_tools_plus_internal_final(self):
+        config = RuntimeConfig(values={"tools": {"sandbox": {"enabled": True}, "rag": {"enabled": False}}}, sources=[])
+
+        self.assertEqual(_allowed_plan_tools(config), {"sandbox", "final"})
 
     def test_llm_log_tail_chars_clamps_numeric_config(self):
         config = RuntimeConfig(values={"logging": {"llm_tail_chars": 250000}}, sources=[])
@@ -419,7 +469,8 @@ class ChatFlowTests(TestCase):
         with TemporaryDirectory() as root_dir:
             root = Path(root_dir)
             file_path = root / "created.txt"
-            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
 
             response = self.client.post(
                 reverse("send_message", args=[self.thread.id]),
@@ -430,12 +481,28 @@ class ChatFlowTests(TestCase):
             self.assertIn("書き込みしました", response.json()["content"])
             self.assertEqual(file_path.read_text(encoding="utf-8"), "hello write")
 
+    def test_write_command_resolves_relative_path_inside_output_folder(self):
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": "/write created.txt -- hello write"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("書き込みしました", response.json()["content"])
+            self.assertEqual((root / "created.txt").read_text(encoding="utf-8"), "hello write")
+
     def test_write_command_rejects_disabled_file_write_flag(self):
         FeatureFlag.objects.create(name="file_write", enabled=False)
         with TemporaryDirectory() as root_dir:
             root = Path(root_dir)
             file_path = root / "blocked.txt"
-            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
 
             response = self.client.post(
                 reverse("send_message", args=[self.thread.id]),
@@ -446,11 +513,24 @@ class ChatFlowTests(TestCase):
             self.assertIn("ファイル書き込み機能が無効です", response.json()["content"])
             self.assertFalse(file_path.exists())
 
-    def test_write_command_rejects_read_only_access(self):
+    def test_write_command_rejects_missing_output_folder(self):
         with TemporaryDirectory() as root_dir:
-            root = Path(root_dir)
-            file_path = root / "blocked.txt"
-            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            file_path = Path(root_dir) / "blocked.txt"
+
+            response = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"/write {file_path} -- blocked"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn("書き出し先フォルダが未設定です", response.json()["content"])
+            self.assertFalse(file_path.exists())
+
+    def test_write_command_rejects_path_outside_output_folder(self):
+        with TemporaryDirectory() as output_dir, TemporaryDirectory() as other_dir:
+            self.project.output_path = output_dir
+            self.project.save(update_fields=["output_path"])
+            file_path = Path(other_dir) / "blocked.txt"
 
             response = self.client.post(
                 reverse("send_message", args=[self.thread.id]),
@@ -466,7 +546,8 @@ class ChatFlowTests(TestCase):
             root = Path(root_dir)
             file_path = root / "note.txt"
             file_path.write_text("first", encoding="utf-8")
-            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
 
             response = self.client.post(
                 reverse("send_message", args=[self.thread.id]),
@@ -521,7 +602,7 @@ class ChatFlowTests(TestCase):
 
         self.assertIn('"progress_tail"', body)
         self.assertIn("Goal: Answer the user's request: hello", body)
-        self.assertIn("Criteria: The answer directly addresses the user's request.", body)
+        self.assertIn("Criteria:", body)
         self.assertIn("Plan: Direct answer; no tool use needed.", body)
         self.assertIn('"done": true', body)
         self.assertIn('"elapsed_ms":', body)
@@ -535,6 +616,50 @@ class ChatFlowTests(TestCase):
         self.assertEqual(run.goal, "Answer the user's request: hello")
         self.assertEqual(run.current_plan_queue, [])
         self.assertEqual(run.final_message, "hello")
+
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_plain_save_request_writes_final_answer_to_output_folder(self, mock_config, mock_stream):
+        mock_config.return_value.model = "test-model"
+        mock_config.return_value.api_key = "test-key"
+        mock_config.return_value.base_url = ""
+        mock_config.return_value.sources = []
+        mock_stream.return_value = iter([("delta", "保存する本文")])
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
+
+            create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "この内容を保存してください"})
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+            saved_path = root / "maigent-output.txt"
+            self.assertEqual(saved_path.read_text(encoding="utf-8"), "保存する本文\n")
+
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertIn("回答の保存結果", assistant.content)
+        self.assertIn("OK:", assistant.content)
+
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_plain_save_request_reports_missing_output_folder(self, mock_config, mock_stream):
+        mock_config.return_value.model = "test-model"
+        mock_config.return_value.api_key = "test-key"
+        mock_config.return_value.base_url = ""
+        mock_config.return_value.sources = []
+        mock_stream.return_value = iter([("delta", "保存する本文")])
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "この内容を保存してください"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        b"".join(stream.streaming_content)
+
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertIn("回答の保存結果", assistant.content)
+        self.assertIn("NG:", assistant.content)
+        self.assertIn("書き出し先フォルダが未設定です", assistant.content)
 
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
@@ -721,7 +846,7 @@ class ChatFlowTests(TestCase):
         first_evaluation_prompt = mock_complete.call_args_list[1].args[1]
         self.assertIn("Goal set before planning:", first_evaluation_prompt)
         self.assertIn("Evaluation criteria set before planning:", first_evaluation_prompt)
-        self.assertIn("The answer directly addresses the user's request.", first_evaluation_prompt)
+        self.assertIn("ユーザーの依頼に直接対応", first_evaluation_prompt)
         self.assertEqual(mock_complete.call_args_list[1].kwargs["max_output_tokens"], 80)
         self.assertEqual(mock_complete.call_args_list[1].kwargs["reasoning_effort"], "minimal")
 
@@ -875,7 +1000,8 @@ class ChatFlowTests(TestCase):
         with TemporaryDirectory() as root_dir:
             root = Path(root_dir)
             output_path = root / "result.txt"
-            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
             mock_run_sandbox.return_value = SandboxResult(True, "4")
 
             create = self.client.post(
@@ -910,7 +1036,8 @@ class ChatFlowTests(TestCase):
         with TemporaryDirectory() as root_dir:
             root = Path(root_dir)
             output_path = root / "artifact.txt"
-            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
             mock_run_sandbox.return_value = SandboxResult(
                 True,
                 "\n".join(
@@ -932,6 +1059,297 @@ class ChatFlowTests(TestCase):
             b"".join(stream.streaming_content)
 
             self.assertEqual(output_path.read_text(encoding="utf-8"), "artifact\n")
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.views.load_runtime_config")
+    def test_sandbox_image_artifact_base64_is_saved_and_linked(self, mock_config, mock_generate_sandbox_code, mock_run_sandbox):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_config.return_value = Config()
+        mock_generate_sandbox_code.return_value = "print('chart ready')"
+        png_bytes = b"\x89PNG\r\n\x1a\nimage-bytes"
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
+            mock_run_sandbox.return_value = SandboxResult(
+                True,
+                "\n".join(
+                    [
+                        "chart ready",
+                        "```json",
+                        json.dumps(
+                            {
+                                "maigent_artifacts": [
+                                    {
+                                        "path": "chart.png",
+                                        "content_base64": base64.b64encode(png_bytes).decode("ascii"),
+                                        "mime_type": "image/png",
+                                        "append": False,
+                                    }
+                                ]
+                            }
+                        ),
+                        "```",
+                    ]
+                ),
+            )
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": "Pythonで画像を作成して保存してください"},
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+            self.assertEqual((root / "chart.png").read_bytes(), png_bytes)
+            assistant = Message.objects.get(id=payload["assistant_id"])
+            self.assertIn(f"![chart.png](/projects/{self.project.id}/artifacts/chart.png)", assistant.content)
+
+            image_response = self.client.get(reverse("artifact_image", args=[self.project.id, "chart.png"]))
+            self.assertEqual(image_response.status_code, 200)
+            self.assertEqual(image_response["Content-Type"], "image/png")
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.views.load_runtime_config")
+    def test_typed_sandbox_image_artifact_is_saved_without_raw_json_in_message(
+        self,
+        mock_config,
+        mock_generate_sandbox_code,
+        mock_run_sandbox,
+    ):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_config.return_value = Config()
+        mock_generate_sandbox_code.return_value = "print('typed result')"
+        png_bytes = b"\x89PNG\r\n\x1a\ntyped-image"
+        artifact = {
+            "path": "typed-chart.png",
+            "content_base64": base64.b64encode(png_bytes).decode("ascii"),
+            "mime_type": "image/png",
+            "append": False,
+        }
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
+            mock_run_sandbox.return_value = SandboxResult(True, "chart ready", (artifact,), json.dumps({"ignored": True}))
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": "Pythonで画像を作成して保存してください"},
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+            self.assertEqual((root / "typed-chart.png").read_bytes(), png_bytes)
+
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertIn("chart ready", assistant.content)
+        self.assertIn(f"![typed-chart.png](/projects/{self.project.id}/artifacts/typed-chart.png)", assistant.content)
+        self.assertNotIn("content_base64", assistant.content)
+        self.assertNotIn("maigent_artifacts", assistant.content)
+
+    def test_typed_sandbox_output_parser_separates_stdout_and_artifacts(self):
+        payload = {
+            "maigent_sandbox_result": {
+                "stdout": "chart ready",
+                "artifacts": [
+                    {
+                        "path": "chart.png",
+                        "content_base64": base64.b64encode(b"png").decode("ascii"),
+                        "mime_type": "image/png",
+                    }
+                ],
+            }
+        }
+
+        stdout, artifacts = _parse_typed_sandbox_output(json.dumps(payload))
+
+        self.assertEqual(stdout, "chart ready")
+        self.assertEqual(artifacts[0]["path"], "chart.png")
+
+    def test_typed_sandbox_output_parser_extracts_embedded_payload(self):
+        payload = {
+            "maigent_sandbox_result": {
+                "stdout": "chart ready",
+                "artifacts": [
+                    {
+                        "path": "chart.png",
+                        "content_base64": base64.b64encode(b"png").decode("ascii"),
+                        "mime_type": "image/png",
+                    }
+                ],
+            }
+        }
+
+        stdout, artifacts = _parse_typed_sandbox_output("合計人数: 30\n" + json.dumps(payload))
+
+        self.assertEqual(stdout, "合計人数: 30")
+        self.assertEqual(artifacts[0]["path"], "chart.png")
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.views.load_runtime_config")
+    def test_sandbox_image_artifact_link_handles_spaces(self, mock_config, mock_generate_sandbox_code, mock_run_sandbox):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_config.return_value = Config()
+        mock_generate_sandbox_code.return_value = "print('chart ready')"
+        png_bytes = b"\x89PNG\r\n\x1a\nimage-bytes"
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
+            mock_run_sandbox.return_value = SandboxResult(
+                True,
+                "\n".join(
+                    [
+                        "chart ready",
+                        "```json",
+                        json.dumps(
+                            {
+                                "maigent_artifacts": [
+                                    {
+                                        "path": "my chart.png",
+                                        "content_base64": base64.b64encode(png_bytes).decode("ascii"),
+                                        "mime_type": "image/png",
+                                        "append": False,
+                                    }
+                                ]
+                            }
+                        ),
+                        "```",
+                    ]
+                ),
+            )
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": "Pythonで画像成果物を作成してmy chart.pngに保存してください\n```python\nprint('chart ready')\n```"},
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+            assistant = Message.objects.get(id=payload["assistant_id"])
+            self.assertIn(f"![my chart.png](/projects/{self.project.id}/artifacts/my%20chart.png)", assistant.content)
+            image_response = self.client.get(reverse("artifact_image", args=[self.project.id, "my chart.png"]))
+            self.assertEqual(image_response.status_code, 200)
+
+    def test_artifact_image_route_rejects_non_images_and_output_escape(self):
+        with TemporaryDirectory() as root_dir, TemporaryDirectory() as other_dir:
+            root = Path(root_dir)
+            other = Path(other_dir)
+            self.project.output_path = str(root)
+            self.project.save(update_fields=["output_path"])
+            (root / "note.txt").write_text("not an image", encoding="utf-8")
+            (other / "secret.png").write_bytes(b"secret")
+
+            non_image = self.client.get(reverse("artifact_image", args=[self.project.id, "note.txt"]))
+            escaped = self.client.get(reverse("artifact_image", args=[self.project.id, f"../{other.name}/secret.png"]))
+
+            self.assertEqual(non_image.status_code, 404)
+            self.assertEqual(escaped.status_code, 404)
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.load_runtime_config")
+    def test_sandbox_artifact_json_rejects_path_outside_output_folder(self, mock_config, mock_run_sandbox):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_config.return_value = Config()
+        with TemporaryDirectory() as output_dir, TemporaryDirectory() as other_dir:
+            self.project.output_path = output_dir
+            self.project.save(update_fields=["output_path"])
+            outside_path = Path(other_dir) / "artifact.txt"
+            mock_run_sandbox.return_value = SandboxResult(
+                True,
+                json.dumps({"maigent_artifacts": [{"path": str(outside_path), "content": "artifact\n", "append": False}]}),
+            )
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": f"Pythonで成果物を作成して{outside_path}に保存してください"},
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+            self.assertFalse(outside_path.exists())
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertIn("Sandbox成果物の保存結果", assistant.content)
+        self.assertIn("NG:", assistant.content)
+
+    def test_implicit_sandbox_artifact_ignores_rag_source_paths(self):
+        with TemporaryDirectory() as output_dir, TemporaryDirectory() as source_dir:
+            output = Path(output_dir)
+            source = Path(source_dir)
+            source_path = source / "test.csv"
+            source_path.write_text("score\n1\n", encoding="utf-8")
+            self.project.output_path = str(output)
+            self.project.save(update_fields=["output_path"])
+            input_text = "\n".join(
+                [
+                    "test.csvのテストの点のヒストグラムを作り、pngファイルを読み書き可能フォルダに保存してください。",
+                    "",
+                    f"Auto-selected file: {source_path}",
+                    "```text",
+                    "score",
+                    "1",
+                    "```",
+                ]
+            )
+
+            message = _persist_sandbox_artifacts(self.thread, input_text, "histogram text")
+
+            self.assertIn("OK:", message)
+            self.assertTrue((output / "maigent-histogram.txt").exists())
+            self.assertEqual((output / "maigent-histogram.txt").read_text(encoding="utf-8"), "histogram text\n")
+            self.assertEqual(source_path.read_text(encoding="utf-8"), "score\n1\n")
 
     @patch("agent.tooling.subprocess.run")
     def test_sandbox_generates_program_for_natural_language_sum(self, mock_run):
@@ -1024,6 +1442,175 @@ class ChatFlowTests(TestCase):
         self.assertIn("population_std:", printed)
         self.assertNotIn("column: id", printed)
 
+    def test_sandbox_tabular_program_uses_host_dataset_when_available(self):
+        message = "\n".join(
+            [
+                "test.csvの全てのテストの点を足し合わせてください。",
+                "",
+                "RAG context from allowed local files:",
+                "Auto-selected file: /tmp/test.csv",
+                "```text",
+                "名前,テストの種類,テストの点",
+                "佐藤太郎,国語,82",
+                "```",
+                "",
+                "Host-provided sandbox dataset API:",
+                "Available datasets:",
+                "- id: rag_1; name: test.csv; kind: csv; rows: 3; columns: 名前, テストの種類, テストの点; truncated: no",
+            ]
+        )
+
+        code = _python_for_tabular_task(message)
+
+        self.assertIn("df = load_dataset('rag_1')", code)
+        self.assertNotIn("csv_text =", code)
+
+    def test_sandbox_csv_histogram_image_requires_llm_generated_code(self):
+        message = "\n".join(
+            [
+                "test.csvのテストの点のヒストグラムを作り画像を表示してください。",
+                "",
+                "RAG context from allowed local files:",
+                "Auto-selected file: /tmp/test.csv",
+                "```text",
+                "id,name,テストの点",
+                "1001,Alice,70",
+                "1002,Bob,80",
+                "1003,Carol,90",
+                "```",
+            ]
+        )
+
+        self.assertTrue(requires_llm_sandbox_program(message))
+        self.assertFalse(can_build_sandbox_program(message))
+
+    def test_sandbox_code_policy_rejects_local_file_reads_and_path_writes(self):
+        self.assertIn("local file reads", _sandbox_code_policy_violation("import pandas as pd\npd.read_csv('test.csv')"))
+        self.assertIn(
+            "local file reads",
+            _sandbox_code_policy_violation("import pandas as pd\nfile_path = 'test.csv'\ndf = pd.read_csv(file_path)"),
+        )
+        self.assertIn(
+            "local filesystem checks",
+            _sandbox_code_policy_violation("import os\nfile_path = 'test.csv'\nos.path.exists(file_path)"),
+        )
+        self.assertIn("local file access", _sandbox_code_policy_violation("from pathlib import Path\nPath('test.csv').read_text()"))
+        self.assertIn("local file access", _sandbox_code_policy_violation("open('test.csv')"))
+        self.assertIn(
+            "sandbox file writes",
+            _sandbox_code_policy_violation("import matplotlib.pyplot as plt\noutput_path = 'histogram.png'\nplt.savefig(output_path)"),
+        )
+        self.assertIn(
+            "legacy artifact payload format",
+            _sandbox_code_policy_violation("print({'maigent_artifacts': []})"),
+        )
+        self.assertIn(
+            "embedded tabular data copies",
+            _sandbox_code_policy_violation(
+                "csv_data = '''名前，テストの種類，テストの点\n佐藤太郎，国語，82\n佐藤太郎，数学，76'''\n"
+                "df = pd.read_csv(io.StringIO(csv_data))"
+            ),
+        )
+        self.assertEqual(
+            _sandbox_code_policy_violation("import io, pandas as pd\ncsv_text='a\\n1\\n'\ndf = pd.read_csv(io.StringIO(csv_text))"),
+            "",
+        )
+        self.assertEqual(
+            _sandbox_code_policy_violation("df = load_dataset('rag_1')\nprint(df['テストの点'].sum())"),
+            "",
+        )
+        self.assertEqual(
+            _sandbox_code_policy_violation("import io, matplotlib.pyplot as plt\nbuf = io.BytesIO()\nplt.savefig(buf, format='png')"),
+            "",
+        )
+
+    def test_sandbox_prepends_host_dataset_loader(self):
+        dataset = make_sandbox_dataset(
+            "rag_1",
+            "test.csv",
+            "/allowed/test.csv",
+            "csv",
+            "名前,テストの種類,テストの点\n佐藤太郎,国語,82\n",
+        )
+        script = _prepend_sandbox_datasets("df = load_dataset('rag_1')\nprint(df['テストの点'].sum())", (dataset,))
+
+        self.assertIn("def load_dataset(dataset_id):", script)
+        self.assertIn("名前,テストの種類,テストの点", script)
+
+    @patch("agent.views.generate_sandbox_code")
+    def test_sandbox_code_generation_retries_after_policy_rejection(self, mock_generate_sandbox_code):
+        class Config:
+            sandbox_code_generation = {"llm_max_retries": 1}
+
+        mock_generate_sandbox_code.side_effect = [
+            "import pandas as pd\nfile_path = 'test.csv'\ndf = pd.read_csv(file_path)",
+            "import io, pandas as pd\ncsv_text='score\\n80\\n'\ndf = pd.read_csv(io.StringIO(csv_text))\nprint(df['score'].sum())",
+        ]
+
+        code = _generate_sandbox_code_with_retries(Config(), "test.csvを集計してください")
+
+        self.assertIn("io.StringIO", code)
+        self.assertEqual(mock_generate_sandbox_code.call_count, 2)
+        self.assertIn("Previous generated code was rejected", mock_generate_sandbox_code.call_args_list[1].args[1])
+
+    def test_sandbox_artifact_payload_is_hidden_from_display_output(self):
+        payload = json.dumps(
+            {
+                "maigent_artifacts": [
+                    {
+                        "path": "chart.png",
+                        "content_base64": base64.b64encode(b"png").decode("ascii"),
+                        "mime_type": "image/png",
+                    }
+                ]
+            }
+        )
+
+        output = _strip_sandbox_artifact_payloads(f"chart ready\n```json\n{payload}\n```\ndone")
+
+        self.assertEqual(output, "chart ready\n\ndone")
+        self.assertNotIn("content_base64", output)
+
+    def test_marked_sandbox_artifact_payload_is_hidden_from_display_output(self):
+        payload = json.dumps(
+            {
+                "maigent_artifacts": [
+                    {
+                        "path": "chart.png",
+                        "content_base64": base64.b64encode(b"png").decode("ascii"),
+                        "mime_type": "image/png",
+                    }
+                ]
+            },
+            indent=2,
+        )
+
+        output = _strip_sandbox_artifact_payloads(f"chart ready\n<MAIGENT_ARTIFACT>\n{payload}\ndone")
+
+        self.assertEqual(output, "chart ready\n\ndone")
+        self.assertNotIn("content_base64", output)
+        self.assertNotIn("<MAIGENT_ARTIFACT>", output)
+
+    def test_typed_sandbox_artifact_payload_is_hidden_from_display_output(self):
+        payload = json.dumps(
+            {
+                "maigent_sandbox_result": {
+                    "stdout": "chart ready",
+                    "artifacts": [
+                        {
+                            "path": "chart.png",
+                            "content_base64": base64.b64encode(b"png").decode("ascii"),
+                            "mime_type": "image/png",
+                        }
+                    ],
+                }
+            }
+        )
+
+        output = _strip_sandbox_artifact_payloads(f"```json\n{payload}\n```")
+
+        self.assertEqual(output, "")
+
     @patch("agent.tooling.subprocess.run")
     def test_sandbox_prefers_csv_program_over_first_number(self, mock_run):
         class Config:
@@ -1108,7 +1695,7 @@ class ChatFlowTests(TestCase):
         self.assertIn("population_variance:", printed)
         self.assertIn("sample_variance:", printed)
 
-    def test_sandbox_csv_program_outputs_text_histogram(self):
+    def test_sandbox_csv_histogram_text_requires_llm_generated_code(self):
         message = "\n".join(
             [
                 "test.csvのテストの点のヒストグラムを作ってください。",
@@ -1124,14 +1711,8 @@ class ChatFlowTests(TestCase):
             ]
         )
 
-        code = _python_for_tabular_task(message)
-        namespace = {"__name__": "__main__"}
-        with patch("builtins.print") as mock_print:
-            exec(code, namespace)
-
-        printed = "\n".join(str(call.args[0]) for call in mock_print.call_args_list)
-        self.assertIn("column: テストの点", printed)
-        self.assertIn("histogram:", printed)
+        self.assertTrue(requires_llm_sandbox_program(message))
+        self.assertFalse(can_build_sandbox_program(message))
 
     def test_grouped_csv_task_requires_llm_generated_program(self):
         message = "\n".join(
@@ -1207,7 +1788,7 @@ class ChatFlowTests(TestCase):
         plan = build_agent_plan("正確に説明してください", Config())
 
         self.assertEqual(plan.goal, "Answer the user's request: 正確に説明してください")
-        self.assertIn("The answer directly addresses the user's request.", plan.evaluation_criteria)
+        self.assertIn("回答は、ユーザーの依頼に直接対応している。", plan.evaluation_criteria)
         self.assertEqual([step.tool for step in plan.steps], ["final"])
         self.assertFalse(can_build_sandbox_program("正確に説明してください"))
 
@@ -1228,6 +1809,15 @@ class ChatFlowTests(TestCase):
                 return name == "sandbox" or (name == "rag" and default)
 
         decision = select_tool("123 * 456 を正確に計算して", Config())
+
+        self.assertEqual(decision.name, "sandbox")
+
+    def test_tool_selection_prefers_sandbox_for_image_when_enabled(self):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox" or (name == "rag" and default)
+
+        decision = select_tool("画像を作成して保存してください", Config())
 
         self.assertEqual(decision.name, "sandbox")
 
@@ -1259,7 +1849,7 @@ class ChatFlowTests(TestCase):
             }
 
             def tool_enabled(self, name, default=False):
-                return name == "dynamic_replanner"
+                return name in {"dynamic_replanner", "sandbox"}
 
         state = AgentState.from_plan(
             AgentPlan(
@@ -1305,7 +1895,7 @@ class ChatFlowTests(TestCase):
             }
 
             def tool_enabled(self, name, default=False):
-                return name == "dynamic_finalizer"
+                return name in {"dynamic_finalizer", "sandbox"}
 
         state = AgentState.from_plan(
             AgentPlan(
@@ -1347,7 +1937,7 @@ class ChatFlowTests(TestCase):
             }
 
             def tool_enabled(self, name, default=False):
-                return name in {"dynamic_finalizer", "sandbox"}
+                return name in {"dynamic_finalizer", "sandbox", "web_search"}
 
         mock_complete.side_effect = [
             json.dumps(
@@ -1423,6 +2013,51 @@ class ChatFlowTests(TestCase):
         self.assertTrue(result["ok"])
         self.assertIn("Sandbox実行結果: 成功", result["final_message"])
         self.assertEqual(mock_run_sandbox.call_args.kwargs["code"], "print('computed')")
+
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.generate_sandbox_code")
+    def test_generated_sandbox_code_retries_after_runtime_error(self, mock_generate_code, mock_run_sandbox):
+        class Config:
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+            sandbox_code_generation = {"llm_max_retries": 1}
+
+            def tool_enabled(self, name, default=False):
+                return name == "sandbox"
+
+        mock_generate_code.side_effect = [
+            "json",
+            "import json\nprint(json.dumps({'maigent_sandbox_result': {'stdout': 'ok', 'artifacts': []}}))",
+        ]
+        mock_run_sandbox.side_effect = [
+            SandboxResult(False, "Traceback (most recent call last):\nNameError: name 'json' is not defined"),
+            SandboxResult(True, "ok"),
+        ]
+        input_text = "テスト結果のヒストグラムを作成してください。"
+        plan = AgentPlan(
+            goal="Create a histogram.",
+            evaluation_criteria=["The sandbox succeeds."],
+            summary="sandbox -> final",
+            steps=[AgentPlanStep("sandbox", "Create histogram.")],
+        )
+
+        runner = _execute_agent_plan(self.thread, input_text, Config(), plan)
+        result = None
+        while True:
+            try:
+                next(runner)
+            except StopIteration as exc:
+                result = exc.value
+                break
+
+        self.assertTrue(result["ok"])
+        self.assertIn("Sandbox実行結果: 成功", result["final_message"])
+        self.assertEqual(mock_generate_code.call_count, 2)
+        self.assertEqual(mock_run_sandbox.call_count, 2)
+        self.assertIn("Previous generated sandbox code failed during execution", mock_generate_code.call_args_list[1].args[1])
+        self.assertIn("NameError: name 'json' is not defined", mock_generate_code.call_args_list[1].args[1])
+        self.assertIn("import json", mock_run_sandbox.call_args.kwargs["code"])
 
     @patch("agent.views.complete_response")
     def test_llm_tool_selector_can_choose_rag_and_sandbox(self, mock_complete):
@@ -1851,6 +2486,61 @@ class ChatFlowTests(TestCase):
         self.assertIn("佐藤太郎: 246", assistant.content)
         mock_stream.assert_not_called()
 
+    @patch("agent.views.stream_response")
+    @patch("agent.views.run_sandbox")
+    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.views.load_runtime_config")
+    def test_llm_sandbox_code_gets_host_dataset_api_for_named_csv(
+        self,
+        mock_config,
+        mock_generate_sandbox_code,
+        mock_run_sandbox,
+        mock_stream,
+    ):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+            def tool_enabled(self, name, default=False):
+                return name in {"rag", "sandbox"}
+
+        mock_config.return_value = Config()
+        mock_generate_sandbox_code.return_value = "df = load_dataset('rag_1')\nprint(df['テストの点'].sum())"
+        mock_run_sandbox.return_value = SandboxResult(True, "246")
+        mock_stream.return_value = iter([("delta", "should not call")])
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            source = root / "test.csv"
+            source.write_text(
+                "名前,テストの種類,テストの点\n佐藤太郎,国語,82\n佐藤太郎,数学,76\n佐藤太郎,英語,88\n",
+                encoding="utf-8",
+            )
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]),
+                {"message": "test.csvのテストの点のヒストグラムを作り画像を表示してください。"},
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+        generation_prompt = mock_generate_sandbox_code.call_args.args[1]
+        self.assertIn("Host-provided sandbox dataset API", generation_prompt)
+        self.assertIn("id: rag_1", generation_prompt)
+        self.assertIn("columns: 名前, テストの種類, テストの点", generation_prompt)
+        datasets = mock_run_sandbox.call_args.kwargs["datasets"]
+        self.assertEqual(datasets[0].id, "rag_1")
+        self.assertEqual(datasets[0].text.splitlines()[0], "名前,テストの種類,テストの点")
+        self.assertIn("load_dataset('rag_1')", mock_run_sandbox.call_args.kwargs["code"])
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertIn("Sandbox実行結果: 成功", assistant.content)
+
     def test_approval_actions_never_execute_command(self):
         approval = ApprovalRequest.objects.create(thread=self.thread, command="rm -rf /tmp/example")
 
@@ -1872,6 +2562,17 @@ class ChatFlowTests(TestCase):
         self.assertEqual(access.mode, "write")
         self.assertEqual(access.note, "workspace")
         self.assertEqual(access.path, normalize_access_path(root_dir))
+
+    def test_update_output_path_normalizes_and_saves_folder(self):
+        with TemporaryDirectory() as root_dir:
+            response = self.client.post(
+                reverse("update_output_path", args=[self.project.id]),
+                {"output_path": root_dir},
+            )
+
+        self.assertEqual(response.status_code, 302)
+        self.project.refresh_from_db()
+        self.assertEqual(self.project.output_path, normalize_access_path(root_dir))
 
     def test_delete_access_path_removes_entry(self):
         access = ProjectAccessPath.objects.create(project=self.project, path="/tmp/example", mode="read")

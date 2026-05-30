@@ -4,6 +4,7 @@ from django.db import models
 class Project(models.Model):
     name = models.CharField(max_length=120)
     path = models.CharField(max_length=500, blank=True)
+    output_path = models.CharField(max_length=700, blank=True)
     description = models.TextField(blank=True)
     is_current = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)

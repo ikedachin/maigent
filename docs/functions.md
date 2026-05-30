@@ -108,7 +108,9 @@ Dockerコンテナ内でPythonコードを実行します。
 安全設計:
 - sandboxは許可フォルダを直接マウントしない
 - 通常はネットワークを無効化する
-- ファイル保存はstdoutの `maigent_artifacts` JSONをホスト側brokerが検証して行う
+- ファイル保存はstdoutの typed `maigent_sandbox_result` JSONをホスト側brokerが検証して行う
+- RAGで選ばれたCSV/TSV/JSON/TXT/Markdownは、許可パス検証後に `SandboxDataset` としてホスト側で読み、`load_dataset("rag_1")` などの固定APIをsandboxコードへ注入する
+- LLM生成コードがCSV/TSV行をPython文字列へ再転記した場合は、ポリシー違反として再生成する
 
 ### web_search
 
@@ -199,17 +201,20 @@ Dockerコンテナ内でPythonコードを実行します。
 
 ## ファイルアクセスと保存
 
-読み取り/書き込みは `ProjectAccessPath` に登録されたパスに制限されます。
+読み取りは `ProjectAccessPath` に登録されたパスに制限されます。書き込みはプロジェクトの書き出し先フォルダ配下に制限されます。
 
 書き込みの追加条件:
 - `file_write` feature flagが有効
-- 書き込み先または親フォルダが許可済み
+- 書き込み先がプロジェクトの書き出し先フォルダ配下
 - 親フォルダが存在する
 - 書き込み内容が `MAX_BROKER_WRITE_CHARS` 以下
+- 画像成果物は `content_base64` で保存し、PNG/JPEG/WebP/GIF のみチャット内表示リンクを生成する
 
 関連関数:
 - `is_path_allowed()`
 - `write_allowed_text_file()`
+- `write_allowed_binary_file()`
+- `serve_artifact_image()`
 - `_persist_sandbox_artifacts()`
 
 ## 新しいツールを追加する方法

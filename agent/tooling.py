@@ -1,4 +1,6 @@
 import ast
+import csv
+import json
 import logging
 import re
 import shlex
@@ -38,6 +40,20 @@ class AgentPlan:
 class SandboxResult:
     ok: bool
     output: str
+    artifacts: tuple[dict[str, object], ...] = ()
+    raw_output: str = ""
+
+
+@dataclass(frozen=True)
+class SandboxDataset:
+    id: str
+    name: str
+    path: str
+    kind: str
+    text: str
+    columns: tuple[str, ...] = ()
+    row_count: int = 0
+    truncated: bool = False
 
 
 def build_sandbox_program(message: str) -> str:
@@ -60,6 +76,20 @@ def requires_llm_sandbox_program(message: str) -> bool:
     lowered = question.lower()
     group_markers = ["ごと", "ごとの", "別", "別に", "別の", "group by", "grouped by", "by name", "by subject"]
     if any(marker in question or marker in lowered for marker in group_markers):
+        return True
+    visual_markers = [
+        "画像",
+        "ヒストグラム",
+        "度数分布",
+        "グラフ",
+        "プロット",
+        "image",
+        "histogram",
+        "chart",
+        "graph",
+        "plot",
+    ]
+    if any(marker in question or marker in lowered for marker in visual_markers):
         return True
     return False
 
@@ -180,11 +210,12 @@ def _config_tool_enabled(config: RuntimeConfig, name: str, default: bool = False
     return value if isinstance(value, bool) else default
 
 
-def run_sandbox(message: str, config: RuntimeConfig, code: str = "") -> SandboxResult:
+def run_sandbox(message: str, config: RuntimeConfig, code: str = "", datasets: tuple[SandboxDataset, ...] = ()) -> SandboxResult:
     code = code.strip() if code else build_sandbox_program(message)
     if not code:
         logger.debug("sandbox_skip reason=no_code")
         return SandboxResult(False, "sandboxで実行できるPythonコードまたは計算式を特定できませんでした。")
+    code = _prepend_sandbox_datasets(code, datasets)
     with tempfile.TemporaryDirectory() as tmp_dir:
         script = Path(tmp_dir) / "script.py"
         script.write_text(code, encoding="utf-8")
@@ -231,10 +262,168 @@ def run_sandbox(message: str, config: RuntimeConfig, code: str = "") -> SandboxR
         except subprocess.TimeoutExpired:
             logger.debug("sandbox_error reason=timeout")
             return SandboxResult(False, "sandbox実行がタイムアウトしました。")
-    output = (completed.stdout or "") + (completed.stderr or "")
+    raw_output = ((completed.stdout or "") + (completed.stderr or "")).strip()
+    output, artifacts = _parse_typed_sandbox_output(raw_output)
     output = output.strip() or "(no output)"
-    logger.debug("sandbox_done returncode=%s output_preview=%r", completed.returncode, output[:240])
-    return SandboxResult(completed.returncode == 0, output[:12000])
+    logger.debug("sandbox_done returncode=%s output_preview=%r artifacts=%s", completed.returncode, output[:240], len(artifacts))
+    return SandboxResult(completed.returncode == 0, output[:12000], tuple(artifacts[:5]), raw_output[:12000])
+
+
+def make_sandbox_dataset(
+    dataset_id: str,
+    name: str,
+    path: str,
+    kind: str,
+    text: str,
+    truncated: bool = False,
+) -> SandboxDataset:
+    columns, row_count = _tabular_dataset_shape(kind, text)
+    return SandboxDataset(
+        id=dataset_id,
+        name=name,
+        path=path,
+        kind=kind,
+        text=text,
+        columns=tuple(columns),
+        row_count=row_count,
+        truncated=truncated,
+    )
+
+
+def sandbox_dataset_manifest(datasets: tuple[SandboxDataset, ...]) -> str:
+    if not datasets:
+        return ""
+    lines = [
+        "Sandbox datasets are available through the host-provided API below.",
+        "Do not copy or rewrite dataset contents into generated code.",
+        "Use load_dataset(dataset_id) for tabular data and dataset_text(dataset_id) only when raw text is required.",
+        "Available datasets:",
+    ]
+    for dataset in datasets:
+        columns = ", ".join(dataset.columns) if dataset.columns else "(unknown)"
+        row_count = str(dataset.row_count) if dataset.row_count else "(unknown)"
+        truncated = " yes" if dataset.truncated else " no"
+        lines.append(
+            f"- id: {dataset.id}; name: {dataset.name}; kind: {dataset.kind}; rows: {row_count}; "
+            f"columns: {columns}; truncated:{truncated}"
+        )
+    return "\n".join(lines)
+
+
+def _prepend_sandbox_datasets(code: str, datasets: tuple[SandboxDataset, ...]) -> str:
+    if not datasets:
+        return code
+    payload = [
+        {
+            "id": dataset.id,
+            "name": dataset.name,
+            "path": dataset.path,
+            "kind": dataset.kind,
+            "text": dataset.text,
+            "columns": list(dataset.columns),
+            "row_count": dataset.row_count,
+            "truncated": dataset.truncated,
+        }
+        for dataset in datasets
+    ]
+    payload_json = json.dumps(payload, ensure_ascii=False)
+    prelude = (
+        "import io as _maigent_io\n"
+        "import json as _maigent_json\n"
+        f"_MAIGENT_DATASETS = {{item['id']: item for item in _maigent_json.loads({payload_json!r})}}\n"
+        "\n"
+        "def dataset_text(dataset_id):\n"
+        "    try:\n"
+        "        return _MAIGENT_DATASETS[dataset_id]['text']\n"
+        "    except KeyError as exc:\n"
+        "        raise KeyError(f'unknown dataset_id: {dataset_id}') from exc\n"
+        "\n"
+        "def dataset_meta(dataset_id):\n"
+        "    try:\n"
+        "        item = dict(_MAIGENT_DATASETS[dataset_id])\n"
+        "    except KeyError as exc:\n"
+        "        raise KeyError(f'unknown dataset_id: {dataset_id}') from exc\n"
+        "    item.pop('text', None)\n"
+        "    return item\n"
+        "\n"
+        "def load_dataset(dataset_id):\n"
+        "    try:\n"
+        "        item = _MAIGENT_DATASETS[dataset_id]\n"
+        "    except KeyError as exc:\n"
+        "        raise KeyError(f'unknown dataset_id: {dataset_id}') from exc\n"
+        "    kind = item.get('kind')\n"
+        "    text = item.get('text', '')\n"
+        "    if kind in {'csv', 'tsv'}:\n"
+        "        import pandas as _maigent_pd\n"
+        "        sep = '\\t' if kind == 'tsv' else ','\n"
+        "        return _maigent_pd.read_csv(_maigent_io.StringIO(text), sep=sep)\n"
+        "    if kind == 'json':\n"
+        "        return _maigent_json.loads(text)\n"
+        "    return text\n"
+        "\n"
+    )
+    return prelude + code
+
+
+def _tabular_dataset_shape(kind: str, text: str) -> tuple[list[str], int]:
+    if kind not in {"csv", "tsv"} or not text.strip():
+        return [], 0
+    delimiter = "\t" if kind == "tsv" else ","
+    try:
+        reader = csv.reader(text.splitlines(), delimiter=delimiter)
+        rows = list(reader)
+    except csv.Error:
+        return [], 0
+    if not rows:
+        return [], 0
+    columns = [str(value).strip().lstrip("\ufeff") for value in rows[0]]
+    row_count = max(0, len([row for row in rows[1:] if any(str(cell).strip() for cell in row)]))
+    return columns, row_count
+
+
+def _parse_typed_sandbox_output(output: str) -> tuple[str, list[dict[str, object]]]:
+    if not output:
+        return "", []
+    try:
+        payload = json.loads(output)
+    except json.JSONDecodeError:
+        embedded = _extract_embedded_typed_sandbox_output(output)
+        return embedded if embedded else (output, [])
+    if not isinstance(payload, dict):
+        return output, []
+    result = payload.get("maigent_sandbox_result")
+    if not isinstance(result, dict):
+        return output, []
+    stdout = str(result.get("stdout") or "")
+    artifacts = result.get("artifacts", [])
+    if not isinstance(artifacts, list):
+        artifacts = []
+    return stdout, [artifact for artifact in artifacts if isinstance(artifact, dict)]
+
+
+def _extract_embedded_typed_sandbox_output(output: str) -> tuple[str, list[dict[str, object]]] | None:
+    decoder = json.JSONDecoder()
+    index = 0
+    while index < len(output):
+        object_start = output.find("{", index)
+        if object_start < 0:
+            return None
+        try:
+            payload, object_length = decoder.raw_decode(output[object_start:])
+        except json.JSONDecodeError:
+            index = object_start + 1
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("maigent_sandbox_result"), dict):
+            result = payload["maigent_sandbox_result"]
+            typed_stdout = str(result.get("stdout") or "").strip()
+            artifacts = result.get("artifacts", [])
+            if not isinstance(artifacts, list):
+                artifacts = []
+            visible_output = (output[:object_start] + output[object_start + object_length :]).strip()
+            stdout = visible_output or typed_stdout
+            return stdout, [artifact for artifact in artifacts if isinstance(artifact, dict)]
+        index = object_start + max(1, object_length)
+    return None
 
 
 def _looks_like_sandbox_task(message: str) -> bool:
@@ -254,6 +443,7 @@ def _looks_like_sandbox_task(message: str) -> bool:
         "足し合わせ",
         "足し算",
         "標準偏差",
+        "画像",
         "ヒストグラム",
         "グラフ",
         "プロット",
@@ -304,8 +494,9 @@ def _python_for_expression(message: str) -> str:
 
 
 def _python_for_tabular_task(message: str) -> str:
+    dataset_id = _extract_first_dataset_id(message)
     csv_text = _extract_csv_context(message)
-    if not csv_text:
+    if not csv_text and not dataset_id:
         return ""
     question = _strip_rag_context(message)
     lowered = question.lower()
@@ -323,13 +514,26 @@ def _python_for_tabular_task(message: str) -> str:
     )
     if not any([wants_mean, wants_variance, wants_std, wants_sum, wants_count, wants_histogram]):
         return ""
+    if dataset_id:
+        source_code = (
+            "import math, statistics\n"
+            f"question = {question!r}\n"
+            f"df = load_dataset({dataset_id!r})\n"
+            "rows = df.to_dict('records') if hasattr(df, 'to_dict') else []\n"
+            "headers = list(df.columns) if hasattr(df, 'columns') else []\n"
+        )
+    else:
+        source_code = (
+            "import csv, io, math, statistics\n"
+            f"csv_text = {csv_text!r}\n"
+            f"question = {question!r}\n"
+            "reader = csv.DictReader(io.StringIO(csv_text.strip()))\n"
+            "rows = list(reader)\n"
+            "headers = reader.fieldnames or []\n"
+        )
     return (
-        "import csv, io, math, statistics\n"
-        f"csv_text = {csv_text!r}\n"
-        f"question = {question!r}\n"
-        "reader = csv.DictReader(io.StringIO(csv_text.strip()))\n"
-        "rows = list(reader)\n"
-        "headers = reader.fieldnames or []\n"
+        source_code
+        +
         "def to_number(value):\n"
         "    text = str(value).strip().replace(',', '')\n"
         "    if text.endswith('%'):\n"
@@ -392,7 +596,50 @@ def _python_for_tabular_task(message: str) -> str:
         "        start = low + width * index\n"
         "        end = low + width * (index + 1)\n"
         "        print(f'{start:.2f}-{end:.2f}: {count}')\n"
+        "    if '画像' in question or '表示' in question or 'png' in question_lower or 'image' in question_lower:\n"
+        "        import base64, json, struct, zlib\n"
+        "        image_width, image_height = 800, 480\n"
+        "        margin_left, margin_right, margin_top, margin_bottom = 70, 30, 30, 70\n"
+        "        pixels = bytearray([255, 255, 255] * image_width * image_height)\n"
+        "        def set_pixel(x, y, color):\n"
+        "            if 0 <= x < image_width and 0 <= y < image_height:\n"
+        "                offset = (y * image_width + x) * 3\n"
+        "                pixels[offset:offset + 3] = bytes(color)\n"
+        "        def fill_rect(x0, y0, x1, y1, color):\n"
+        "            x0, x1 = max(0, int(x0)), min(image_width, int(x1))\n"
+        "            y0, y1 = max(0, int(y0)), min(image_height, int(y1))\n"
+        "            for y in range(y0, y1):\n"
+        "                for x in range(x0, x1):\n"
+        "                    set_pixel(x, y, color)\n"
+        "        axis = (40, 45, 50)\n"
+        "        for x in range(margin_left, image_width - margin_right):\n"
+        "            set_pixel(x, image_height - margin_bottom, axis)\n"
+        "        for y in range(margin_top, image_height - margin_bottom + 1):\n"
+        "            set_pixel(margin_left, y, axis)\n"
+        "        plot_width = image_width - margin_left - margin_right\n"
+        "        plot_height = image_height - margin_top - margin_bottom\n"
+        "        max_count = max(counts) or 1\n"
+        "        bar_gap = 4\n"
+        "        bar_width = max(1, plot_width // bins - bar_gap)\n"
+        "        for index, count in enumerate(counts):\n"
+        "            x0 = margin_left + index * plot_width / bins + bar_gap / 2\n"
+        "            x1 = x0 + bar_width\n"
+        "            bar_height = int(plot_height * count / max_count)\n"
+        "            y0 = image_height - margin_bottom - bar_height\n"
+        "            y1 = image_height - margin_bottom\n"
+        "            fill_rect(x0, y0, x1, y1, (52, 120, 246))\n"
+        "        def chunk(kind, data_bytes):\n"
+        "            return struct.pack('>I', len(data_bytes)) + kind + data_bytes + struct.pack('>I', zlib.crc32(kind + data_bytes) & 0xffffffff)\n"
+        "        raw = b''.join(b'\\x00' + bytes(pixels[y * image_width * 3:(y + 1) * image_width * 3]) for y in range(image_height))\n"
+        "        png = b'\\x89PNG\\r\\n\\x1a\\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', image_width, image_height, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(raw, 9)) + chunk(b'IEND', b'')\n"
+        "        artifact = {'maigent_artifacts': [{'path': 'histogram.png', 'content_base64': base64.b64encode(png).decode('ascii'), 'mime_type': 'image/png', 'append': False}]}\n"
+        "        print(json.dumps(artifact, ensure_ascii=False))\n"
     )
+
+
+def _extract_first_dataset_id(message: str) -> str:
+    match = re.search(r"^\s*-\s+id:\s+([A-Za-z0-9_-]+);", message, flags=re.MULTILINE)
+    return match.group(1) if match else ""
 
 
 def _python_for_numeric_task(message: str) -> str:

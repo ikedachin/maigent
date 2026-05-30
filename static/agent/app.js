@@ -37,6 +37,11 @@ const translations = {
     tools: "ツール",
     accessPaths: "アクセス許可",
     accessPathPlaceholder: "/path/to/file-or-folder",
+    outputFolder: "書き出し先",
+    outputPathPlaceholder: "/path/to/output-folder",
+    saveOutputFolder: "書き出し先を保存",
+    outputFolderHelp: "ファイル書き出しはこのフォルダ配下に限定されます。",
+    noOutputFolder: "書き出し先フォルダは未設定です。",
     readOnly: "読み取りのみ",
     readWrite: "読み書き",
     notePlaceholder: "メモ",
@@ -69,14 +74,14 @@ const translations = {
     cmdFilePath: "ファイルなら読み取り、フォルダなら一覧表示",
     cmdRead: "許可済みファイルを読み取る",
     cmdLs: "許可済みフォルダの一覧を表示",
-    cmdWrite: "読み書き許可済みファイルへ書き込む",
-    cmdAppend: "読み書き許可済みファイルへ追記する",
+    cmdWrite: "書き出し先フォルダ配下のファイルへ書き込む",
+    cmdAppend: "書き出し先フォルダ配下のファイルへ追記する",
     cmdExperimental: "試験的機能の状態を表示",
     cmdAgent: "エージェント設定の状態を表示",
     cmdTheme: "テーマ設定の状態を表示",
     cmdApps: "アプリ連携の状態を表示",
     selectRepository: "リポジトリを選択",
-    selectRepositoryHelp: "フォルダをクリックして移動し、現在のフォルダをプロジェクトパスに設定できます。",
+    selectRepositoryHelp: "フォルダをクリックして移動し、現在のフォルダを入力欄に設定できます。",
     currentFolder: "現在のフォルダ",
     parentFolder: "上へ",
     useThisFolder: "このフォルダを使う",
@@ -128,6 +133,11 @@ const translations = {
     tools: "Tools",
     accessPaths: "Access paths",
     accessPathPlaceholder: "/path/to/file-or-folder",
+    outputFolder: "Output folder",
+    outputPathPlaceholder: "/path/to/output-folder",
+    saveOutputFolder: "Save output folder",
+    outputFolderHelp: "File exports are limited to this folder.",
+    noOutputFolder: "No output folder configured.",
     readOnly: "Read only",
     readWrite: "Read and write",
     notePlaceholder: "Note",
@@ -160,14 +170,14 @@ const translations = {
     cmdFilePath: "Read a file or list a folder",
     cmdRead: "Read an allowed file",
     cmdLs: "List an allowed folder",
-    cmdWrite: "Write an allowed read/write file",
-    cmdAppend: "Append to an allowed read/write file",
+    cmdWrite: "Write a file under the output folder",
+    cmdAppend: "Append to a file under the output folder",
     cmdExperimental: "Show experimental feature status",
     cmdAgent: "Show agent settings status",
     cmdTheme: "Show theme settings status",
     cmdApps: "Show app integration status",
     selectRepository: "Select repository",
-    selectRepositoryHelp: "Click folders to navigate, then set the current folder as the project path.",
+    selectRepositoryHelp: "Click folders to navigate, then set the current folder in the input.",
     currentFolder: "Current folder",
     parentFolder: "Up",
     useThisFolder: "Use this folder",
@@ -252,6 +262,158 @@ function applyLanguage(lang) {
   applyTheme(activeTheme());
 }
 
+function isSafeMarkdownImageUrl(url) {
+  if (/^https?:\/\//i.test(url)) return true;
+  if (/^\/(?!\/)/.test(url)) return true;
+  return /^data:image\/(?:png|jpe?g|webp|gif);base64,[a-z0-9+/=\s]+$/i.test(url);
+}
+
+function artifactPayloadToImageMarkdown(rawJson) {
+  let payload;
+  try {
+    payload = JSON.parse(rawJson);
+  } catch (error) {
+    return "";
+  }
+  const typedResult = payload && typeof payload.maigent_sandbox_result === "object" ? payload.maigent_sandbox_result : null;
+  const artifacts = Array.isArray(typedResult?.artifacts)
+    ? typedResult.artifacts
+    : Array.isArray(payload.maigent_artifacts)
+      ? payload.maigent_artifacts
+      : [];
+  return artifacts
+    .map((artifact) => {
+      const mimeType = String(artifact?.mime_type || "").toLowerCase();
+      const content = String(artifact?.content_base64 || "").replace(/\s+/g, "");
+      if (!/^image\/(?:png|jpe?g|webp|gif)$/.test(mimeType) || !/^[a-z0-9+/=]+$/i.test(content)) return "";
+      const name = String(artifact?.path || "image").split(/[\\/]/).pop() || "image";
+      return `![${name}](data:${mimeType};base64,${content})`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+function findJsonObjectEnd(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (inString) {
+      if (escaped) {
+        escaped = false;
+      } else if (char === "\\") {
+        escaped = true;
+      } else if (char === "\"") {
+        inString = false;
+      }
+      continue;
+    }
+    if (char === "\"") {
+      inString = true;
+    } else if (char === "{") {
+      depth += 1;
+    } else if (char === "}") {
+      depth -= 1;
+      if (depth === 0) return index + 1;
+    }
+  }
+  return -1;
+}
+
+function replaceMarkedArtifactJsonWithImages(content) {
+  const marker = "<MAIGENT_ARTIFACT>";
+  let text = content || "";
+  let searchFrom = 0;
+  while (searchFrom < text.length) {
+    const markerIndex = text.indexOf(marker, searchFrom);
+    if (markerIndex < 0) break;
+    const objectStart = text.indexOf("{", markerIndex + marker.length);
+    if (objectStart < 0) break;
+    const objectEnd = findJsonObjectEnd(text, objectStart);
+    if (objectEnd < 0) break;
+    const markdown = artifactPayloadToImageMarkdown(text.slice(objectStart, objectEnd));
+    if (!markdown) {
+      searchFrom = objectEnd;
+      continue;
+    }
+    text = `${text.slice(0, markerIndex)}${markdown}${text.slice(objectEnd)}`;
+    searchFrom = markerIndex + markdown.length;
+  }
+  return text;
+}
+
+function replaceArtifactJsonWithImages(content) {
+  let text = replaceMarkedArtifactJsonWithImages(content || "");
+  text = text.replace(/```json\s*([\s\S]*?)```/gi, (syntax, rawJson) => {
+    const markdown = artifactPayloadToImageMarkdown(rawJson.trim());
+    return markdown || syntax;
+  });
+  return text
+    .split("\n")
+    .map((line) => {
+      const trimmed = line.trim();
+      if (!trimmed.includes("maigent_artifacts") && !trimmed.includes("maigent_sandbox_result")) return line;
+      return artifactPayloadToImageMarkdown(trimmed) || line;
+    })
+    .join("\n");
+}
+
+function renderMessageContent(node, content) {
+  node.textContent = "";
+  node.dataset.rawContent = content || "";
+  const text = replaceArtifactJsonWithImages(content || "");
+  const imagePattern = /!\[([^\]\n]*)\]\(([^)\s]+)\)/g;
+  let cursor = 0;
+  let match;
+  while ((match = imagePattern.exec(text)) !== null) {
+    const [syntax, alt, url] = match;
+    if (!isSafeMarkdownImageUrl(url)) continue;
+    if (match.index > cursor) {
+      node.append(document.createTextNode(text.slice(cursor, match.index)));
+    }
+    const image = document.createElement("img");
+    image.className = "message-image";
+    image.src = url;
+    image.alt = alt || "";
+    image.loading = "lazy";
+    image.decoding = "async";
+    node.append(image);
+    cursor = match.index + syntax.length;
+  }
+  if (cursor < text.length) {
+    node.append(document.createTextNode(text.slice(cursor)));
+  }
+}
+
+function renderInitialMessages() {
+  document.querySelectorAll(".message").forEach((message) => {
+    const body = message.querySelector("[data-message-body]");
+    const contentNode = message.querySelector("[data-message-content]");
+    if (!body || !contentNode) return;
+    let content = "";
+    try {
+      content = JSON.parse(contentNode.textContent || "\"\"");
+    } catch (error) {
+      content = contentNode.textContent || "";
+    }
+    renderMessageContent(body, content);
+    contentNode.remove();
+  });
+}
+
+function renderLoadingMessage(node) {
+  node.textContent = "";
+  node.className = "message-body message-loading";
+  const label = document.createElement("span");
+  label.textContent = t("running");
+  const dots = document.createElement("span");
+  dots.className = "typing-dots";
+  dots.setAttribute("aria-hidden", "true");
+  dots.append(document.createElement("i"), document.createElement("i"), document.createElement("i"));
+  node.append(label, dots);
+}
+
 function appendMessage(role, content, status) {
   const container = document.querySelector("#messages");
   const empty = container.querySelector(".empty-state");
@@ -279,14 +441,15 @@ function appendMessage(role, content, status) {
   copyButton.setAttribute("aria-label", t("copyMessage"));
   copyButton.textContent = t("copy");
   actions.append(statusNode, copyButton);
-  const pre = document.createElement("pre");
-  pre.textContent = content || "";
+  const body = document.createElement("div");
+  body.className = "message-body";
+  body.dataset.messageBody = "";
+  renderMessageContent(body, content || "");
   if (role === "assistant" && state === "streaming" && !content) {
-    pre.className = "message-loading";
-    pre.innerHTML = `<span>${t("running")}</span><span class="typing-dots" aria-hidden="true"><i></i><i></i><i></i></span>`;
+    renderLoadingMessage(body);
   }
   meta.append(roleNode, actions);
-  article.append(meta, pre);
+  article.append(meta, body);
   let progress = null;
   if (role === "assistant") {
     progress = document.createElement("div");
@@ -303,7 +466,7 @@ function appendMessage(role, content, status) {
   }
   container.append(article);
   scrollMessagesToBottom();
-  return { article, pre, meta, progress };
+  return { article, body, meta, progress, content: content || "" };
 }
 
 function formatElapsed(ms) {
@@ -372,16 +535,18 @@ function streamAssistant(url, node) {
       updateProgressTail(node, payload.progress_tail, payload.progress_truncated);
     }
     if (payload.delta) {
-      if (node.pre.classList.contains("message-loading")) {
-        node.pre.className = "";
-        node.pre.textContent = "";
+      if (node.body.classList.contains("message-loading")) {
+        node.body.className = "message-body";
+        node.content = "";
       }
-      node.pre.textContent += payload.delta;
+      node.content += payload.delta;
+      renderMessageContent(node.body, node.content);
     }
     if (payload.error) {
       node.article.classList.add("error");
-      node.pre.className = "";
-      node.pre.textContent = payload.error;
+      node.body.className = "message-body";
+      node.content = payload.error;
+      renderMessageContent(node.body, node.content);
       const status = node.meta.querySelector("[data-status]");
       if (status) {
         status.dataset.status = "error";
@@ -411,15 +576,16 @@ function streamAssistant(url, node) {
   };
   source.onerror = () => {
     node.article.classList.add("error");
-    node.pre.className = "";
+    node.body.className = "message-body";
     const status = node.meta.querySelector("[data-status]");
     if (status) {
       status.dataset.status = "error";
       status.textContent = t("error");
     }
     setElapsedTime(node, performance.now() - startedAt);
-    if (!node.pre.textContent.trim()) {
-      node.pre.textContent = t("error");
+    if (!node.content.trim()) {
+      node.content = t("error");
+      renderMessageContent(node.body, node.content);
     }
     stopElapsedTimer();
     setActivity(false);
@@ -466,7 +632,7 @@ function setupMessageCopy() {
     const button = event.target.closest("[data-copy-message]");
     if (!button) return;
     const message = button.closest(".message");
-    const content = message?.querySelector("pre")?.textContent || "";
+    const content = message?.querySelector("[data-message-body]")?.dataset.rawContent || "";
     if (!content) return;
     await copyText(content);
     button.classList.add("copied");
@@ -563,12 +729,19 @@ function setupDirectoryPicker() {
   const parentButton = document.querySelector("[data-directory-parent]");
   const pathInput = document.querySelector("[data-project-path-input]");
   const accessPathInput = document.querySelector("[data-access-path-input]");
+  const outputPathInput = document.querySelector("[data-output-path-input]");
   if (!modal || !openButton || !closeButton || !chooseButton || !parentButton || !pathInput) return;
+
+  const targetInput = () => {
+    if (directoryPicker.target === "access") return accessPathInput;
+    if (directoryPicker.target === "output") return outputPathInput;
+    return pathInput;
+  };
 
   document.querySelectorAll("[data-open-directory-picker]").forEach((button) => {
     button.addEventListener("click", async () => {
       directoryPicker.target = button.dataset.pickerTarget || "project";
-      const input = directoryPicker.target === "access" ? accessPathInput : pathInput;
+      const input = targetInput();
       modal.hidden = false;
       await loadDirectory(input?.value.trim() || "");
     });
@@ -587,7 +760,7 @@ function setupDirectoryPicker() {
     }
   });
   chooseButton.addEventListener("click", () => {
-    const input = directoryPicker.target === "access" ? accessPathInput : pathInput;
+    const input = targetInput();
     if (input) input.value = directoryPicker.current;
     modal.hidden = true;
   });
@@ -617,6 +790,7 @@ document.addEventListener("DOMContentLoaded", () => {
       }
     });
   });
+  renderInitialMessages();
   setupDirectoryPicker();
   setupMessageCopy();
   setupSettingsToggle();

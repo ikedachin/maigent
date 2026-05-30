@@ -354,7 +354,7 @@ tools:
 sandboxの安全性:
 - 入力ファイルは直接マウントしません
 - 通常はDockerネットワークを無効化します
-- ファイル保存は `maigent_artifacts` JSONをstdoutへ出し、ホスト側brokerが権限検証して行います
+- ファイル保存は typed `maigent_sandbox_result` JSONをstdoutへ出し、ホスト側brokerが権限検証して行います
 
 ## tool_selector
 

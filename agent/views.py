@@ -1,3 +1,4 @@
+import ast
 import json
 import logging
 import math
@@ -5,9 +6,10 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import TypedDict
 
 from django.db import transaction
-from django.http import Http404, JsonResponse, StreamingHttpResponse
+from django.http import FileResponse, Http404, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.views.decorators.http import require_POST
@@ -15,7 +17,7 @@ from django.views.decorators.http import require_POST
 from .access import is_path_allowed
 from .access import normalize_access_path
 from .config import RuntimeConfig, load_runtime_config
-from .file_broker import write_allowed_text_file
+from .file_broker import allowed_image_mime_type, resolve_project_output_file, write_allowed_binary_file, write_allowed_text_file
 from .models import AgentRun, AgentTaskRecord, AppSetting, ApprovalRequest, Automation, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .openai_client import complete_response, generate_sandbox_code, stream_response
 from .prompt_loader import load_prompt
@@ -23,12 +25,15 @@ from .slash_commands import handle_slash_command
 from .tooling import (
     AgentPlan,
     AgentPlanStep,
+    SandboxDataset,
     build_agent_evaluation_criteria,
     build_agent_goal,
     build_agent_plan,
     can_build_sandbox_program,
     evaluation_criterion,
+    make_sandbox_dataset,
     run_sandbox,
+    sandbox_dataset_manifest,
 )
 
 logger = logging.getLogger("agent")
@@ -45,6 +50,8 @@ AUTO_CONTEXT_MAX_FILES = 3
 DEFAULT_RAG_TOP_K = 3
 MAX_RAG_TOP_K = 10
 DEFAULT_FINAL_EVALUATION_MAX_RETRIES = 3
+KNOWN_TOOL_NAMES = {"rag", "sandbox", "web_search"}
+INTERNAL_PLAN_TOOL_NAMES = {"final"}
 RAG_MIN_BM25_SCORE = 0.1
 AUTO_CONTEXT_EXTENSIONS = {
     ".csv",
@@ -55,6 +62,14 @@ AUTO_CONTEXT_EXTENSIONS = {
     ".toml",
     ".yaml",
     ".yml",
+}
+SANDBOX_DATASET_MAX_CHARS = 500_000
+SANDBOX_DATASET_EXTENSIONS = {
+    ".csv": "csv",
+    ".tsv": "tsv",
+    ".json": "json",
+    ".txt": "text",
+    ".md": "text",
 }
 
 
@@ -120,11 +135,12 @@ class AgentState:
     task_history: list[TaskExecutionRecord]
     input_text: str
     run: AgentRun | None = None
+    allowed_tools: set[str] | None = None
     final_message: str = ""
     stopped: bool = False
 
     @classmethod
-    def from_plan(cls, plan: AgentPlan, user_text: str, run: AgentRun | None = None):
+    def from_plan(cls, plan: AgentPlan, user_text: str, run: AgentRun | None = None, allowed_tools: set[str] | None = None):
         return cls(
             goal=plan.goal,
             evaluation_criteria=list(plan.evaluation_criteria),
@@ -133,10 +149,23 @@ class AgentState:
             task_history=[],
             input_text=user_text,
             run=run,
+            allowed_tools=allowed_tools,
         )
 
     def queue_summary(self) -> str:
         return _summarize_revised_plan(self.plan_queue, "dynamic queue") if self.plan_queue else "(empty)"
+
+
+class StoredPlanStep(TypedDict):
+    tool: str
+    purpose: str
+
+
+class StoredReplanDecision(TypedDict):
+    action: str
+    reason: str
+    plan_queue: list[StoredPlanStep]
+    final_message: str
 
 
 def _ensure_defaults() -> tuple[Project, Thread]:
@@ -218,6 +247,27 @@ def update_rag_settings(request):
     AppSetting.objects.update_or_create(key="final_evaluation_enabled", defaults={"value": "true" if enabled else "false"})
     AppSetting.objects.update_or_create(key="final_evaluation_max_retries", defaults={"value": str(max_retries)})
     return redirect(request.POST.get("next") or "dashboard")
+
+
+@require_POST
+def update_output_path(request, project_id):
+    project = get_object_or_404(Project, id=project_id)
+    path = request.POST.get("output_path", "").strip()
+    project.output_path = normalize_access_path(path) if path else ""
+    project.save(update_fields=["output_path", "updated_at"])
+    thread = project.threads.first() or Thread.objects.create(project=project, title="Main thread")
+    return redirect("thread", thread_id=thread.id)
+
+
+def serve_artifact_image(request, project_id, relative_path):
+    project = get_object_or_404(Project, id=project_id)
+    mime_type = allowed_image_mime_type(relative_path)
+    if not mime_type:
+        raise Http404("artifact image not found")
+    resolved, error = resolve_project_output_file(project, relative_path)
+    if error or resolved is None or not resolved.exists() or not resolved.is_file():
+        raise Http404("artifact image not found")
+    return FileResponse(resolved.open("rb"), content_type=mime_type)
 
 
 @require_POST
@@ -494,7 +544,60 @@ def _build_thread_conversation_input(thread: Thread, latest_user: Message, assis
 
 def _format_sandbox_message(ok: bool, output: str) -> str:
     status = "成功" if ok else "失敗"
+    output = _strip_sandbox_artifact_payloads(output).strip()
+    if ok and not output:
+        output = "成果物を生成しました。"
     return f"Sandbox実行結果: {status}\n\n```text\n{output}\n```"
+
+
+def _strip_sandbox_artifact_payloads(output: str) -> str:
+    output = _strip_marked_sandbox_artifact_payloads(output)
+
+    def strip_json_block(match):
+        block = match.group(1).strip()
+        return "" if _is_sandbox_artifact_payload(block) else match.group(0)
+
+    text = re.sub(r"```json\s*(.*?)```", strip_json_block, output, flags=re.DOTALL | re.IGNORECASE)
+    lines = []
+    for line in text.splitlines():
+        if _is_sandbox_artifact_payload(line.strip()):
+            continue
+        lines.append(line)
+    return "\n".join(lines).strip()
+
+
+def _strip_marked_sandbox_artifact_payloads(output: str) -> str:
+    marker = "<MAIGENT_ARTIFACT>"
+    text = output
+    while marker in text:
+        marker_index = text.find(marker)
+        object_start = text.find("{", marker_index + len(marker))
+        if object_start < 0:
+            break
+        decoder = json.JSONDecoder()
+        try:
+            payload, object_end = decoder.raw_decode(text[object_start:])
+        except json.JSONDecodeError:
+            break
+        if not (isinstance(payload, dict) and isinstance(payload.get("maigent_artifacts"), list)):
+            break
+        text = text[:marker_index] + text[object_start + object_end :]
+    return text
+
+
+def _is_sandbox_artifact_payload(text: str) -> bool:
+    if not text or ("maigent_artifacts" not in text and "maigent_sandbox_result" not in text):
+        return False
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if isinstance(payload.get("maigent_artifacts"), list):
+        return True
+    result = payload.get("maigent_sandbox_result")
+    return isinstance(result, dict) and isinstance(result.get("artifacts"), list)
 
 
 def _sse(payload: dict[str, object]) -> str:
@@ -703,6 +806,8 @@ def _generate_once(
         plan = build_agent_plan(user_text, config)
         plan = _apply_llm_rag_decision(thread, user_text, config, plan)
     plan = _avoid_failed_plan(plan, config, failed_plans)
+    allowed_tools = _allowed_plan_tools(config)
+    plan = _filter_plan_to_allowed_tools(plan, allowed_tools)
     if progress:
         yield _sse(progress(f"Goal: {plan.goal}"))
         yield _sse(progress("Criteria: " + "; ".join(plan.evaluation_criteria)))
@@ -716,7 +821,7 @@ def _generate_once(
         plan.summary,
         [f"{step.tool}:{step.purpose}" for step in plan.steps],
     )
-    run = _create_agent_run(thread, user_message, assistant_message, attempt, plan)
+    run = _create_agent_run(thread, user_message, assistant_message, attempt, plan, allowed_tools)
     try:
         plan_result = yield from _execute_agent_plan(thread, user_text, config, plan, progress, run=run, input_text=input_text)
     except Exception as exc:
@@ -751,9 +856,13 @@ def _generate_once(
     except Exception as exc:
         _finish_agent_run(run, "error", error=str(exc))
         raise
-    _finish_agent_run(run, "complete", "".join(content_parts))
+    final_content = "".join(content_parts)
+    artifact_message = _persist_final_answer_artifact(thread, user_text, final_content)
+    if artifact_message:
+        final_content = f"{final_content}\n\n{artifact_message}"
+    _finish_agent_run(run, "complete", final_content)
     return {
-        "content": "".join(content_parts),
+        "content": final_content,
         "status": "complete",
         "response_id": response_id,
         "goal": plan.goal,
@@ -815,6 +924,21 @@ def _avoid_failed_plan(plan: AgentPlan, config, failed_plans: list[str]) -> Agen
         failed_plans,
     )
     return fallback
+
+
+def _filter_plan_to_allowed_tools(plan: AgentPlan, allowed_tools: set[str]) -> AgentPlan:
+    steps = [step for step in plan.steps if step.tool in allowed_tools]
+    if not steps:
+        steps = [AgentPlanStep("final", "Answer directly with the language model.")]
+    if steps == plan.steps:
+        return plan
+    return AgentPlan(
+        goal=plan.goal,
+        evaluation_criteria=plan.evaluation_criteria,
+        summary=_summarize_revised_plan(steps, "allowed tools"),
+        steps=steps,
+        rag_query=plan.rag_query,
+    )
 
 
 def _build_agent_plan_with_llm_tool_selection(thread: Thread, user_text: str, config) -> AgentPlan | None:
@@ -916,7 +1040,7 @@ def _format_initial_clarification_message(clarification: InitialClarification) -
 
 
 def _select_tools_with_llm(config, user_text: str, tools: list[dict[str, str]]) -> LlmToolPlanDecision | None:
-    instructions = load_prompt("tool_selection_instructions.txt")
+    instructions = _append_allowed_tool_instruction(load_prompt("tool_selection_instructions.txt"), _allowed_plan_tools(config))
     prompt = load_prompt("tool_selection_prompt.txt", user_text=user_text, tools=json.dumps(tools, ensure_ascii=False))
     _log_tail("llm_prompt", prompt, config=config, purpose="tool_selection")
     payload = None
@@ -946,7 +1070,7 @@ def _select_tools_with_llm(config, user_text: str, tools: list[dict[str, str]]) 
     if payload is None:
         logger.debug("tool_selection_fallback reason=no_valid_response attempts=%s", max_attempts)
         return None
-    steps = _parse_plan_tasks(payload.get("steps"))
+    steps = _parse_plan_tasks(payload.get("steps"), _allowed_plan_tools(config))
     if not steps:
         return None
     allowed = {tool["name"] for tool in tools}
@@ -971,6 +1095,45 @@ def _available_tool_specs(thread: Thread, config) -> list[dict[str, str]]:
     if _tool_enabled(config, "web_search"):
         tools.append({"name": "web_search", "description": "Collect current or external web information. Currently returns an unimplemented notice."})
     return tools
+
+
+def _allowed_configured_tool_names(config) -> set[str]:
+    names = getattr(config, "enabled_tool_names", None)
+    if isinstance(names, set):
+        return {str(name) for name in names if str(name) in KNOWN_TOOL_NAMES}
+    if isinstance(names, (list, tuple)):
+        return {str(name) for name in names if str(name) in KNOWN_TOOL_NAMES}
+    if isinstance(config, RuntimeConfig):
+        return set()
+    tools = getattr(config, "tools", None)
+    tool_enabled = getattr(config, "tool_enabled", None)
+    if not callable(tool_enabled) and not isinstance(tools, dict):
+        return set(KNOWN_TOOL_NAMES)
+    enabled: set[str] = set()
+    saw_bool = False
+    for name in KNOWN_TOOL_NAMES:
+        try:
+            value = tool_enabled(name, default=False) if callable(tool_enabled) else None
+        except Exception:
+            value = None
+        if isinstance(value, bool):
+            saw_bool = True
+            if value:
+                enabled.add(name)
+    if saw_bool:
+        return enabled
+    if not isinstance(tools, dict):
+        return set(KNOWN_TOOL_NAMES)
+    return {name for name in KNOWN_TOOL_NAMES if _tool_enabled(config, name)}
+
+
+def _allowed_plan_tools(config) -> set[str]:
+    return _allowed_configured_tool_names(config) | INTERNAL_PLAN_TOOL_NAMES
+
+
+def _append_allowed_tool_instruction(instructions: str, allowed_tools: set[str]) -> str:
+    allowed = ", ".join(sorted(allowed_tools))
+    return f"{instructions.rstrip()}\n\nAllowed tools for this run: {allowed}.\nDo not return any tool outside this set."
 
 
 def _tool_selector_llm_enabled(config) -> bool:
@@ -1265,7 +1428,8 @@ def _replan_after_step(config, state: AgentState) -> ReplanDecision:
 
 
 def _replan_after_step_with_llm(config, state: AgentState) -> ReplanDecision | None:
-    instructions = load_prompt("dynamic_replanner_instructions.txt")
+    allowed_tools = state.allowed_tools or _allowed_plan_tools(config)
+    instructions = _append_allowed_tool_instruction(load_prompt("dynamic_replanner_instructions.txt"), allowed_tools)
     prompt = load_prompt(
         "dynamic_replanner_prompt.txt",
         goal=state.goal,
@@ -1297,7 +1461,7 @@ def _replan_after_step_with_llm(config, state: AgentState) -> ReplanDecision | N
     if action == "finish":
         return ReplanDecision("finish", reason, list(state.plan_queue), str(payload.get("final_message") or state.final_message))
     if action == "replace":
-        tasks = _parse_plan_tasks(payload.get("tasks"))
+        tasks = _parse_plan_tasks(payload.get("tasks"), allowed_tools)
         if tasks:
             return ReplanDecision("replace", reason, tasks)
     return ReplanDecision("keep", reason, list(state.plan_queue))
@@ -1311,7 +1475,8 @@ def _route_final_output(config, state: AgentState) -> ReplanDecision:
     if not _dynamic_finalizer_llm_enabled(config):
         action = "discard" if state.final_message else "save"
         return ReplanDecision("keep", f"final routing: {action}", [])
-    instructions = load_prompt("dynamic_finalizer_instructions.txt")
+    allowed_tools = state.allowed_tools or _allowed_plan_tools(config)
+    instructions = _append_allowed_tool_instruction(load_prompt("dynamic_finalizer_instructions.txt"), allowed_tools)
     prompt = load_prompt(
         "dynamic_finalizer_prompt.txt",
         goal=state.goal,
@@ -1338,22 +1503,23 @@ def _route_final_output(config, state: AgentState) -> ReplanDecision:
     action = str(payload.get("action") or "save").strip().lower()
     reason = str(payload.get("reason") or f"final routing: {action}")
     if action == "add_tasks":
-        tasks = _parse_plan_tasks(payload.get("tasks"))
+        tasks = _parse_plan_tasks(payload.get("tasks"), allowed_tools)
         if tasks:
             return ReplanDecision("replace", reason, tasks)
     return ReplanDecision("keep", reason, [])
 
 
-def _parse_plan_tasks(raw_tasks: object) -> list[AgentPlanStep]:
+def _parse_plan_tasks(raw_tasks: object, allowed_tools: set[str] | None = None) -> list[AgentPlanStep]:
     if not isinstance(raw_tasks, list):
         return []
+    allowed = allowed_tools or (KNOWN_TOOL_NAMES | INTERNAL_PLAN_TOOL_NAMES)
     tasks: list[AgentPlanStep] = []
     for item in raw_tasks:
         if not isinstance(item, dict):
             continue
         tool = str(item.get("tool") or "").strip()
         purpose = str(item.get("purpose") or "").strip()
-        if tool in {"rag", "sandbox", "web_search", "final"} and purpose:
+        if tool in allowed and purpose:
             tasks.append(AgentPlanStep(tool, purpose))
     return tasks
 
@@ -1425,6 +1591,7 @@ def _create_agent_run(
     assistant_message: Message | None,
     attempt: int,
     plan: AgentPlan,
+    allowed_tools: set[str] | None = None,
 ) -> AgentRun:
     return AgentRun.objects.create(
         thread=thread,
@@ -1435,7 +1602,7 @@ def _create_agent_run(
         goal=plan.goal,
         evaluation_criteria=list(plan.evaluation_criteria),
         initial_plan_summary=plan.summary,
-        current_plan_queue=_serialize_plan_queue(plan.steps),
+        current_plan_queue=_serialize_plan_queue(plan.steps, allowed_tools),
         plan_history=[plan.summary],
     )
 
@@ -1444,7 +1611,7 @@ def _sync_agent_run_state(state: AgentState, status: str = "running", final_mess
     if not state.run:
         return
     state.run.status = status
-    state.run.current_plan_queue = _serialize_plan_queue(state.plan_queue)
+    state.run.current_plan_queue = _serialize_plan_queue(state.plan_queue, state.allowed_tools)
     state.run.plan_history = list(state.plan_history)
     if final_message:
         state.run.final_message = _truncate_db_text(final_message)
@@ -1478,7 +1645,7 @@ def _record_replan_decision(state: AgentState, decision: ReplanDecision) -> None
         {
             "action": decision.action,
             "reason": decision.reason,
-            "plan_queue": _serialize_plan_queue(decision.plan_queue),
+            "plan_queue": _serialize_plan_queue(decision.plan_queue, state.allowed_tools),
             "final_message": _truncate_db_text(decision.final_message, limit=2000),
         }
     )
@@ -1497,8 +1664,17 @@ def _finish_agent_run(run: AgentRun | None, status: str, final_message: str = ""
     run.save(update_fields=["status", "final_message", "error", "updated_at"])
 
 
-def _serialize_plan_queue(queue: list[AgentPlanStep]) -> list[dict[str, str]]:
-    return [{"tool": step.tool, "purpose": step.purpose} for step in queue]
+def _serialize_plan_queue(queue: list[AgentPlanStep], allowed_tools: set[str] | None = None) -> list[StoredPlanStep]:
+    allowed = allowed_tools or (KNOWN_TOOL_NAMES | INTERNAL_PLAN_TOOL_NAMES)
+    serialized: list[StoredPlanStep] = []
+    for step in queue:
+        if step.tool not in allowed:
+            continue
+        purpose = str(step.purpose or "").strip()
+        if not purpose:
+            continue
+        serialized.append({"tool": step.tool, "purpose": purpose})
+    return serialized
 
 
 def _truncate_db_text(text: object, limit: int = 12000) -> str:
@@ -1517,7 +1693,9 @@ def _execute_agent_plan(
     run: AgentRun | None = None,
     input_text: str | None = None,
 ):
-    state = AgentState.from_plan(plan, input_text or user_text, run=run)
+    allowed_tools = _allowed_plan_tools(config)
+    plan = _filter_plan_to_allowed_tools(plan, allowed_tools)
+    state = AgentState.from_plan(plan, input_text or user_text, run=run, allowed_tools=allowed_tools)
     _sync_agent_run_state(state)
     plan_trace = [
         f"Agent goal: {plan.goal}",
@@ -1640,12 +1818,14 @@ def _execute_agent_task(
         return {"ok": True, "input_text": _prepend_plan_trace(rag.input_text, plan_trace), "final_message": ""}
     if step.tool == "sandbox":
         generated_code = ""
+        datasets = _sandbox_datasets_from_rag_context(thread, input_text)
+        sandbox_input_text = _append_sandbox_dataset_manifest(input_text, datasets)
         if not can_build_sandbox_program(input_text):
             logger.debug("sandbox_code_generation_start thread_id=%s", thread.id)
             if progress:
                 yield _sse(progress("Tool sandbox: generating executable program."))
-            _log_tail("llm_prompt", input_text, config=config, thread_id=thread.id, purpose="sandbox_code_generation")
-            generated_code = _generate_sandbox_code_with_retries(config, input_text)
+            _log_tail("llm_prompt", sandbox_input_text, config=config, thread_id=thread.id, purpose="sandbox_code_generation")
+            generated_code = _generate_sandbox_code_with_retries(config, sandbox_input_text)
             if not generated_code.strip():
                 plan_trace.append("Sandbox result: skipped before execution; no executable program could be generated.")
                 logger.debug(
@@ -1664,8 +1844,18 @@ def _execute_agent_task(
                 thread.id,
                 generated_code[:240],
             )
+            sandbox_input_text = sandbox_input_text + "\n\nGenerated sandbox program:\n```python\n" + generated_code + "\n```"
             input_text = input_text + "\n\nGenerated sandbox program:\n```python\n" + generated_code + "\n```"
-        result = run_sandbox(input_text, config, code=generated_code)
+        result = run_sandbox(sandbox_input_text, config, code=generated_code, datasets=datasets)
+        if generated_code and not _is_sandbox_result_adequate(result.ok, result.output):
+            result, generated_code = _retry_generated_sandbox_after_execution_failure(
+                config,
+                sandbox_input_text,
+                generated_code,
+                result,
+                thread.id,
+                datasets,
+            )
         if not result.ok and "Pythonコードまたは計算式を特定できませんでした" in result.output:
             plan_trace.append("Sandbox result: skipped; no executable code or numeric data was found.")
             logger.debug(
@@ -1689,7 +1879,7 @@ def _execute_agent_task(
                 yield _sse(progress("Tool sandbox: execution failed or returned inadequate output."))
             return {"ok": False, "input_text": input_text, "final_message": _format_sandbox_message(result.ok, result.output)}
         plan_trace.append("Sandbox result: adequate")
-        artifact_message = _persist_sandbox_artifacts(thread, input_text, result.output)
+        artifact_message = _persist_sandbox_artifacts(thread, user_text, result.output, result.artifacts, result.raw_output)
         logger.debug(
             "agent_step_result thread_id=%s tool=sandbox status=adequate output_preview=%r",
             thread.id,
@@ -1707,14 +1897,37 @@ def _execute_agent_task(
 def _generate_sandbox_code_with_retries(config, input_text: str) -> str:
     attempts = _llm_response_max_retries(config, "sandbox_code_generation") + 1
     last_error = ""
+    prompt = input_text
     for attempt in range(1, attempts + 1):
         try:
-            generated_code = str(generate_sandbox_code(config, input_text) or "").strip()
+            generated_code = str(generate_sandbox_code(config, prompt) or "").strip()
         except Exception as exc:
             last_error = str(exc)
             logger.exception("sandbox_code_generation_error attempt=%s/%s", attempt, attempts)
             continue
         if generated_code:
+            policy_error = _sandbox_code_policy_violation(generated_code)
+            if policy_error:
+                last_error = policy_error
+                logger.debug(
+                    "sandbox_code_generation_policy_rejected attempt=%s/%s reason=%s code_preview=%r",
+                    attempt,
+                    attempts,
+                    policy_error,
+                    generated_code[:240],
+                )
+                prompt = (
+                    input_text
+                    + "\n\nPrevious generated code was rejected before execution.\n"
+                    + f"Reason: {policy_error}\n"
+                    + "Regenerate executable Python that reads only embedded RAG/message text, never local files. "
+                    + "When host-provided sandbox datasets are listed, use load_dataset(dataset_id) and do not paste rows "
+                    + "into Python string literals. "
+                    + "For images, render to io.BytesIO, base64-encode the image bytes, and print one "
+                    + "maigent_sandbox_result JSON object with artifacts[].content_base64. Do not call os.path.exists, open, "
+                    + "Path.read_text, pandas read_* with file paths, or savefig with a filesystem path.\n"
+                )
+                continue
             if attempt > 1:
                 logger.debug("sandbox_code_generation_retry_succeeded attempt=%s/%s", attempt, attempts)
             return generated_code
@@ -1724,23 +1937,225 @@ def _generate_sandbox_code_with_retries(config, input_text: str) -> str:
     return ""
 
 
-def _persist_sandbox_artifacts(thread: Thread, input_text: str, output: str) -> str:
-    requests = _extract_sandbox_artifact_requests(output)
+def _retry_generated_sandbox_after_execution_failure(
+    config,
+    input_text: str,
+    generated_code: str,
+    result,
+    thread_id: int,
+    datasets: tuple[SandboxDataset, ...] = (),
+):
+    attempts = _llm_response_max_retries(config, "sandbox_code_generation")
+    for attempt in range(1, attempts + 1):
+        prompt = (
+            input_text
+            + "\n\nPrevious generated sandbox code failed during execution.\n"
+            + "Previous code:\n"
+            + "```python\n"
+            + generated_code
+            + "\n```\n"
+            + "Execution output / traceback:\n"
+            + "```text\n"
+            + result.output[:4000]
+            + "\n```\n"
+            + "Regenerate corrected executable Python. Fix missing imports and runtime errors. "
+            + "Use only embedded RAG/message text, never local files. When host-provided sandbox datasets are listed, "
+            + "use load_dataset(dataset_id) and do not paste rows into Python string literals. For images, render to io.BytesIO, "
+            + "base64-encode the image bytes, and print one maigent_sandbox_result JSON object with "
+            + "artifacts[].content_base64.\n"
+        )
+        logger.debug(
+            "sandbox_code_execution_retry_start thread_id=%s attempt=%s/%s output_preview=%r",
+            thread_id,
+            attempt,
+            attempts,
+            result.output[:240],
+        )
+        repaired_code = _generate_sandbox_code_with_retries(config, prompt)
+        if not repaired_code.strip():
+            logger.debug(
+                "sandbox_code_execution_retry_no_code thread_id=%s attempt=%s/%s",
+                thread_id,
+                attempt,
+                attempts,
+            )
+            continue
+        generated_code = repaired_code
+        result = run_sandbox(input_text, config, code=generated_code, datasets=datasets)
+        if _is_sandbox_result_adequate(result.ok, result.output):
+            logger.debug(
+                "sandbox_code_execution_retry_succeeded thread_id=%s attempt=%s/%s",
+                thread_id,
+                attempt,
+                attempts,
+            )
+            break
+    return result, generated_code
+
+
+def _sandbox_code_policy_violation(code: str) -> str:
+    if "maigent_artifacts" in code or "<MAIGENT_ARTIFACT>" in code:
+        return "legacy artifact payload format is not allowed; use maigent_sandbox_result"
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        return ""
+    if _contains_embedded_tabular_literal(tree):
+        return "embedded tabular data copies are not allowed; use load_dataset(dataset_id)"
+    string_assignments = _constant_string_assignments(tree)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        name = _call_name(node.func)
+        if name in {"open", "Path.open", "Path.read_text", "Path.read_bytes"}:
+            return f"local file access is not allowed: {name}"
+        if name in {
+            "os.path.exists",
+            "os.path.isfile",
+            "os.path.isdir",
+            "Path.exists",
+            "Path.is_file",
+            "Path.is_dir",
+        } and node.args and _string_argument_value(node.args[0], string_assignments) is not None:
+            return f"local filesystem checks are not allowed: {name}"
+        if name in {
+            "pd.read_csv",
+            "pandas.read_csv",
+            "read_csv",
+            "pd.read_table",
+            "pandas.read_table",
+            "read_table",
+            "pd.read_excel",
+            "pandas.read_excel",
+            "read_excel",
+        } and node.args and _string_argument_value(node.args[0], string_assignments) is not None:
+            return f"local file reads are not allowed: {name}"
+        if name in {"plt.savefig", "matplotlib.pyplot.savefig", "savefig"}:
+            if node.args and _string_argument_value(node.args[0], string_assignments) is not None:
+                return f"sandbox file writes are not allowed: {name}"
+            for keyword in node.keywords:
+                if keyword.arg == "fname" and _string_argument_value(keyword.value, string_assignments) is not None:
+                    return f"sandbox file writes are not allowed: {name}"
+    return ""
+
+
+def _contains_embedded_tabular_literal(tree: ast.AST) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Constant) or not isinstance(node.value, str):
+            continue
+        lines = [line for line in node.value.splitlines() if line.strip()]
+        if len(lines) < 3:
+            continue
+        comma_like_lines = sum(1 for line in lines if "," in line or "，" in line or "\t" in line)
+        if comma_like_lines >= 3:
+            return True
+    return False
+
+
+def _constant_string_assignments(tree: ast.AST) -> dict[str, str]:
+    assignments: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments[target.id] = node.value.value
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                assignments[node.target.id] = node.value.value
+    return assignments
+
+
+def _string_argument_value(node: ast.AST, assignments: dict[str, str]) -> str | None:
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name):
+        return assignments.get(node.id)
+    return None
+
+
+def _call_name(func: ast.AST) -> str:
+    if isinstance(func, ast.Name):
+        return func.id
+    if isinstance(func, ast.Attribute):
+        parent = _call_name(func.value)
+        return f"{parent}.{func.attr}" if parent else func.attr
+    if isinstance(func, ast.Call):
+        return _call_name(func.func)
+    return ""
+
+
+def _persist_sandbox_artifacts(
+    thread: Thread,
+    input_text: str,
+    output: str,
+    artifacts: tuple[dict[str, object], ...] | list[dict[str, object]] = (),
+    raw_output: str = "",
+) -> str:
+    requests = _artifact_requests_from_items(list(artifacts))
+    if not requests:
+        requests = _extract_sandbox_artifact_requests(raw_output or output)
     if not requests:
         requests = _implicit_sandbox_artifact_requests(input_text, output)
     if not requests:
         return ""
     lines = ["Sandbox成果物の保存結果:"]
     for request in requests:
-        result = write_allowed_text_file(
-            thread.project,
-            request["path"],
-            request["content"],
-            append=request.get("append", False),
-        )
+        result = _write_artifact_request(thread.project, request)
         prefix = "OK" if result.ok else "NG"
         lines.append(f"- {prefix}: {result.message}")
+        image_markdown = _artifact_image_markdown(thread.project, result.path)
+        if result.ok and image_markdown:
+            lines.append(image_markdown)
     return "\n".join(lines)
+
+
+def _persist_final_answer_artifact(thread: Thread, input_text: str, output: str) -> str:
+    requests = _implicit_sandbox_artifact_requests(input_text, output)
+    if not requests:
+        return ""
+    lines = ["回答の保存結果:"]
+    for request in requests[:1]:
+        result = _write_artifact_request(thread.project, request)
+        prefix = "OK" if result.ok else "NG"
+        lines.append(f"- {prefix}: {result.message}")
+        image_markdown = _artifact_image_markdown(thread.project, result.path)
+        if result.ok and image_markdown:
+            lines.append(image_markdown)
+    return "\n".join(lines)
+
+
+def _write_artifact_request(project: Project, request: dict[str, object]):
+    if request.get("content_base64") is not None:
+        return write_allowed_binary_file(
+            project,
+            str(request["path"]),
+            str(request["content_base64"]),
+            append=bool(request.get("append", False)),
+        )
+    return write_allowed_text_file(
+        project,
+        str(request["path"]),
+        str(request["content"]),
+        append=bool(request.get("append", False)),
+    )
+
+
+def _artifact_image_markdown(project: Project, saved_path: str) -> str:
+    if not saved_path or not allowed_image_mime_type(saved_path):
+        return ""
+    output_root = (project.output_path or "").strip()
+    if not output_root:
+        return ""
+    try:
+        root = Path(output_root).expanduser().resolve()
+        path = Path(saved_path).expanduser().resolve()
+    except OSError:
+        return ""
+    if path != root and root not in path.parents:
+        return ""
+    relative_path = path.relative_to(root).as_posix()
+    url = reverse("artifact_image", args=[project.id, relative_path])
+    return f"![{Path(relative_path).name}]({url})"
 
 
 def _extract_sandbox_artifact_requests(output: str) -> list[dict[str, object]]:
@@ -1755,40 +2170,73 @@ def _extract_sandbox_artifact_requests(output: str) -> list[dict[str, object]]:
     except Exception:
         pass
 
-    requests: list[dict[str, object]] = []
     for payload in payloads:
         if not isinstance(payload, dict):
             continue
-        artifacts = payload.get("maigent_artifacts", [])
+        result = payload.get("maigent_sandbox_result")
+        if isinstance(result, dict):
+            artifacts = result.get("artifacts", [])
+        else:
+            artifacts = payload.get("maigent_artifacts", [])
         if not isinstance(artifacts, list):
             continue
-        for item in artifacts:
-            if not isinstance(item, dict):
-                continue
-            path = str(item.get("path") or "").strip()
-            content = item.get("content")
-            if not path or content is None:
-                continue
-            requests.append(
-                {
-                    "path": path,
-                    "content": str(content),
-                    "append": bool(item.get("append", False)),
-                }
-            )
+        requests = _artifact_requests_from_items(artifacts)
+        if requests:
+            return requests[:5]
+    return []
+
+
+def _artifact_requests_from_items(items: list[object]) -> list[dict[str, object]]:
+    requests: list[dict[str, object]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        path = str(item.get("path") or "").strip()
+        content = item.get("content")
+        content_base64 = item.get("content_base64")
+        if not path or (content is None and content_base64 is None):
+            continue
+        request = {"path": path, "append": bool(item.get("append", False))}
+        if content_base64 is not None and allowed_image_mime_type(path):
+            request["content_base64"] = str(content_base64)
+            request["mime_type"] = str(item.get("mime_type") or "")
+        elif content is not None:
+            request["content"] = str(content)
+        else:
+            continue
+        requests.append(request)
     return requests[:5]
 
 
 def _implicit_sandbox_artifact_requests(input_text: str, output: str) -> list[dict[str, object]]:
-    if not _looks_like_save_request(input_text):
+    request_text = _artifact_request_text(input_text)
+    if not _looks_like_save_request(request_text):
         return []
-    paths = _extract_candidate_paths(input_text)
-    if not paths:
-        return []
+    paths = _extract_candidate_paths(request_text)
     content = output.strip()
     if not content:
         return []
-    return [{"path": paths[-1], "content": content + "\n", "append": False}]
+    path = paths[-1] if paths else _default_artifact_filename(request_text)
+    return [{"path": path, "content": content + "\n", "append": False}]
+
+
+def _artifact_request_text(input_text: str) -> str:
+    return re.split(r"\n\s*(?:RAG context from allowed local files|Auto-selected file|File):", input_text, maxsplit=1)[0]
+
+
+def _default_artifact_filename(input_text: str) -> str:
+    lowered = input_text.lower()
+    if "histogram" in lowered or "ヒストグラム" in input_text:
+        return "maigent-histogram.txt"
+    if "png" in lowered or "画像" in input_text:
+        return "maigent-output.txt"
+    if "csv" in lowered and "test.csv" not in lowered:
+        return "maigent-output.csv"
+    if "json" in lowered:
+        return "maigent-output.json"
+    if "markdown" in lowered or ".md" in lowered:
+        return "maigent-output.md"
+    return "maigent-output.txt"
 
 
 def _looks_like_save_request(text: str) -> bool:
@@ -1888,6 +2336,66 @@ def _build_rag_input(thread: Thread, user_text: str, preferred_query: str = "", 
         + "\n\nUse the RAG context only when it directly supports the answer. If it does not, say that the allowed files do not contain enough information."
     )
     return RagResult(input_text=input_text, searched=True, has_context=True, query=query)
+
+
+def _append_sandbox_dataset_manifest(input_text: str, datasets: tuple[SandboxDataset, ...]) -> str:
+    manifest = sandbox_dataset_manifest(datasets)
+    if not manifest:
+        return input_text
+    return (
+        input_text
+        + "\n\nHost-provided sandbox dataset API:\n"
+        + manifest
+        + "\n\nGenerated code must use load_dataset(\"rag_1\") or another listed dataset id for these files. "
+        + "Do not paste CSV/TSV/JSON rows into Python string literals."
+    )
+
+
+def _sandbox_datasets_from_rag_context(thread: Thread, input_text: str) -> tuple[SandboxDataset, ...]:
+    datasets: list[SandboxDataset] = []
+    for path_text in _rag_context_file_paths(input_text):
+        if len(datasets) >= 5:
+            break
+        try:
+            path = Path(path_text).expanduser().resolve()
+        except OSError:
+            continue
+        kind = SANDBOX_DATASET_EXTENSIONS.get(path.suffix.lower())
+        if not kind or not is_path_allowed(thread.project, str(path), write=False):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        truncated = len(text) > SANDBOX_DATASET_MAX_CHARS
+        if truncated:
+            text = text[:SANDBOX_DATASET_MAX_CHARS]
+        datasets.append(
+            make_sandbox_dataset(
+                f"rag_{len(datasets) + 1}",
+                path.name,
+                str(path),
+                kind,
+                text,
+                truncated=truncated,
+            )
+        )
+    if datasets:
+        logger.debug(
+            "sandbox_datasets_built thread_id=%s datasets=%s",
+            thread.id,
+            [{"id": item.id, "name": item.name, "kind": item.kind, "rows": item.row_count} for item in datasets],
+        )
+    return tuple(datasets)
+
+
+def _rag_context_file_paths(input_text: str) -> list[str]:
+    paths: list[str] = []
+    for match in re.finditer(r"^(?:Auto-selected file|File):\s+(.+?)\s*$", input_text, flags=re.MULTILINE):
+        path = match.group(1).strip()
+        if path and path not in paths:
+            paths.append(path)
+    return paths
 
 
 def _build_answer_query(text: str) -> str:

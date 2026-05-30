@@ -69,6 +69,7 @@ tools:
       - charset-normalizer
       - lxml
       - matplotlib
+      - japanize-matplotlib
       - numpy
       - openpyxl
       - pandas

@@ -38,6 +38,7 @@ from .views import (
     _serialize_plan_queue,
     _sandbox_datasets_from_rag_context,
     _strip_sandbox_artifact_payloads,
+    _build_instructions,
 )
 from .views import AgentState, TaskExecutionRecord, _execute_agent_plan, _replan_after_step, _route_final_output
 
@@ -406,6 +407,51 @@ class ChatFlowTests(TestCase):
         self.assertEqual(response.status_code, 200)
         self.thread.refresh_from_db()
         self.assertTrue(self.thread.memory_enabled)
+
+    def test_compact_updates_only_current_thread_summary(self):
+        other = Thread.objects.create(project=self.project, title="Other", summary="keep this")
+        Message.objects.create(thread=other, role="user", content="other thread secret")
+        Message.objects.create(thread=self.thread, role="user", content="main thread fact")
+        Message.objects.create(thread=self.thread, role="assistant", content="main thread answer")
+
+        response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/compact"})
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.thread.refresh_from_db()
+        other.refresh_from_db()
+        self.assertIn("main thread fact", self.thread.summary)
+        self.assertIn("main thread answer", self.thread.summary)
+        self.assertNotIn("other thread secret", self.thread.summary)
+        self.assertEqual(other.summary, "keep this")
+        self.assertIn("スレッド要約を更新しました", payload["content"])
+        self.assertIn(self.thread.summary, payload["content"])
+        self.assertEqual(payload["thread_summary"], self.thread.summary)
+
+    def test_compact_ignores_slash_commands_and_responses(self):
+        Message.objects.create(thread=self.thread, role="user", content="/status")
+        Message.objects.create(thread=self.thread, role="assistant", content="Project: Repo")
+        Message.objects.create(thread=self.thread, role="user", content="remember this")
+
+        response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/compact"})
+
+        self.assertEqual(response.status_code, 200)
+        self.thread.refresh_from_db()
+        self.assertIn("remember this", self.thread.summary)
+        self.assertNotIn("/status", self.thread.summary)
+        self.assertNotIn("Project: Repo", self.thread.summary)
+        self.assertNotIn("/compact", self.thread.summary)
+
+    def test_build_instructions_uses_current_thread_memory_only(self):
+        other = Thread.objects.create(project=self.project, title="Other", memory_enabled=True, summary="other memory")
+        self.thread.memory_enabled = True
+        self.thread.summary = "current memory"
+        self.thread.save(update_fields=["memory_enabled", "summary"])
+
+        instructions = _build_instructions(self.thread)
+
+        self.assertIn("current memory", instructions)
+        self.assertNotIn(other.summary, instructions)
 
     def test_read_command_reads_allowed_file(self):
         with TemporaryDirectory() as root_dir:

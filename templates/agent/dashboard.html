@@ -178,6 +178,15 @@
       </section>
 
       <section class="panel">
+        <h2 data-i18n="threadMemory">スレッドメモリ</h2>
+        {% if thread.summary %}
+          <pre class="memory-summary" data-thread-summary>{{ thread.summary }}</pre>
+        {% else %}
+          <p class="muted" data-thread-summary data-i18n="noThreadMemory">まだ要約メモリはありません。</p>
+        {% endif %}
+      </section>
+
+      <section class="panel">
         <h2 data-i18n="accessPaths">アクセス許可</h2>
         <form class="stack-form" method="post" action="{% url 'add_access_path' current_project.id %}">
           {% csrf_token %}

@@ -638,6 +638,20 @@ textarea:focus {
   font-family: inherit;
 }
 
+.memory-summary {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px;
+  color: var(--ink);
+  background: var(--surface);
+  font: inherit;
+}
+
 .message-image {
   display: block;
   max-width: min(100%, 720px);

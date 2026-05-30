@@ -14,6 +14,8 @@ const translations = {
     threads: "スレッド",
     memoryOn: "メモリ有効",
     memoryOff: "メモリ無効",
+    threadMemory: "スレッドメモリ",
+    noThreadMemory: "まだ要約メモリはありません。",
     threadTitlePlaceholder: "スレッド名",
     newThread: "新規スレッド",
     deleteThread: "スレッドを削除",
@@ -110,6 +112,8 @@ const translations = {
     threads: "Threads",
     memoryOn: "Memory on",
     memoryOff: "Memory off",
+    threadMemory: "Thread memory",
+    noThreadMemory: "No summary memory yet.",
     threadTitlePlaceholder: "Thread title",
     newThread: "New thread",
     deleteThread: "Delete thread",
@@ -467,6 +471,22 @@ function appendMessage(role, content, status) {
   container.append(article);
   scrollMessagesToBottom();
   return { article, body, meta, progress, content: content || "" };
+}
+
+function updateThreadSummary(summary) {
+  if (summary === undefined || summary === null) return;
+  const node = document.querySelector("[data-thread-summary]");
+  if (!node) return;
+  const text = String(summary || "").trim();
+  if (text) {
+    node.textContent = text;
+    node.className = "memory-summary";
+    node.removeAttribute("data-i18n");
+  } else {
+    node.textContent = t("noThreadMemory");
+    node.className = "muted";
+    node.dataset.i18n = "noThreadMemory";
+  }
 }
 
 function formatElapsed(ms) {
@@ -830,6 +850,7 @@ document.addEventListener("DOMContentLoaded", () => {
       const payload = await response.json();
       if (payload.content) {
         appendMessage("assistant", payload.content, payload.error ? "error" : "complete");
+        updateThreadSummary(payload.thread_summary);
         setActivity(false);
         return;
       }

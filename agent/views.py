@@ -430,7 +430,15 @@ def send_message(request, thread_id):
     if text.startswith("/"):
         content = handle_slash_command(thread, text, config)
         assistant = Message.objects.create(thread=thread, role="assistant", content=content, status="complete")
-        return JsonResponse({"user_id": user_message.id, "assistant_id": assistant.id, "content": content, "command": True})
+        return JsonResponse(
+            {
+                "user_id": user_message.id,
+                "assistant_id": assistant.id,
+                "content": content,
+                "command": True,
+                "thread_summary": thread.summary,
+            }
+        )
 
     if not config.model:
         content = "モデルが未設定です。config.tomlに model または default_model を設定してください。"

@@ -48,11 +48,11 @@ def handle_slash_command(thread: Thread, command_text: str, config: RuntimeConfi
         return _handle_write(thread, command_text, append=True)
 
     if command == "/compact":
-        messages = thread.messages.order_by("-created_at")[:12]
-        lines = [f"{message.role}: {message.content[:180]}" for message in reversed(list(messages))]
+        messages = _thread_memory_messages(thread)
+        lines = [f"{message.role}: {message.content[:180]}" for message in messages]
         thread.summary = "Updated at {:%Y-%m-%d %H:%M}\n{}".format(timezone.localtime(), "\n".join(lines))
         thread.save(update_fields=["summary", "updated_at"])
-        return "スレッド要約を更新しました。"
+        return f"スレッド要約を更新しました。\n\n```text\n{thread.summary}\n```"
 
     if command == "/resume":
         threads = Thread.objects.filter(project=thread.project).order_by("-updated_at")[:8]
@@ -81,6 +81,24 @@ def handle_slash_command(thread: Thread, command_text: str, config: RuntimeConfi
         return f"{command} は初回版では状態表示のみです。設定パネルから管理してください。"
 
     return f"未対応のスラッシュコマンドです: {command}"
+
+
+def _thread_memory_messages(thread: Thread) -> list[Message]:
+    remembered: list[Message] = []
+    skip_command_response = False
+    for message in thread.messages.order_by("created_at"):
+        content = message.content.strip()
+        if message.role == "user" and content.startswith("/"):
+            skip_command_response = True
+            continue
+        if skip_command_response and message.role == "assistant":
+            skip_command_response = False
+            continue
+        skip_command_response = False
+        if not content:
+            continue
+        remembered.append(message)
+    return remembered[-12:]
 
 
 def _handle_read(thread: Thread, parts: list[str]) -> str:

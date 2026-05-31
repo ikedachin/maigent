@@ -195,7 +195,7 @@ def _complete_chat_completions(
 
 def _log_empty_chat_completion_response(response, request: dict[str, object], *, reason: str) -> None:
     logger.warning(
-        "!!! CHAT_COMPLETION_EMPTY_RESPONSE !!! reason=%s request=%s structure=%s",
+        "CHAT_COMPLETION_EMPTY_RESPONSE reason=%s request=%s structure=%s",
         reason,
         _summarize_chat_completion_request(request),
         _summarize_chat_completion_response(response),

@@ -2895,7 +2895,7 @@ class OpenAIClientTests(TestCase):
                 result = complete_response(Config(), "hello", "system")
 
         self.assertEqual(result, "")
-        self.assertIn("!!! CHAT_COMPLETION_EMPTY_RESPONSE !!! reason=empty_message_content", "\n".join(logs.output))
+        self.assertIn("CHAT_COMPLETION_EMPTY_RESPONSE reason=empty_message_content", "\n".join(logs.output))
         self.assertIn("'messages_len': 2", "\n".join(logs.output))
         self.assertIn("'role': 'system'", "\n".join(logs.output))
         self.assertIn("'content_preview': 'system'", "\n".join(logs.output))

@@ -34,7 +34,7 @@ final_evaluation:
   max_retries: 3
   llm_max_retries: 1
   reasoning_effort: none
-  max_output_tokens: 160
+  max_output_tokens: 8192
 
 tools:
   rag:
@@ -51,19 +51,19 @@ tool_selector:
 initial_clarifier:
   enabled: true
   reasoning_effort: none
-  max_output_tokens: 192
+  max_output_tokens: 8192
   llm_max_retries: 1
 
 dynamic_replanner:
   enabled: true
   reasoning_effort: true
-  max_output_tokens: 160
+  max_output_tokens: 8192
   llm_max_retries: 1
 
 dynamic_finalizer:
   enabled: true
   reasoning_effort: none
-  max_output_tokens: 160
+  max_output_tokens: 8192
   llm_max_retries: 1
 
 sandbox_code_generation:

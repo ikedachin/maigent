@@ -713,7 +713,8 @@ def _generate_with_final_evaluation(
             yield _sse(progress(f"Attempt {attempt}: evaluating answer completeness."))
         goal = str(result.get("goal") or build_agent_goal(user_text))
         evaluation_criteria = list(result.get("evaluation_criteria") or build_agent_evaluation_criteria(user_text))
-        evaluation = _evaluate_final_answer(config, input_text, goal, evaluation_criteria, last_content)
+        evaluation_context = str(result.get("evaluation_context") or input_text)
+        evaluation = _evaluate_final_answer(config, evaluation_context, goal, evaluation_criteria, last_content)
         logger.debug(
             "final_evaluation_result thread_id=%s attempt=%s goal=%r criteria=%s adequate=%s reason=%r",
             thread.id,
@@ -810,6 +811,7 @@ def _generate_once(
             "evaluation_criteria": build_agent_evaluation_criteria(user_text),
             "plan_summary": "Clarification requested before planning.",
             "clarification_requested": True,
+            "evaluation_context": input_text,
         }
     plan = _build_agent_plan_with_llm_tool_selection(thread, user_text, config)
     if not plan:
@@ -846,6 +848,7 @@ def _generate_once(
             "goal": plan.goal,
             "evaluation_criteria": plan.evaluation_criteria,
             "plan_summary": plan.summary,
+            "evaluation_context": str(plan_result["input_text"]),
         }
 
     input_text = str(plan_result["input_text"])
@@ -878,6 +881,7 @@ def _generate_once(
         "goal": plan.goal,
         "evaluation_criteria": plan.evaluation_criteria,
         "plan_summary": plan.summary,
+        "evaluation_context": input_text,
     }
 
 
@@ -960,6 +964,7 @@ def _build_agent_plan_with_llm_tool_selection(thread: Thread, user_text: str, co
     decision = _select_tools_with_llm(config, user_text, tools)
     if not decision or not decision.steps:
         return None
+    decision = _correct_tool_selection_for_local_context(thread, user_text, tools, decision)
     goal = build_agent_goal(user_text)
     criteria = build_agent_evaluation_criteria(user_text)
     tool_names = [step.tool for step in decision.steps]
@@ -986,6 +991,55 @@ def _build_agent_plan_with_llm_tool_selection(thread: Thread, user_text: str, co
         decision.rag_query,
     )
     return plan
+
+
+def _correct_tool_selection_for_local_context(
+    thread: Thread,
+    user_text: str,
+    tools: list[dict[str, str]],
+    decision: LlmToolPlanDecision,
+) -> LlmToolPlanDecision:
+    if any(step.tool == "rag" for step in decision.steps):
+        return decision
+    available = {tool["name"] for tool in tools}
+    if "rag" not in available or not _has_allowed_context_sources(thread):
+        return decision
+    if not _should_force_rag_for_local_context(user_text):
+        return decision
+    steps = [AgentPlanStep("rag", "Search allowed local files for relevant local context."), *decision.steps]
+    rag_query = decision.rag_query.strip() or _build_local_context_rag_query(user_text)
+    reason = f"{decision.reason}; corrected to include RAG for likely local/project-specific context."
+    logger.debug(
+        "tool_selection_corrected thread_id=%s action=prepend_rag original_tools=%s corrected_tools=%s rag_query=%r",
+        thread.id,
+        [step.tool for step in decision.steps],
+        [step.tool for step in steps],
+        rag_query,
+    )
+    return LlmToolPlanDecision(steps=steps, rag_query=rag_query, reason=reason)
+
+
+def _should_force_rag_for_local_context(user_text: str) -> bool:
+    if _should_search(user_text):
+        return True
+    text = user_text.strip()
+    if not text:
+        return False
+    lowered = text.lower()
+    if any(marker in lowered for marker in ["who is", "what is", "tell me about", "について", "教えて"]):
+        return bool(_search_terms(text))
+    return False
+
+
+def _build_local_context_rag_query(user_text: str) -> str:
+    match = re.search(r"(.+?)(?:について|を教えて|教えて|とは|って何)", user_text)
+    if match:
+        candidate = match.group(1).strip(" 　、。?？")
+        if candidate:
+            terms = _search_terms(candidate.replace("の", " "))
+            if terms:
+                return " ".join(terms)
+    return _build_answer_query(user_text)
 
 
 def _request_initial_clarification_if_needed(config, user_text: str, latest_user_text: str = "") -> InitialClarification | None:
@@ -1066,6 +1120,7 @@ def _select_tools_with_llm(config, user_text: str, tools: list[dict[str, str]]) 
             reasoning_effort=_tool_selector_reasoning_effort(config),
             max_retries=0,
             log_exceptions=True,
+            temperature=0,
         )
         if not raw:
             logger.debug("tool_selection_empty_response attempt=%s/%s", attempt, max_attempts)
@@ -1155,7 +1210,11 @@ def _initial_clarifier_llm_enabled(config) -> bool:
 
 
 def _initial_clarifier_max_output_tokens(config) -> int:
-    return _control_config_int(config, "initial_clarifier", "max_output_tokens", 192, minimum=32, maximum=2048)
+    value = _control_config(config, "initial_clarifier").get("max_output_tokens", 8192)
+    try:
+        return max(32, int(value))
+    except (TypeError, ValueError):
+        return 8192
 
 
 def _initial_clarifier_reasoning_effort(config) -> str:
@@ -1269,11 +1328,11 @@ def _prepend_retry_feedback(input_text: str, retry_feedback: list[str]) -> str:
     return f"{prefix}\n\n{input_text}"
 
 
-def _evaluate_final_answer(config, user_text: str, goal: str, evaluation_criteria: list[str], answer: str) -> dict[str, object]:
+def _evaluate_final_answer(config, evaluation_context: str, goal: str, evaluation_criteria: list[str], answer: str) -> dict[str, object]:
     instructions = load_prompt("final_evaluation_instructions.txt")
     prompt = load_prompt(
         "final_evaluation_prompt.txt",
-        user_text=user_text,
+        evaluation_context=evaluation_context,
         goal=goal,
         evaluation_criteria="\n".join(f"- {criterion}" for criterion in evaluation_criteria),
         answer=answer,
@@ -1321,6 +1380,7 @@ def _complete_response_with_retries(
     config_name: str,
     max_output_tokens: int | None = None,
     reasoning_effort: str | None = None,
+    temperature: float | None = None,
     max_retries: int | None = None,
     log_exceptions: bool = True,
 ) -> str:
@@ -1335,6 +1395,7 @@ def _complete_response_with_retries(
                 instructions,
                 max_output_tokens=max_output_tokens,
                 reasoning_effort=reasoning_effort,
+                temperature=temperature,
             )
         except Exception as exc:
             last_error = str(exc)
@@ -1386,8 +1447,8 @@ def _config_mapping_int(config, name: str, key: str, default: int | None) -> int
 
 
 def _final_evaluation_max_output_tokens(config) -> int:
-    value = getattr(config, "final_evaluation_max_output_tokens", 160)
-    return value if isinstance(value, int) and value > 0 else 160
+    value = getattr(config, "final_evaluation_max_output_tokens", 8192)
+    return value if isinstance(value, int) and value > 0 else 8192
 
 
 def _final_evaluation_reasoning_effort(config) -> str:
@@ -1455,7 +1516,7 @@ def _replan_after_step_with_llm(config, state: AgentState) -> ReplanDecision | N
         instructions,
         purpose="dynamic_replanner",
         config_name="dynamic_replanner",
-        max_output_tokens=_control_config_int(config, "dynamic_replanner", "max_output_tokens", 160),
+        max_output_tokens=_control_config_max_output_tokens(config, "dynamic_replanner"),
         reasoning_effort=_control_config_reasoning_effort(config, "dynamic_replanner", "reasoning_effort", "none"),
     )
     if not raw:
@@ -1500,7 +1561,7 @@ def _route_final_output(config, state: AgentState) -> ReplanDecision:
         instructions,
         purpose="dynamic_finalizer",
         config_name="dynamic_finalizer",
-        max_output_tokens=_control_config_int(config, "dynamic_finalizer", "max_output_tokens", 160),
+        max_output_tokens=_control_config_max_output_tokens(config, "dynamic_finalizer"),
         reasoning_effort=_control_config_reasoning_effort(config, "dynamic_finalizer", "reasoning_effort", "none"),
     )
     if not raw:
@@ -1579,6 +1640,14 @@ def _control_config_int(config, name: str, key: str, default: int, minimum: int 
     try:
         value = _control_config(config, name).get(key, default)
         return max(minimum, min(maximum, int(value)))
+    except (TypeError, ValueError):
+        return default
+
+
+def _control_config_max_output_tokens(config, name: str, default: int = 8192) -> int:
+    try:
+        value = _control_config(config, name).get("max_output_tokens", default)
+        return max(1, int(value))
     except (TypeError, ValueError):
         return default
 

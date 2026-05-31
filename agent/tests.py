@@ -31,7 +31,10 @@ from .views import (
     _allowed_plan_tools,
     _avoid_failed_plan,
     _evaluate_final_answer,
+    _final_evaluation_max_output_tokens,
     _generate_sandbox_code_with_retries,
+    _control_config_max_output_tokens,
+    _initial_clarifier_max_output_tokens,
     _parse_plan_tasks,
     _persist_sandbox_artifacts,
     _request_initial_clarification_if_needed,
@@ -259,6 +262,34 @@ class ConfigTests(TestCase):
         self.assertTrue(config.tool_enabled("sandbox"))
         self.assertFalse(config.tool_enabled("rag", default=True))
         self.assertFalse(config.tool_enabled("web_search", default=True))
+
+    def test_initial_clarifier_max_output_tokens_defaults_to_8192_and_uses_config_value(self):
+        default_config = RuntimeConfig(values={}, sources=[])
+        configured = RuntimeConfig(values={"initial_clarifier": {"max_output_tokens": 32768}}, sources=[])
+        invalid = RuntimeConfig(values={"initial_clarifier": {"max_output_tokens": "invalid"}}, sources=[])
+
+        self.assertEqual(_initial_clarifier_max_output_tokens(default_config), 8192)
+        self.assertEqual(_initial_clarifier_max_output_tokens(configured), 32768)
+        self.assertEqual(_initial_clarifier_max_output_tokens(invalid), 8192)
+
+    def test_dynamic_max_output_tokens_defaults_to_8192_and_uses_config_value(self):
+        default_config = RuntimeConfig(values={}, sources=[])
+        configured = RuntimeConfig(values={"dynamic_replanner": {"max_output_tokens": 32768}}, sources=[])
+        invalid = RuntimeConfig(values={"dynamic_finalizer": {"max_output_tokens": "invalid"}}, sources=[])
+
+        self.assertEqual(_control_config_max_output_tokens(default_config, "dynamic_replanner"), 8192)
+        self.assertEqual(_control_config_max_output_tokens(configured, "dynamic_replanner"), 32768)
+        self.assertEqual(_control_config_max_output_tokens(invalid, "dynamic_finalizer"), 8192)
+
+    def test_final_evaluation_max_output_tokens_defaults_to_8192_and_uses_config_value(self):
+        default_config = RuntimeConfig(values={}, sources=[])
+        configured = RuntimeConfig(values={"final_evaluation": {"max_output_tokens": 32768}}, sources=[])
+        invalid = RuntimeConfig(values={"final_evaluation": {"max_output_tokens": "invalid"}}, sources=[])
+
+        self.assertEqual(_final_evaluation_max_output_tokens(default_config), 8192)
+        self.assertEqual(configured.final_evaluation_max_output_tokens, 32768)
+        self.assertEqual(_final_evaluation_max_output_tokens(configured), 32768)
+        self.assertEqual(invalid.final_evaluation_max_output_tokens, 8192)
 
     def test_plan_task_parser_and_storage_filter_to_allowed_tools(self):
         allowed = {"sandbox", "final"}
@@ -896,6 +927,44 @@ class ChatFlowTests(TestCase):
         self.assertIn("ユーザーの依頼に直接対応", first_evaluation_prompt)
         self.assertEqual(mock_complete.call_args_list[1].kwargs["max_output_tokens"], 80)
         self.assertEqual(mock_complete.call_args_list[1].kwargs["reasoning_effort"], "minimal")
+
+    @patch("agent.views.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_final_evaluation_receives_rag_context_when_rag_was_used(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = True
+            final_evaluation_max_retries = 1
+            final_evaluation_max_output_tokens = 80
+            final_evaluation_reasoning_effort = "minimal"
+            final_evaluation = {"llm_max_retries": 0}
+
+            def tool_enabled(self, name, default=False):
+                return name == "rag"
+
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "alpha.txt").write_text("alpha is a sealed book in the deep sea library.", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_config.return_value = Config()
+            mock_stream.return_value = iter([("delta", "alpha is a sealed book.")])
+            mock_complete.return_value = '{"adequate": true, "reason": "uses retrieved context"}'
+
+            create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "alphaについて要約して"})
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+        evaluation_prompt = mock_complete.call_args.args[1]
+        self.assertIn("User question and available context:", evaluation_prompt)
+        self.assertIn("RAG context from allowed local files:", evaluation_prompt)
+        self.assertIn("alpha.txt", evaluation_prompt)
+        self.assertIn("alpha is a sealed book", evaluation_prompt)
+        self.assertIn("Candidate answer:", evaluation_prompt)
 
     @patch("agent.views.complete_response")
     @patch("agent.views.stream_response")
@@ -2172,6 +2241,41 @@ class ChatFlowTests(TestCase):
         kwargs = mock_complete.call_args.kwargs
         self.assertEqual(kwargs["max_output_tokens"], 96)
         self.assertEqual(kwargs["reasoning_effort"], "low")
+        self.assertEqual(kwargs["temperature"], 0)
+
+    @patch("agent.views.complete_response")
+    def test_llm_tool_selector_corrects_direct_answer_to_rag_for_local_context(self, mock_complete):
+        class Config:
+            tool_selector = {
+                "enabled": True,
+                "reasoning_effort": "none",
+                "max_output_tokens": 96,
+            }
+
+            def tool_enabled(self, name, default=False):
+                return name in {"tool_selector", "rag"} or default
+
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "text_4.txt").write_text("古書修復師の灰島ノエは京都の月返寺で写本を修復する。", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_complete.return_value = json.dumps(
+                {
+                    "steps": [{"tool": "final", "purpose": "Answer directly."}],
+                    "rag_query": "",
+                    "reason": "Direct answer is enough.",
+                }
+            )
+
+            from .views import _build_agent_plan_with_llm_tool_selection
+
+            plan = _build_agent_plan_with_llm_tool_selection(self.thread, "古書修復師の灰島ノエについて教えて", Config())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual([step.tool for step in plan.steps], ["rag", "final"])
+        self.assertEqual(plan.summary, "rag -> final (LLM-selected tools)")
+        self.assertEqual(plan.rag_query, "古書修復師 灰島ノエ")
+        self.assertIn("RAG", plan.evaluation_criteria[-1])
 
     @patch("agent.views.complete_response")
     def test_llm_tool_selector_retries_empty_response(self, mock_complete):
@@ -2755,10 +2859,50 @@ class OpenAIClientTests(TestCase):
         with patch("agent.openai_client.OpenAI", return_value=Client()):
             from .openai_client import complete_response
 
-            result = complete_response(Config(), "hello", "system", max_output_tokens=64)
+            result = complete_response(Config(), "hello", "system", max_output_tokens=64, temperature=0)
 
         self.assertEqual(result, "chat ok")
         self.assertEqual(Client.chat.completions.kwargs["max_tokens"], 64)
+        self.assertEqual(Client.chat.completions.kwargs["temperature"], 0)
+
+    def test_chat_completion_empty_content_logs_response_structure(self):
+        class Config:
+            model = "model"
+            api_key = "key"
+            base_url = ""
+            api_mode = "chat"
+
+        class ChatCompletions:
+            def create(self, **kwargs):
+                message = type("Message", (), {"role": "assistant", "content": ""})()
+                choice = type("Choice", (), {"index": 0, "finish_reason": "stop", "message": message})()
+                return type(
+                    "Response",
+                    (),
+                    {"id": "chat_1", "model": "model", "object": "chat.completion", "usage": {"total_tokens": 12}, "choices": [choice]},
+                )()
+
+        class Chat:
+            completions = ChatCompletions()
+
+        class Client:
+            chat = Chat()
+
+        with patch("agent.openai_client.OpenAI", return_value=Client()):
+            from .openai_client import complete_response
+
+            with self.assertLogs("agent.openai_client", level="WARNING") as logs:
+                result = complete_response(Config(), "hello", "system")
+
+        self.assertEqual(result, "")
+        self.assertIn("!!! CHAT_COMPLETION_EMPTY_RESPONSE !!! reason=empty_message_content", "\n".join(logs.output))
+        self.assertIn("'messages_len': 2", "\n".join(logs.output))
+        self.assertIn("'role': 'system'", "\n".join(logs.output))
+        self.assertIn("'content_preview': 'system'", "\n".join(logs.output))
+        self.assertIn("'role': 'user'", "\n".join(logs.output))
+        self.assertIn("'content_preview': 'hello'", "\n".join(logs.output))
+        self.assertIn("'finish_reason': 'stop'", "\n".join(logs.output))
+        self.assertIn("'content_len': 0", "\n".join(logs.output))
 
     def test_ollama_uses_openai_compatible_client_with_default_base_url_and_dummy_key(self):
         config = RuntimeConfig(
@@ -2874,8 +3018,9 @@ class OpenAIClientTests(TestCase):
         with patch("agent.openai_client.OpenAI", return_value=Client()):
             from .openai_client import complete_response
 
-            result = complete_response(config, "hello", max_output_tokens=64, reasoning_effort="none")
+            result = complete_response(config, "hello", max_output_tokens=64, reasoning_effort="none", temperature=0)
 
         self.assertEqual(result, "ok")
         self.assertEqual(Client.responses.kwargs["max_output_tokens"], 64)
         self.assertEqual(Client.responses.kwargs["reasoning"], {"effort": "none"})
+        self.assertEqual(Client.responses.kwargs["temperature"], 0)

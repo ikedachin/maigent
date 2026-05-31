@@ -194,9 +194,9 @@ class RuntimeConfig:
     @property
     def final_evaluation_max_output_tokens(self) -> int:
         try:
-            return max(1, min(1024, int(self.final_evaluation.get("max_output_tokens", 160))))
+            return max(1, int(self.final_evaluation.get("max_output_tokens", 8192)))
         except (TypeError, ValueError):
-            return 160
+            return 8192
 
     @property
     def final_evaluation_reasoning_effort(self) -> str:

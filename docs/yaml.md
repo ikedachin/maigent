@@ -42,7 +42,7 @@ final_evaluation:
   max_retries: 3
   llm_max_retries: 1
   reasoning_effort: none
-  max_output_tokens: 160
+  max_output_tokens: 8192
 
 tools:
   rag:
@@ -67,19 +67,19 @@ tool_selector:
 initial_clarifier:
   enabled: true
   reasoning_effort: none
-  max_output_tokens: 192
+  max_output_tokens: 8192
   llm_max_retries: 1
 
 dynamic_replanner:
   enabled: true
   reasoning_effort: true
-  max_output_tokens: 160
+  max_output_tokens: 8192
   llm_max_retries: 1
 
 dynamic_finalizer:
   enabled: true
   reasoning_effort: none
-  max_output_tokens: 160
+  max_output_tokens: 8192
   llm_max_retries: 1
 
 sandbox_code_generation:
@@ -285,7 +285,7 @@ final_evaluation:
   max_retries: 3
   llm_max_retries: 1
   reasoning_effort: none
-  max_output_tokens: 160
+  max_output_tokens: 8192
 ```
 
 項目:
@@ -293,7 +293,7 @@ final_evaluation:
 - `max_retries`: 評価NG時に別プランで再実行する回数
 - `llm_max_retries`: 評価LLMが空応答/None/例外を返したときの短いリトライ回数
 - `reasoning_effort`: Responses APIに渡すreasoning effort
-- `max_output_tokens`: 評価LLMの最大出力トークン数
+- `max_output_tokens`: 評価LLMの最大出力トークン数。未指定時は `8192`、指定時はその値を使用します
 
 注意:
 - `max_retries` は0から3に丸められます
@@ -386,14 +386,14 @@ tool_selector:
 initial_clarifier:
   enabled: true
   reasoning_effort: none
-  max_output_tokens: 192
+  max_output_tokens: 8192
   llm_max_retries: 1
 ```
 
 項目:
 - `enabled`: 初期確認判定を有効化するか
 - `reasoning_effort`: reasoning effort
-- `max_output_tokens`: 最大出力トークン数
+- `max_output_tokens`: 最大出力トークン数。未指定時は `8192`、指定時はその値を使用します
 - `llm_max_retries`: 空応答/None/例外時の再試行回数
 
 質問が必要と判定された場合は、理由と最大3問の確認事項を返してエージェント実行を止めます。
@@ -406,14 +406,14 @@ initial_clarifier:
 dynamic_replanner:
   enabled: true
   reasoning_effort: true
-  max_output_tokens: 160
+  max_output_tokens: 8192
   llm_max_retries: 1
 ```
 
 項目:
 - `enabled`: 動的リプランを有効化するか
 - `reasoning_effort`: reasoning effort。`true` は `medium`、`false` は `none` として扱います
-- `max_output_tokens`: 最大出力トークン数。未指定時は `160`
+- `max_output_tokens`: 最大出力トークン数。未指定時は `8192`、指定時はその値を使用します
 - `llm_max_retries`: 空応答/None/例外時の再試行回数
 
 返せるアクション:
@@ -429,14 +429,14 @@ dynamic_replanner:
 dynamic_finalizer:
   enabled: true
   reasoning_effort: none
-  max_output_tokens: 160
+  max_output_tokens: 8192
   llm_max_retries: 1
 ```
 
 項目:
 - `enabled`: 最終ルーティングを有効化するか
 - `reasoning_effort`: reasoning effort
-- `max_output_tokens`: 最大出力トークン数
+- `max_output_tokens`: 最大出力トークン数。未指定時は `8192`、指定時はその値を使用します
 - `llm_max_retries`: 空応答/None/例外時の再試行回数
 
 返せるアクション:

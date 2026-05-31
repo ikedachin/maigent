@@ -1,5 +1,5 @@
-User question:
-{{user_text}}
+User question and available context:
+{{evaluation_context}}
 
 Goal set before planning:
 {{goal}}

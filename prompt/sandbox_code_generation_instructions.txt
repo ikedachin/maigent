@@ -13,6 +13,7 @@ Host-provided sandbox dataset API が提示されている場合は、CSV/TSV/JS
 
 最終回答はプレーンテキストとして print してください。
 有用な場合は、csv, io, statistics, pandas を優先して使用してください。
+Matplotlibで日本語を含む画像を作る場合は、`Noto Sans CJK JP` をフォントに指定し、`plt.rcParams["axes.unicode_minus"] = False` を設定してください。
 
 サンドボックス内からファイルを書き込んではいけません。
 画像は `plt.savefig("chart.png")` のようにファイルへ保存せず、`io.BytesIO` に保存してbase64化してください。

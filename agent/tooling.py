@@ -216,6 +216,7 @@ def run_sandbox(message: str, config: RuntimeConfig, code: str = "", datasets: t
         logger.debug("sandbox_skip reason=no_code")
         return SandboxResult(False, "sandboxで実行できるPythonコードまたは計算式を特定できませんでした。")
     code = _prepend_sandbox_datasets(code, datasets)
+    code = _prepend_sandbox_runtime_prelude(code)
     with tempfile.TemporaryDirectory() as tmp_dir:
         script = Path(tmp_dir) / "script.py"
         script.write_text(code, encoding="utf-8")
@@ -365,6 +366,27 @@ def _prepend_sandbox_datasets(code: str, datasets: tuple[SandboxDataset, ...]) -
     return prelude + code
 
 
+def _prepend_sandbox_runtime_prelude(code: str) -> str:
+    prelude = (
+        "try:\n"
+        "    import matplotlib\n"
+        "    matplotlib.use('Agg', force=True)\n"
+        "    from matplotlib import font_manager as _maigent_font_manager\n"
+        "    _maigent_japanese_font = 'Noto Sans CJK JP'\n"
+        "    try:\n"
+        "        _maigent_font_manager.findfont(_maigent_japanese_font, fallback_to_default=False)\n"
+        "    except Exception:\n"
+        "        _maigent_japanese_font = ''\n"
+        "    if _maigent_japanese_font:\n"
+        "        matplotlib.rcParams['font.family'] = [_maigent_japanese_font]\n"
+        "        matplotlib.rcParams['axes.unicode_minus'] = False\n"
+        "except Exception:\n"
+        "    pass\n"
+        "\n"
+    )
+    return prelude + code
+
+
 def _tabular_dataset_shape(kind: str, text: str) -> tuple[list[str], int]:
     if kind not in {"csv", "tsv"} or not text.strip():
         return [], 0
@@ -388,6 +410,9 @@ def _parse_typed_sandbox_output(output: str) -> tuple[str, list[dict[str, object
         payload = json.loads(output)
     except json.JSONDecodeError:
         embedded = _extract_embedded_typed_sandbox_output(output)
+        if embedded:
+            return embedded
+        embedded = _extract_embedded_python_typed_sandbox_output(output)
         return embedded if embedded else (output, [])
     if not isinstance(payload, dict):
         return output, []
@@ -424,6 +449,61 @@ def _extract_embedded_typed_sandbox_output(output: str) -> tuple[str, list[dict[
             return stdout, [artifact for artifact in artifacts if isinstance(artifact, dict)]
         index = object_start + max(1, object_length)
     return None
+
+
+def _extract_embedded_python_typed_sandbox_output(output: str) -> tuple[str, list[dict[str, object]]] | None:
+    index = 0
+    while index < len(output):
+        object_start = output.find("{", index)
+        if object_start < 0:
+            return None
+        literal_text = _balanced_brace_text(output, object_start)
+        if not literal_text:
+            index = object_start + 1
+            continue
+        try:
+            payload = ast.literal_eval(literal_text)
+        except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
+            index = object_start + 1
+            continue
+        if isinstance(payload, dict) and isinstance(payload.get("maigent_sandbox_result"), dict):
+            result = payload["maigent_sandbox_result"]
+            typed_stdout = str(result.get("stdout") or "").strip()
+            artifacts = result.get("artifacts", [])
+            if not isinstance(artifacts, list):
+                artifacts = []
+            visible_output = (output[:object_start] + output[object_start + len(literal_text) :]).strip()
+            stdout = visible_output or typed_stdout
+            return stdout, [artifact for artifact in artifacts if isinstance(artifact, dict)]
+        index = object_start + max(1, len(literal_text))
+    return None
+
+
+def _balanced_brace_text(text: str, start: int) -> str:
+    if start < 0 or start >= len(text) or text[start] != "{":
+        return ""
+    depth = 0
+    quote = ""
+    escape = False
+    for index in range(start, len(text)):
+        char = text[index]
+        if quote:
+            if escape:
+                escape = False
+            elif char == "\\":
+                escape = True
+            elif char == quote:
+                quote = ""
+            continue
+        if char in {"'", '"'}:
+            quote = char
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start : index + 1]
+    return ""
 
 
 def _looks_like_sandbox_task(message: str) -> bool:

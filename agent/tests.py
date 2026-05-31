@@ -16,6 +16,7 @@ from .tooling import (
     AgentPlanStep,
     SandboxResult,
     _parse_typed_sandbox_output,
+    _prepend_sandbox_runtime_prelude,
     _prepend_sandbox_datasets,
     make_sandbox_dataset,
     _python_for_tabular_task,
@@ -1258,6 +1259,26 @@ class ChatFlowTests(TestCase):
         self.assertEqual(stdout, "合計人数: 30")
         self.assertEqual(artifacts[0]["path"], "chart.png")
 
+    def test_typed_sandbox_output_parser_extracts_python_dict_payload(self):
+        payload = {
+            "maigent_sandbox_result": {
+                "stdout": "chart ready",
+                "artifacts": [
+                    {
+                        "path": "chart.png",
+                        "content_base64": base64.b64encode(b"png").decode("ascii"),
+                        "mime_type": "image/png",
+                    }
+                ],
+            }
+        }
+
+        stdout, artifacts = _parse_typed_sandbox_output(f"合計人数: 30\n{payload}")
+
+        self.assertEqual(stdout, "合計人数: 30")
+        self.assertEqual(artifacts[0]["path"], "chart.png")
+        self.assertEqual(artifacts[0]["content_base64"], base64.b64encode(b"png").decode("ascii"))
+
     @patch("agent.views.run_sandbox")
     @patch("agent.views.generate_sandbox_code")
     @patch("agent.views.load_runtime_config")
@@ -1316,6 +1337,7 @@ class ChatFlowTests(TestCase):
             self.assertIn(f"![my chart.png](/projects/{self.project.id}/artifacts/my%20chart.png)", assistant.content)
             image_response = self.client.get(reverse("artifact_image", args=[self.project.id, "my chart.png"]))
             self.assertEqual(image_response.status_code, 200)
+            self.assertEqual(image_response["Cache-Control"], "no-store")
 
     def test_artifact_image_route_rejects_non_images_and_output_escape(self):
         with TemporaryDirectory() as root_dir, TemporaryDirectory() as other_dir:
@@ -1582,6 +1604,13 @@ class ChatFlowTests(TestCase):
 
         self.assertIn("def load_dataset(dataset_id):", script)
         self.assertIn("名前,テストの種類,テストの点", script)
+
+    def test_sandbox_runtime_prelude_configures_japanese_matplotlib_font(self):
+        script = _prepend_sandbox_runtime_prelude("print('ok')\n")
+
+        self.assertIn("Noto Sans CJK JP", script)
+        self.assertIn("matplotlib.rcParams['font.family']", script)
+        self.assertIn("matplotlib.rcParams['axes.unicode_minus'] = False", script)
 
     @patch("agent.views.generate_sandbox_code")
     def test_sandbox_code_generation_retries_after_policy_rejection(self, mock_generate_sandbox_code):

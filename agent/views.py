@@ -267,7 +267,9 @@ def serve_artifact_image(request, project_id, relative_path):
     resolved, error = resolve_project_output_file(project, relative_path)
     if error or resolved is None or not resolved.exists() or not resolved.is_file():
         raise Http404("artifact image not found")
-    return FileResponse(resolved.open("rb"), content_type=mime_type)
+    response = FileResponse(resolved.open("rb"), content_type=mime_type)
+    response["Cache-Control"] = "no-store"
+    return response
 
 
 @require_POST

@@ -93,11 +93,13 @@ const translations = {
     complete: "完了",
     streaming: "生成中",
     running: "実行中",
+    queued: "待機中",
     preparing: "準備中",
     partialProgress: "進行ログ（一部・最新3行）",
     error: "エラー",
     pending: "待機中",
     elapsedTime: "実行時間",
+    agentProgress: "エージェント進捗",
     copy: "コピー",
     copied: "コピー済み",
     copyMessage: "メッセージをコピー",
@@ -191,11 +193,13 @@ const translations = {
     complete: "complete",
     streaming: "streaming",
     running: "running",
+    queued: "queued",
     preparing: "preparing",
     partialProgress: "Progress log (partial, latest 3 lines)",
     error: "error",
     pending: "pending",
     elapsedTime: "Elapsed time",
+    agentProgress: "Agent progress",
     copy: "Copy",
     copied: "Copied",
     copyMessage: "Copy message",
@@ -465,7 +469,10 @@ function appendMessage(role, content, status) {
     label.textContent = t("partialProgress");
     const list = document.createElement("ol");
     list.className = "message-progress-lines";
-    progress.append(label, list);
+    const agents = document.createElement("ul");
+    agents.className = "message-agent-progress";
+    agents.hidden = true;
+    progress.append(label, agents, list);
     article.append(progress);
   }
   container.append(article);
@@ -554,6 +561,9 @@ function streamAssistant(url, node) {
     if (payload.progress_tail) {
       updateProgressTail(node, payload.progress_tail, payload.progress_truncated);
     }
+    if (payload.agent && payload.agent_status) {
+      updateAgentProgress(node, payload.agent, payload.agent_status, payload.agent_progress || "");
+    }
     if (payload.delta) {
       if (node.body.classList.contains("message-loading")) {
         node.body.className = "message-body";
@@ -625,6 +635,33 @@ function updateProgressTail(node, lines, truncated) {
   });
   node.progress.classList.toggle("truncated", Boolean(truncated));
   node.progress.hidden = lines.length === 0;
+}
+
+function updateAgentProgress(node, agent, status, message) {
+  if (!node.progress) return;
+  const list = node.progress.querySelector(".message-agent-progress");
+  if (!list) return;
+  const key = String(agent || "").trim();
+  if (!key) return;
+  let item = list.querySelector(`[data-agent="${CSS.escape(key)}"]`);
+  if (!item) {
+    item = document.createElement("li");
+    item.dataset.agent = key;
+    const name = document.createElement("strong");
+    name.className = "message-agent-name";
+    const state = document.createElement("span");
+    state.className = "message-agent-status";
+    const detail = document.createElement("span");
+    detail.className = "message-agent-detail";
+    item.append(name, state, detail);
+    list.append(item);
+  }
+  item.dataset.status = status;
+  item.querySelector(".message-agent-name").textContent = key;
+  item.querySelector(".message-agent-status").textContent = t(status) || status;
+  item.querySelector(".message-agent-detail").textContent = message ? ` ${message}` : "";
+  list.hidden = false;
+  node.progress.hidden = false;
 }
 
 async function copyText(text) {

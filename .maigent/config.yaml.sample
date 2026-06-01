@@ -122,3 +122,10 @@ sandbox_code_generation:
 logging:
   llm_tail_chars: full
   # llm_tail_chars: 500
+
+
+multi_agent:
+  enabled: true
+  max_workers: 3
+  parallel_tools: true
+  progress_visible: true

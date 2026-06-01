@@ -66,6 +66,12 @@ dynamic_finalizer:
   max_output_tokens: 8192
   llm_max_retries: 1
 
+multi_agent:
+  enabled: true
+  max_workers: 3
+  parallel_tools: true
+  progress_visible: true
+
 sandbox_code_generation:
   llm_max_retries: 1
 ```
@@ -77,6 +83,8 @@ sandbox_code_generation:
 `logging.llm_tail_chars` は、LLMプロンプトやLLM応答をデバッグログへ出すときの末尾文字数です。標準は `100` です。全文を出す場合は `full`、`all`、`unlimited`、または `0` を指定します。
 
 `final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。最終評価のLLM呼び出しは `reasoning_effort`、`max_output_tokens`、`llm_max_retries` で軽量化と応答失敗時の再試行を設定できます。画面から保存した最終評価の有効/無効とリトライ回数はDBの `AppSetting` に保存され、設定ファイル値より優先されます。
+
+`multi_agent.enabled` は、1つのユーザー依頼の内部で複数worker agentを並列実行するかを制御します。標準は有効で、`max_workers` は 1 から 5 の範囲に丸められます。v1では同一スレッドへの複数ユーザー送信を同時処理するのではなく、1つのassistant回答の中で `research` / `compute` / `verify` workerを走らせ、最後に1つの回答へ統合します。`parallel_tools` が `true` の場合、RAGやsandboxなど独立可能なツールをworkerへ分割します。`progress_visible` が `true` の場合、ブラウザの進捗欄にagent別の状態を表示します。
 
 プラン作成時の評価基準文は `prompt/evaluation_criteria.txt` から読み込みます。コード側は依頼内容に応じて `base`、`rag`、`sandbox`、`summary`、`list`、`rag_selected` の各セクションを選び、文面はプロンプトファイル側で調整できます。
 

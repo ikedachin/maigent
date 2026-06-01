@@ -183,12 +183,45 @@ class AgentRun(models.Model):
         return f"{self.status}: {self.goal[:40]}"
 
 
+class AgentWorkerRun(models.Model):
+    STATUS_CHOICES = [
+        ("queued", "Queued"),
+        ("running", "Running"),
+        ("complete", "Complete"),
+        ("error", "Error"),
+    ]
+    run = models.ForeignKey(AgentRun, related_name="worker_runs", on_delete=models.CASCADE)
+    name = models.CharField(max_length=80)
+    role = models.CharField(max_length=40)
+    purpose = models.TextField(blank=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="queued")
+    result = models.TextField(blank=True)
+    error = models.TextField(blank=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ["created_at", "id"]
+
+    def __str__(self):
+        return f"{self.name}: {self.status}"
+
+
 class AgentTaskRecord(models.Model):
     STATUS_CHOICES = [
         ("ok", "OK"),
         ("error", "Error"),
     ]
     run = models.ForeignKey(AgentRun, related_name="task_records", on_delete=models.CASCADE)
+    worker = models.ForeignKey(
+        AgentWorkerRun,
+        related_name="task_records",
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+    )
     sequence = models.PositiveIntegerField()
     tool = models.CharField(max_length=40)
     purpose = models.TextField(blank=True)

@@ -37,6 +37,26 @@ class AgentPlan:
 
 
 @dataclass(frozen=True)
+class AgentWorkerSpec:
+    name: str
+    role: str
+    purpose: str
+    steps: tuple[AgentPlanStep, ...]
+
+
+@dataclass(frozen=True)
+class AgentWorkerResult:
+    name: str
+    role: str
+    purpose: str
+    ok: bool
+    input_text: str
+    result: str
+    error: str = ""
+    task_records: tuple[dict[str, str], ...] = ()
+
+
+@dataclass(frozen=True)
 class SandboxResult:
     ok: bool
     output: str
@@ -115,6 +135,56 @@ def build_agent_plan(message: str, config: RuntimeConfig) -> AgentPlan:
         [step.tool for step in plan.steps],
     )
     return plan
+
+
+def build_agent_worker_specs(plan: AgentPlan, max_workers: int = 3, parallel_tools: bool = True) -> list[AgentWorkerSpec]:
+    max_workers = max(1, min(5, int(max_workers or 1)))
+    tool_steps = [step for step in plan.steps if step.tool != "final"]
+    if not tool_steps or not parallel_tools:
+        return []
+
+    specs: list[AgentWorkerSpec] = []
+    research_steps = tuple(step for step in tool_steps if step.tool in {"rag", "web_search"})
+    compute_steps = tuple(step for step in tool_steps if step.tool == "sandbox")
+    other_steps = tuple(step for step in tool_steps if step.tool not in {"rag", "web_search", "sandbox"})
+
+    if research_steps:
+        specs.append(
+            AgentWorkerSpec(
+                name="research",
+                role="research",
+                purpose="Collect local or external context for the request.",
+                steps=research_steps,
+            )
+        )
+    if compute_steps:
+        specs.append(
+            AgentWorkerSpec(
+                name="compute",
+                role="compute",
+                purpose="Run deterministic computation or artifact generation.",
+                steps=compute_steps,
+            )
+        )
+    if other_steps:
+        specs.append(
+            AgentWorkerSpec(
+                name="analysis",
+                role="analysis",
+                purpose="Run remaining analysis tasks.",
+                steps=other_steps,
+            )
+        )
+    if len(specs) >= 2 and len(specs) < max_workers:
+        specs.append(
+            AgentWorkerSpec(
+                name="verify",
+                role="verify",
+                purpose="Review worker outputs during synthesis for gaps or contradictions.",
+                steps=(),
+            )
+        )
+    return specs[:max_workers]
 
 
 def build_agent_goal(message: str) -> str:
@@ -416,8 +486,8 @@ def _parse_typed_sandbox_output(output: str) -> tuple[str, list[dict[str, object
         return embedded if embedded else (output, [])
     if not isinstance(payload, dict):
         return output, []
-    result = payload.get("maigent_sandbox_result")
-    if not isinstance(result, dict):
+    result = _typed_sandbox_result_payload(payload)
+    if result is None:
         return output, []
     stdout = str(result.get("stdout") or "")
     artifacts = result.get("artifacts", [])
@@ -438,8 +508,11 @@ def _extract_embedded_typed_sandbox_output(output: str) -> tuple[str, list[dict[
         except json.JSONDecodeError:
             index = object_start + 1
             continue
-        if isinstance(payload, dict) and isinstance(payload.get("maigent_sandbox_result"), dict):
-            result = payload["maigent_sandbox_result"]
+        if isinstance(payload, dict):
+            result = _typed_sandbox_result_payload(payload)
+            if result is None:
+                index = object_start + max(1, object_length)
+                continue
             typed_stdout = str(result.get("stdout") or "").strip()
             artifacts = result.get("artifacts", [])
             if not isinstance(artifacts, list):
@@ -466,8 +539,11 @@ def _extract_embedded_python_typed_sandbox_output(output: str) -> tuple[str, lis
         except (SyntaxError, ValueError, TypeError, MemoryError, RecursionError):
             index = object_start + 1
             continue
-        if isinstance(payload, dict) and isinstance(payload.get("maigent_sandbox_result"), dict):
-            result = payload["maigent_sandbox_result"]
+        if isinstance(payload, dict):
+            result = _typed_sandbox_result_payload(payload)
+            if result is None:
+                index = object_start + max(1, len(literal_text))
+                continue
             typed_stdout = str(result.get("stdout") or "").strip()
             artifacts = result.get("artifacts", [])
             if not isinstance(artifacts, list):
@@ -476,6 +552,15 @@ def _extract_embedded_python_typed_sandbox_output(output: str) -> tuple[str, lis
             stdout = visible_output or typed_stdout
             return stdout, [artifact for artifact in artifacts if isinstance(artifact, dict)]
         index = object_start + max(1, len(literal_text))
+    return None
+
+
+def _typed_sandbox_result_payload(payload: dict[str, object]) -> dict[str, object] | None:
+    result = payload.get("maigent_sandbox_result")
+    if isinstance(result, dict):
+        return result
+    if "stdout" in payload and "artifacts" in payload:
+        return payload
     return None
 
 

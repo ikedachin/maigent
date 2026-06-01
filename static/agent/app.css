@@ -700,6 +700,47 @@ textarea:focus {
   overflow-wrap: anywhere;
 }
 
+.message-agent-progress {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.message-agent-progress[hidden] {
+  display: none;
+}
+
+.message-agent-progress li {
+  display: grid;
+  grid-template-columns: minmax(68px, max-content) max-content minmax(0, 1fr);
+  gap: 8px;
+  align-items: baseline;
+  padding: 6px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface-soft);
+}
+
+.message-agent-name {
+  color: var(--ink);
+}
+
+.message-agent-status {
+  color: var(--accent);
+  font-weight: 700;
+}
+
+.message-agent-progress li[data-status="error"] .message-agent-status {
+  color: var(--danger);
+}
+
+.message-agent-detail {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .message-loading {
   display: inline-flex;
   align-items: center;

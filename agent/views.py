@@ -1,16 +1,21 @@
 import ast
+import concurrent.futures
 import json
 import logging
 import math
+import queue
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TypedDict
 
+from django.db import close_old_connections
 from django.db import transaction
+from django.db.models import Max
 from django.http import FileResponse, Http404, JsonResponse, StreamingHttpResponse
 from django.shortcuts import get_object_or_404, redirect, render
+from django.utils import timezone
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
@@ -18,17 +23,20 @@ from .access import is_path_allowed
 from .access import normalize_access_path
 from .config import RuntimeConfig, load_runtime_config
 from .file_broker import allowed_image_mime_type, resolve_project_output_file, write_allowed_binary_file, write_allowed_text_file
-from .models import AgentRun, AgentTaskRecord, AppSetting, ApprovalRequest, Automation, FeatureFlag, Message, Project, ProjectAccessPath, Thread
+from .models import AgentRun, AgentTaskRecord, AgentWorkerRun, AppSetting, ApprovalRequest, Automation, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .openai_client import complete_response, generate_sandbox_code, stream_response
 from .prompt_loader import load_prompt
 from .slash_commands import handle_slash_command
 from .tooling import (
     AgentPlan,
     AgentPlanStep,
+    AgentWorkerResult,
+    AgentWorkerSpec,
     SandboxDataset,
     build_agent_evaluation_criteria,
     build_agent_goal,
     build_agent_plan,
+    build_agent_worker_specs,
     can_build_sandbox_program,
     evaluation_criterion,
     make_sandbox_dataset,
@@ -835,7 +843,10 @@ def _generate_once(
     )
     run = _create_agent_run(thread, user_message, assistant_message, attempt, plan, allowed_tools)
     try:
-        plan_result = yield from _execute_agent_plan(thread, user_text, config, plan, progress, run=run, input_text=input_text)
+        if _multi_agent_enabled(config):
+            plan_result = yield from _execute_multi_agent_plan(thread, user_text, config, plan, progress, run=run, input_text=input_text)
+        else:
+            plan_result = yield from _execute_agent_plan(thread, user_text, config, plan, progress, run=run, input_text=input_text)
     except Exception as exc:
         _finish_agent_run(run, "error", error=str(exc))
         raise
@@ -1702,18 +1713,24 @@ def _sync_agent_run_state(state: AgentState, status: str = "running", final_mess
 def _record_agent_task(state: AgentState, record: TaskExecutionRecord) -> None:
     if not state.run:
         return
-    sequence = state.run.task_records.count() + 1
-    AgentTaskRecord.objects.create(
-        run=state.run,
-        sequence=sequence,
-        tool=record.task.tool,
-        purpose=record.task.purpose,
-        status="ok" if record.ok else "error",
-        input_before=_truncate_db_text(record.input_before),
-        input_after=_truncate_db_text(record.input_after),
-        result=_truncate_db_text(record.result),
-        error=_truncate_db_text(record.error),
-    )
+    _create_agent_task_record(state.run, record)
+
+
+def _create_agent_task_record(run: AgentRun, record: TaskExecutionRecord, worker: AgentWorkerRun | None = None) -> None:
+    with transaction.atomic():
+        sequence = (AgentTaskRecord.objects.filter(run=run).aggregate(value=Max("sequence"))["value"] or 0) + 1
+        AgentTaskRecord.objects.create(
+            run=run,
+            worker=worker,
+            sequence=sequence,
+            tool=record.task.tool,
+            purpose=record.task.purpose,
+            status="ok" if record.ok else "error",
+            input_before=_truncate_db_text(record.input_before),
+            input_after=_truncate_db_text(record.input_after),
+            result=_truncate_db_text(record.result),
+            error=_truncate_db_text(record.error),
+        )
 
 
 def _record_replan_decision(state: AgentState, decision: ReplanDecision) -> None:
@@ -1761,6 +1778,457 @@ def _truncate_db_text(text: object, limit: int = 12000) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "\n[truncated]"
+
+
+def _multi_agent_enabled(config) -> bool:
+    value = getattr(config, "multi_agent_enabled", None)
+    if isinstance(value, bool):
+        return value
+    if isinstance(config, RuntimeConfig):
+        return True
+    multi_agent = getattr(config, "multi_agent", None)
+    if isinstance(multi_agent, dict):
+        return _as_bool_like(multi_agent.get("enabled", True))
+    return False
+
+
+def _multi_agent_max_workers(config) -> int:
+    value = getattr(config, "multi_agent_max_workers", None)
+    if isinstance(value, int):
+        return max(1, min(5, value))
+    multi_agent = getattr(config, "multi_agent", None)
+    if isinstance(multi_agent, dict):
+        try:
+            return max(1, min(5, int(multi_agent.get("max_workers", 3))))
+        except (TypeError, ValueError):
+            return 3
+    return 3
+
+
+def _multi_agent_parallel_tools(config) -> bool:
+    value = getattr(config, "multi_agent_parallel_tools", None)
+    if isinstance(value, bool):
+        return value
+    multi_agent = getattr(config, "multi_agent", None)
+    if isinstance(multi_agent, dict):
+        return _as_bool_like(multi_agent.get("parallel_tools", True))
+    return True
+
+
+def _multi_agent_progress_visible(config) -> bool:
+    value = getattr(config, "multi_agent_progress_visible", None)
+    if isinstance(value, bool):
+        return value
+    multi_agent = getattr(config, "multi_agent", None)
+    if isinstance(multi_agent, dict):
+        return _as_bool_like(multi_agent.get("progress_visible", True))
+    return True
+
+
+def _as_bool_like(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_multi_agent_workers(plan: AgentPlan, user_text: str, config) -> list[AgentWorkerSpec]:
+    return build_agent_worker_specs(
+        plan,
+        max_workers=_multi_agent_max_workers(config),
+        parallel_tools=_multi_agent_parallel_tools(config),
+    )
+
+
+def _emit_agent_progress(agent: str, status: str, message: str, progress=None):
+    if not progress:
+        return None
+    payload = progress(f"{agent}: {message}")
+    payload.update(
+        {
+            "agent": agent,
+            "agent_status": status,
+            "agent_progress": message,
+        }
+    )
+    return _sse(payload)
+
+
+def _execute_multi_agent_plan(
+    thread: Thread,
+    user_text: str,
+    config,
+    plan: AgentPlan,
+    progress=None,
+    run: AgentRun | None = None,
+    input_text: str | None = None,
+):
+    workers = _build_multi_agent_workers(plan, user_text, config)
+    if len(workers) < 2 or not run:
+        return (yield from _execute_agent_plan(thread, user_text, config, plan, progress, run=run, input_text=input_text))
+
+    allowed_tools = _allowed_plan_tools(config)
+    plan = _filter_plan_to_allowed_tools(plan, allowed_tools)
+    base_input = input_text or user_text
+    parent_state = AgentState.from_plan(plan, base_input, run=run, allowed_tools=allowed_tools)
+    parent_state.plan_history.append(_summarize_worker_plan(workers))
+    parent_state.plan_queue = []
+    _sync_agent_run_state(parent_state)
+
+    progress_visible = _multi_agent_progress_visible(config)
+    worker_records = _create_agent_worker_runs(run, workers)
+    progress_queue: queue.Queue[dict[str, str]] = queue.Queue()
+    results: list[AgentWorkerResult] = []
+
+    if progress_visible and progress:
+        for spec in workers:
+            yield _emit_agent_progress(spec.name, "queued", spec.purpose, progress)
+
+    pending_workers = list(workers)
+    worker_inputs = {worker.name: base_input for worker in workers}
+    research_dependency = _sandbox_depends_on_research(plan, workers)
+    if research_dependency:
+        research = next((worker for worker in workers if worker.name == "research"), None)
+        if research:
+            research_result = yield from _run_worker_round(
+                [research],
+                worker_inputs,
+                thread,
+                user_text,
+                config,
+                plan,
+                run,
+                worker_records,
+                progress_queue,
+                progress_visible,
+                progress,
+            )
+            results.extend(research_result)
+            pending_workers = [worker for worker in workers if worker.name != "research"]
+            if research_result:
+                research_input = research_result[0].input_text
+                for worker in pending_workers:
+                    if worker.name == "compute":
+                        worker_inputs[worker.name] = research_input
+
+    results.extend(
+        (yield from _run_worker_round(
+            pending_workers,
+            worker_inputs,
+            thread,
+            user_text,
+            config,
+            plan,
+            run,
+            worker_records,
+            progress_queue,
+            progress_visible,
+            progress,
+        ))
+    )
+
+    results.sort(key=lambda result: _worker_order(workers, result.name))
+    parent_state.task_history = [
+        TaskExecutionRecord(
+            task=AgentPlanStep(result.role, result.purpose),
+            ok=result.ok,
+            input_before=base_input,
+            input_after=result.input_text,
+            result=result.result,
+            error=result.error,
+        )
+        for result in results
+    ]
+    parent_state.input_text = _format_worker_results_for_synthesis(base_input, plan, results)
+
+    finalization = _route_final_output(config, parent_state)
+    _record_replan_decision(parent_state, finalization)
+    if finalization.action == "replace" and finalization.plan_queue:
+        if progress:
+            yield _sse(progress("Final routing: adding validation tasks after worker synthesis."))
+        return (yield from _execute_agent_plan(
+            thread,
+            parent_state.input_text,
+            config,
+            AgentPlan(
+                goal=parent_state.goal,
+                evaluation_criteria=parent_state.evaluation_criteria,
+                summary=_summarize_revised_plan(finalization.plan_queue, "multi-agent final routing"),
+                steps=finalization.plan_queue,
+            ),
+            progress,
+            run=run,
+            input_text=parent_state.input_text,
+        ))
+    if finalization.action == "finish" and finalization.final_message:
+        parent_state.final_message = finalization.final_message
+    _sync_agent_run_state(parent_state)
+    if parent_state.final_message:
+        return {
+            "ok": not any(result.error for result in results),
+            "input_text": parent_state.input_text,
+            "final_message": parent_state.final_message,
+        }
+    return {"ok": True, "input_text": parent_state.input_text, "final_message": ""}
+
+
+def _run_worker_round(
+    workers: list[AgentWorkerSpec],
+    worker_inputs: dict[str, str],
+    thread: Thread,
+    user_text: str,
+    config,
+    plan: AgentPlan,
+    run: AgentRun,
+    worker_records: dict[str, AgentWorkerRun],
+    progress_queue: queue.Queue[dict[str, str]],
+    progress_visible: bool,
+    progress=None,
+):
+    if not workers:
+        return []
+    results: list[AgentWorkerResult] = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(workers), _multi_agent_max_workers(config))) as executor:
+        futures = [
+            executor.submit(
+                _execute_agent_worker,
+                thread,
+                user_text,
+                config,
+                worker_inputs.get(spec.name, user_text),
+                plan,
+                spec,
+                worker_records.get(spec.name),
+                run,
+                progress_queue,
+            )
+            for spec in workers
+        ]
+        pending = set(futures)
+        while pending:
+            while True:
+                try:
+                    item = progress_queue.get_nowait()
+                except queue.Empty:
+                    break
+                _handle_worker_progress(worker_records, item)
+                if progress_visible and progress:
+                    yield _emit_agent_progress(item["agent"], item["status"], item["message"], progress)
+            done, pending = concurrent.futures.wait(pending, timeout=0.05, return_when=concurrent.futures.FIRST_COMPLETED)
+            for future in done:
+                result = future.result()
+                results.append(result)
+                _store_worker_result(run, worker_records.get(result.name), result)
+        while True:
+            try:
+                item = progress_queue.get_nowait()
+            except queue.Empty:
+                break
+            _handle_worker_progress(worker_records, item)
+            if progress_visible and progress:
+                yield _emit_agent_progress(item["agent"], item["status"], item["message"], progress)
+    return results
+
+
+def _sandbox_depends_on_research(plan: AgentPlan, workers: list[AgentWorkerSpec]) -> bool:
+    names = {worker.name for worker in workers}
+    if not {"research", "compute"} <= names:
+        return False
+    tools = [step.tool for step in plan.steps]
+    try:
+        return tools.index("rag") < tools.index("sandbox")
+    except ValueError:
+        return False
+
+
+def _execute_agent_worker(
+    thread: Thread,
+    user_text: str,
+    config,
+    input_text: str,
+    plan: AgentPlan,
+    spec: AgentWorkerSpec,
+    worker_run: AgentWorkerRun | None,
+    run: AgentRun,
+    progress_queue: queue.Queue[dict[str, str]],
+) -> AgentWorkerResult:
+    close_old_connections()
+    try:
+        progress_queue.put({"agent": spec.name, "status": "running", "message": spec.purpose})
+        if not spec.steps:
+            result = AgentWorkerResult(
+                name=spec.name,
+                role=spec.role,
+                purpose=spec.purpose,
+                ok=True,
+                input_text=input_text,
+                result="Ready to review worker outputs during synthesis.",
+            )
+            progress_queue.put({"agent": spec.name, "status": "complete", "message": "ready for synthesis"})
+            return result
+
+        worker_input = input_text
+        final_message = ""
+        ok = True
+        result_parts: list[str] = []
+        task_records: list[dict[str, str]] = []
+        plan_trace = [
+            f"Agent worker: {spec.name}",
+            f"Worker role: {spec.role}",
+            f"Worker purpose: {spec.purpose}",
+            f"Parent goal: {plan.goal}",
+        ]
+
+        def worker_progress(message: str) -> dict[str, object]:
+            progress_queue.put({"agent": spec.name, "status": "running", "message": message})
+            return {}
+
+        for step in spec.steps:
+            input_before = worker_input
+            outcome = _consume_generator(
+                _execute_agent_task(thread, user_text, config, worker_input, list(plan_trace), step, plan.rag_query, worker_progress)
+            )
+            worker_input = str(outcome["input_text"])
+            final_message = str(outcome["final_message"])
+            step_ok = bool(outcome["ok"])
+            ok = ok and step_ok
+            result_parts.append(final_message or f"{step.tool} completed")
+            task_records.append(
+                {
+                    "tool": step.tool,
+                    "purpose": step.purpose,
+                    "status": "ok" if step_ok else "error",
+                    "input_before": input_before,
+                    "input_after": worker_input,
+                    "result": final_message or "completed",
+                    "error": "" if step_ok else final_message,
+                }
+            )
+        result_text = "\n\n".join(part for part in result_parts if part).strip() or "completed"
+        error = "" if ok else result_text
+        progress_queue.put({"agent": spec.name, "status": "complete" if ok else "error", "message": result_text[:240]})
+        return AgentWorkerResult(spec.name, spec.role, spec.purpose, ok, worker_input, result_text, error, tuple(task_records))
+    except Exception as exc:
+        error = str(exc)
+        progress_queue.put({"agent": spec.name, "status": "error", "message": error[:240]})
+        return AgentWorkerResult(spec.name, spec.role, spec.purpose, False, input_text, "", error)
+    finally:
+        close_old_connections()
+
+
+def _consume_generator(generator):
+    while True:
+        try:
+            next(generator)
+        except StopIteration as exc:
+            return exc.value
+
+
+def _create_agent_worker_runs(run: AgentRun, specs: list[AgentWorkerSpec]) -> dict[str, AgentWorkerRun]:
+    records: dict[str, AgentWorkerRun] = {}
+    for spec in specs:
+        records[spec.name] = AgentWorkerRun.objects.create(
+            run=run,
+            name=spec.name,
+            role=spec.role,
+            purpose=spec.purpose,
+            status="queued",
+        )
+    return records
+
+
+def _handle_worker_progress(worker_records: dict[str, AgentWorkerRun], item: dict[str, str]) -> None:
+    status = item.get("status", "")
+    if status != "running":
+        return
+    worker = worker_records.get(item.get("agent", ""))
+    if worker and worker.status == "queued":
+        _update_worker_run(worker, "running", started=True)
+
+
+def _store_worker_result(run: AgentRun, worker: AgentWorkerRun | None, result: AgentWorkerResult) -> None:
+    _update_worker_run(
+        worker,
+        "complete" if result.ok else "error",
+        result=result.result if result.ok else "",
+        error=result.error,
+        finished=True,
+    )
+    for item in result.task_records:
+        _create_agent_task_record(
+            run,
+            TaskExecutionRecord(
+                task=AgentPlanStep(str(item.get("tool", "")), str(item.get("purpose", ""))),
+                ok=item.get("status") == "ok",
+                input_before=str(item.get("input_before", "")),
+                input_after=str(item.get("input_after", "")),
+                result=str(item.get("result", "")),
+                error=str(item.get("error", "")),
+            ),
+            worker=worker,
+        )
+
+
+def _update_worker_run(
+    worker: AgentWorkerRun | None,
+    status: str,
+    *,
+    result: str = "",
+    error: str = "",
+    started: bool = False,
+    finished: bool = False,
+) -> None:
+    if not worker:
+        return
+    fields = ["status", "updated_at"]
+    worker.status = status
+    if result:
+        worker.result = _truncate_db_text(result)
+        fields.append("result")
+    if error:
+        worker.error = _truncate_db_text(error)
+        fields.append("error")
+    now = timezone.now()
+    if started:
+        worker.started_at = now
+        fields.append("started_at")
+    if finished:
+        worker.finished_at = now
+        fields.append("finished_at")
+    worker.save(update_fields=fields)
+
+
+def _format_worker_results_for_synthesis(input_text: str, plan: AgentPlan, results: list[AgentWorkerResult]) -> str:
+    instructions = load_prompt("multi_agent_synthesis_instructions.txt")
+    lines = [
+        instructions,
+        "",
+        "Original request and conversation context:",
+        input_text,
+        "",
+        "Multi-agent goal:",
+        plan.goal,
+        "",
+        "Evaluation criteria:",
+        *[f"- {criterion}" for criterion in plan.evaluation_criteria],
+        "",
+        "Worker results:",
+    ]
+    for result in results:
+        status = "ok" if result.ok else "error"
+        body = result.result or result.error or "(no result)"
+        lines.append(f"\n[{result.name}] role={result.role}; status={status}; purpose={result.purpose}\n{body}")
+    return "\n".join(lines)
+
+
+def _summarize_worker_plan(workers: list[AgentWorkerSpec]) -> str:
+    return "multi-agent: " + ", ".join(f"{worker.name}({worker.role})" for worker in workers)
+
+
+def _worker_order(workers: list[AgentWorkerSpec], name: str) -> int:
+    for index, worker in enumerate(workers):
+        if worker.name == name:
+            return index
+    return len(workers)
 
 
 def _execute_agent_plan(

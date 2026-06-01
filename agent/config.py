@@ -278,6 +278,30 @@ class RuntimeConfig:
         except (TypeError, ValueError):
             return 20
 
+    @property
+    def multi_agent(self) -> dict[str, Any]:
+        value = self.values.get("multi_agent", {})
+        return value if isinstance(value, dict) else {}
+
+    @property
+    def multi_agent_enabled(self) -> bool:
+        return _as_bool(self.multi_agent.get("enabled", True))
+
+    @property
+    def multi_agent_max_workers(self) -> int:
+        try:
+            return max(1, min(5, int(self.multi_agent.get("max_workers", 3))))
+        except (TypeError, ValueError):
+            return 3
+
+    @property
+    def multi_agent_parallel_tools(self) -> bool:
+        return _as_bool(self.multi_agent.get("parallel_tools", True))
+
+    @property
+    def multi_agent_progress_visible(self) -> bool:
+        return _as_bool(self.multi_agent.get("progress_visible", True))
+
     def redacted(self) -> dict[str, Any]:
         safe = _redact_sensitive(self.values)
         if os.environ.get("OPENAI_API_KEY") and not any(k in self.values for k in SENSITIVE_KEYS):

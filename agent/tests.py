@@ -10,11 +10,12 @@ from django.urls import reverse
 from .access import is_path_allowed, normalize_access_path
 from .config import RuntimeConfig, load_runtime_config
 from .openai_client import stream_response
-from .models import AgentRun, AgentTaskRecord, AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
+from .models import AgentRun, AgentTaskRecord, AgentWorkerRun, AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .tooling import (
     AgentPlan,
     AgentPlanStep,
     SandboxResult,
+    build_agent_worker_specs,
     _parse_typed_sandbox_output,
     _prepend_sandbox_runtime_prelude,
     _prepend_sandbox_datasets,
@@ -35,6 +36,7 @@ from .views import (
     _generate_sandbox_code_with_retries,
     _control_config_max_output_tokens,
     _initial_clarifier_max_output_tokens,
+    _multi_agent_enabled,
     _parse_plan_tasks,
     _persist_sandbox_artifacts,
     _request_initial_clarification_if_needed,
@@ -43,6 +45,7 @@ from .views import (
     _sandbox_datasets_from_rag_context,
     _strip_sandbox_artifact_payloads,
     _build_instructions,
+    _execute_multi_agent_plan,
 )
 from .views import AgentState, TaskExecutionRecord, _execute_agent_plan, _replan_after_step, _route_final_output
 
@@ -363,6 +366,31 @@ class ConfigTests(TestCase):
             self.assertEqual(config.final_evaluation_max_output_tokens, 96)
             self.assertEqual(config.final_evaluation_reasoning_effort, "minimal")
 
+    def test_multi_agent_config_defaults_and_clamps_workers(self):
+        self.assertTrue(RuntimeConfig(values={}, sources=[]).multi_agent_enabled)
+        config = RuntimeConfig(
+            values={
+                "multi_agent": {
+                    "enabled": True,
+                    "max_workers": 9,
+                    "parallel_tools": False,
+                    "progress_visible": False,
+                }
+            },
+            sources=[],
+        )
+
+        self.assertTrue(config.multi_agent_enabled)
+        self.assertEqual(config.multi_agent_max_workers, 5)
+        self.assertFalse(config.multi_agent_parallel_tools)
+        self.assertFalse(config.multi_agent_progress_visible)
+
+    def test_multi_agent_can_be_disabled_for_sequential_fallback(self):
+        config = RuntimeConfig(values={"multi_agent": {"enabled": False}}, sources=[])
+
+        self.assertFalse(config.multi_agent_enabled)
+        self.assertFalse(_multi_agent_enabled(config))
+
 
 @override_settings(STATICFILES_DIRS=[])
 class ChatFlowTests(TestCase):
@@ -661,6 +689,115 @@ class ChatFlowTests(TestCase):
         replacement = Thread.objects.get(project=self.project)
         self.assertEqual(replacement.title, "Main thread")
         self.assertEqual(response.url, reverse("thread", args=[replacement.id]))
+
+    def test_agent_worker_run_cascades_and_task_record_can_link_worker(self):
+        user = Message.objects.create(thread=self.thread, role="user", content="work")
+        assistant = Message.objects.create(thread=self.thread, role="assistant", content="")
+        run = AgentRun.objects.create(
+            thread=self.thread,
+            user_message=user,
+            assistant_message=assistant,
+            goal="goal",
+        )
+        worker = AgentWorkerRun.objects.create(run=run, name="research", role="research", purpose="Search")
+        AgentTaskRecord.objects.create(
+            run=run,
+            worker=worker,
+            sequence=1,
+            tool="rag",
+            purpose="Search",
+            status="ok",
+        )
+
+        self.assertEqual(run.worker_runs.get(), worker)
+        self.assertEqual(AgentTaskRecord.objects.get(run=run).worker, worker)
+        run.delete()
+        self.assertFalse(AgentWorkerRun.objects.filter(id=worker.id).exists())
+
+    def test_build_agent_worker_specs_splits_rag_sandbox_and_verify(self):
+        plan = AgentPlan(
+            goal="Answer",
+            evaluation_criteria=[],
+            summary="rag -> sandbox -> final",
+            steps=[
+                AgentPlanStep("rag", "Find context."),
+                AgentPlanStep("sandbox", "Compute."),
+                AgentPlanStep("final", "Answer."),
+            ],
+        )
+
+        workers = build_agent_worker_specs(plan, max_workers=3, parallel_tools=True)
+
+        self.assertEqual([worker.name for worker in workers], ["research", "compute", "verify"])
+        self.assertEqual([step.tool for step in workers[0].steps], ["rag"])
+        self.assertEqual([step.tool for step in workers[1].steps], ["sandbox"])
+
+    @patch("agent.views._execute_agent_task")
+    def test_multi_agent_execution_records_workers_and_synthesizes_results(self, mock_execute_task):
+        class Config:
+            multi_agent_enabled = True
+            multi_agent_max_workers = 3
+            multi_agent_parallel_tools = True
+            multi_agent_progress_visible = True
+
+            def tool_enabled(self, name, default=False):
+                return name in {"rag", "sandbox"}
+
+        sandbox_inputs = []
+
+        def fake_execute_task(thread, user_text, config, input_text, plan_trace, step, preferred_rag_query="", progress=None):
+            if progress:
+                yield ""
+            if step.tool == "rag":
+                return {"ok": True, "input_text": input_text + "\nRAG context", "final_message": ""}
+            sandbox_inputs.append(input_text)
+            return {"ok": True, "input_text": input_text, "final_message": "Sandbox実行結果: 成功\n\n```text\n4\n```"}
+
+        mock_execute_task.side_effect = fake_execute_task
+        user = Message.objects.create(thread=self.thread, role="user", content="numbers")
+        assistant = Message.objects.create(thread=self.thread, role="assistant", content="")
+        plan = AgentPlan(
+            goal="Answer numbers",
+            evaluation_criteria=["Use worker results."],
+            summary="rag -> sandbox -> final",
+            steps=[
+                AgentPlanStep("rag", "Find context."),
+                AgentPlanStep("sandbox", "Compute."),
+                AgentPlanStep("final", "Answer."),
+            ],
+        )
+        run = AgentRun.objects.create(
+            thread=self.thread,
+            user_message=user,
+            assistant_message=assistant,
+            goal=plan.goal,
+            initial_plan_summary=plan.summary,
+        )
+        events = []
+
+        def progress(message):
+            events.append(message)
+            return {"progress": message, "progress_tail": events[-3:]}
+
+        runner = _execute_multi_agent_plan(self.thread, "numbers", Config(), plan, progress, run=run, input_text="numbers")
+        result = None
+        chunks = []
+        while True:
+            try:
+                chunks.append(next(runner))
+            except StopIteration as exc:
+                result = exc.value
+                break
+
+        self.assertTrue(result["ok"])
+        self.assertIn("Worker results:", result["input_text"])
+        self.assertIn("[research]", result["input_text"])
+        self.assertIn("[compute]", result["input_text"])
+        self.assertIn('"agent": "research"', "".join(chunks))
+        self.assertIn('"agent_status": "running"', "".join(chunks))
+        self.assertEqual(sandbox_inputs, ["numbers\nRAG context"])
+        self.assertEqual(AgentWorkerRun.objects.filter(run=run).count(), 3)
+        self.assertEqual(AgentTaskRecord.objects.filter(run=run, worker__isnull=False).count(), 2)
 
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
@@ -1308,6 +1445,17 @@ class ChatFlowTests(TestCase):
 
         self.assertEqual(stdout, "chart ready")
         self.assertEqual(artifacts[0]["path"], "chart.png")
+
+    def test_typed_sandbox_output_parser_accepts_top_level_stdout_artifacts(self):
+        payload = {
+            "stdout": "分析結果\n平均値: 79.50点",
+            "artifacts": [],
+        }
+
+        stdout, artifacts = _parse_typed_sandbox_output(json.dumps(payload, ensure_ascii=False))
+
+        self.assertEqual(stdout, "分析結果\n平均値: 79.50点")
+        self.assertEqual(artifacts, [])
 
     def test_typed_sandbox_output_parser_extracts_embedded_payload(self):
         payload = {

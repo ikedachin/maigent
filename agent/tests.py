@@ -2,7 +2,7 @@ import base64
 import json
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from django.test import TestCase, override_settings
 from django.urls import reverse
@@ -28,23 +28,29 @@ from .tooling import (
     run_sandbox,
     select_tool,
 )
+from .applications.rag import (
+    _collect_candidate_documents,
+    _extract_attachment_paths,
+    _format_file_list_for_display,
+    _search_terms,
+)
+from .applications.planning import _initial_clarifier_max_output_tokens, _parse_plan_tasks
+from .applications.llm_helpers import _control_config_max_output_tokens, _final_evaluation_max_output_tokens
+from .applications.sandbox import (
+    _generate_sandbox_code_with_retries,
+    _sandbox_code_policy_violation,
+    _strip_sandbox_artifact_payloads,
+)
 from .views import (
     _allowed_plan_tools,
     _avoid_failed_plan,
     _evaluate_final_answer,
-    _final_evaluation_max_output_tokens,
-    _generate_sandbox_code_with_retries,
-    _control_config_max_output_tokens,
-    _initial_clarifier_max_output_tokens,
     _multi_agent_enabled,
-    _parse_plan_tasks,
     _persist_sandbox_artifacts,
     _request_initial_clarification_if_needed,
-    _sandbox_code_policy_violation,
     _serialize_plan_queue,
-    _sandbox_datasets_from_rag_context,
-    _strip_sandbox_artifact_payloads,
     _build_instructions,
+    _build_file_batch_input,
     _execute_multi_agent_plan,
 )
 from .views import AgentState, TaskExecutionRecord, _execute_agent_plan, _replan_after_step, _route_final_output
@@ -204,6 +210,9 @@ class ConfigTests(TestCase):
                         "    enabled: true",
                         "    image: python:3.12-slim",
                         "    timeout_seconds: 300",
+                        "    memory_limit_mb: 1024",
+                        "    pids_limit: 256",
+                        "    cpus: 2",
                         "    install_libraries_on_run: true",
                         "    allowed_libraries:",
                         "      - numpy",
@@ -239,6 +248,9 @@ class ConfigTests(TestCase):
             self.assertTrue(config.tool_enabled("sandbox"))
             self.assertEqual(config.sandbox_image, "python:3.12-slim")
             self.assertEqual(config.sandbox_timeout_seconds, 300)
+            self.assertEqual(config.sandbox_memory_limit_mb, 1024)
+            self.assertEqual(config.sandbox_pids_limit, 256)
+            self.assertEqual(config.sandbox_cpus, 2.0)
             self.assertTrue(config.sandbox_install_libraries_on_run)
             self.assertEqual(config.sandbox_allowed_libraries, ["numpy", "pandas"])
             self.assertTrue(config.final_evaluation_enabled)
@@ -255,8 +267,49 @@ class ConfigTests(TestCase):
             self.assertEqual(config.control_config("initial_clarifier")["llm_max_retries"], 2)
             self.assertEqual(config.final_evaluation["llm_max_retries"], 2)
             self.assertEqual(config.control_config("dynamic_replanner")["llm_max_retries"], 2)
-            self.assertEqual(config.enabled_tool_names, {"rag", "sandbox"})
+            self.assertEqual(config.enabled_tool_names, {"rag", "file_batch", "sandbox"})
+            self.assertTrue(config.tool_enabled("file_batch"))
             self.assertFalse(config.tool_enabled("web_search"))
+
+    def test_runtime_config_sandbox_resource_limits_default_and_clamp(self):
+        default_config = RuntimeConfig(values={}, sources=[])
+
+        self.assertEqual(default_config.sandbox_memory_limit_mb, 512)
+        self.assertEqual(default_config.sandbox_pids_limit, 128)
+        self.assertEqual(default_config.sandbox_cpus, 1.0)
+
+        clamped_config = RuntimeConfig(
+            values={"tools": {"sandbox": {"memory_limit_mb": 999999, "pids_limit": 999999, "cpus": 999}}},
+            sources=[],
+        )
+
+        self.assertEqual(clamped_config.sandbox_memory_limit_mb, 8192)
+        self.assertEqual(clamped_config.sandbox_pids_limit, 2048)
+        self.assertEqual(clamped_config.sandbox_cpus, 8.0)
+
+    def test_runtime_config_web_search_settings_default_and_clamp(self):
+        default_config = RuntimeConfig(values={}, sources=[])
+
+        self.assertEqual(default_config.web_search_api_key, "")
+        self.assertEqual(default_config.web_search_max_results, 5)
+        self.assertEqual(default_config.web_search_timeout_seconds, 10)
+
+        configured = RuntimeConfig(
+            values={"tools": {"web_search": {"api_key": "tvly-abc", "max_results": 999, "timeout_seconds": 999}}},
+            sources=[],
+        )
+
+        self.assertEqual(configured.web_search_api_key, "tvly-abc")
+        self.assertEqual(configured.web_search_max_results, 10)
+        self.assertEqual(configured.web_search_timeout_seconds, 30)
+
+    def test_runtime_config_web_search_api_key_falls_back_to_env(self):
+        import os
+
+        config = RuntimeConfig(values={"tools": {"web_search": {}}}, sources=[])
+
+        with patch.dict(os.environ, {"TAVILY_API_KEY": "tvly-env-key"}):
+            self.assertEqual(config.web_search_api_key, "tvly-env-key")
 
     def test_runtime_config_tools_must_be_declared_in_yaml_tools(self):
         config = RuntimeConfig(values={"tools": {"sandbox": {"enabled": True}}}, sources=[])
@@ -265,6 +318,16 @@ class ConfigTests(TestCase):
         self.assertTrue(config.tool_enabled("sandbox"))
         self.assertFalse(config.tool_enabled("rag", default=True))
         self.assertFalse(config.tool_enabled("web_search", default=True))
+        self.assertFalse(config.tool_enabled("file_batch", default=True))
+
+    def test_runtime_config_enables_file_batch_with_existing_rag_config(self):
+        config = RuntimeConfig(values={"tools": {"rag": {"enabled": True}}}, sources=[])
+        disabled = RuntimeConfig(values={"tools": {"rag": {"enabled": True}, "file_batch": {"enabled": False}}}, sources=[])
+
+        self.assertTrue(config.tool_enabled("file_batch"))
+        self.assertIn("file_batch", config.enabled_tool_names)
+        self.assertFalse(disabled.tool_enabled("file_batch"))
+        self.assertNotIn("file_batch", disabled.enabled_tool_names)
 
     def test_initial_clarifier_max_output_tokens_defaults_to_8192_and_uses_config_value(self):
         default_config = RuntimeConfig(values={}, sources=[])
@@ -732,6 +795,22 @@ class ChatFlowTests(TestCase):
         self.assertEqual([step.tool for step in workers[0].steps], ["rag"])
         self.assertEqual([step.tool for step in workers[1].steps], ["sandbox"])
 
+    def test_build_agent_worker_specs_includes_file_batch_worker(self):
+        plan = AgentPlan(
+            goal="Answer",
+            evaluation_criteria=[],
+            summary="file_batch -> final",
+            steps=[
+                AgentPlanStep("file_batch", "Summarize files."),
+                AgentPlanStep("final", "Answer."),
+            ],
+        )
+
+        workers = build_agent_worker_specs(plan, max_workers=3, parallel_tools=True)
+
+        self.assertEqual([worker.name for worker in workers], ["file_batch"])
+        self.assertEqual([step.tool for step in workers[0].steps], ["file_batch"])
+
     @patch("agent.views._execute_agent_task")
     def test_multi_agent_execution_records_workers_and_synthesizes_results(self, mock_execute_task):
         class Config:
@@ -798,6 +877,73 @@ class ChatFlowTests(TestCase):
         self.assertEqual(sandbox_inputs, ["numbers\nRAG context"])
         self.assertEqual(AgentWorkerRun.objects.filter(run=run).count(), 3)
         self.assertEqual(AgentTaskRecord.objects.filter(run=run, worker__isnull=False).count(), 2)
+
+    @patch("agent.applications.file_batch._complete_response_with_retries")
+    def test_file_batch_builds_map_reduce_context_for_allowed_folder(self, mock_complete):
+        class Config:
+            multi_agent_enabled = False
+            multi_agent_parallel_tools = False
+            multi_agent_max_workers = 3
+
+            def tool_enabled(self, name, default=False):
+                return name == "file_batch"
+
+        with TemporaryDirectory() as tmp_dir:
+            root = Path(tmp_dir).resolve()
+            (root / "alpha.txt").write_text("Alpha project notes.\nDetails.", encoding="utf-8")
+            (root / "beta.md").write_text("# Beta\nRelease checklist.", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_complete.return_value = json.dumps(
+                [
+                    {"path": str(root / "alpha.txt"), "summary": "Alphaのメモです。", "status": "ok"},
+                    {"path": str(root / "beta.md"), "summary": "Betaのチェックリストです。", "status": "ok"},
+                ],
+                ensure_ascii=False,
+            )
+
+            runner = _build_file_batch_input(
+                self.thread,
+                "フォルダの中のファイル名と一言要約を表にしてください",
+                Config(),
+                "answer base",
+            )
+            result = None
+            while True:
+                try:
+                    next(runner)
+                except StopIteration as exc:
+                    result = exc.value
+                    break
+
+        self.assertTrue(result.ok)
+        self.assertIn("File batch map-reduce context", result.input_text)
+        self.assertIn("Alphaのメモです。", result.input_text)
+        self.assertIn("Betaのチェックリストです。", result.input_text)
+        self.assertIn('"map_batches": 1', result.input_text)
+        self.assertEqual(len(result.paths), 2)
+        self.assertTrue(any(path.endswith("alpha.txt") for path in result.paths))
+        self.assertTrue(any(path.endswith("beta.md") for path in result.paths))
+        mock_complete.assert_called_once()
+
+    def test_extract_attachment_paths_reads_known_prefixes(self):
+        attachments = [
+            "File: /allowed/root/a.txt\n```text\ncontent\n```",
+            "Folder: /allowed/root\n[file] a.txt",
+            "Auto-selected file: /allowed/root/b.csv\n```text\ncontent\n```",
+            "Unrelated block with no recognized prefix",
+        ]
+
+        paths = _extract_attachment_paths(attachments)
+
+        self.assertEqual(paths, ("/allowed/root/a.txt", "/allowed/root", "/allowed/root/b.csv"))
+
+    def test_format_file_list_for_display_truncates_with_remainder(self):
+        paths = tuple(f"/allowed/root/file{i}.txt" for i in range(7))
+
+        display = _format_file_list_for_display(paths, limit=5)
+
+        self.assertEqual(display, "file0.txt, file1.txt, file2.txt, file3.txt, file4.txt, +2 more")
+        self.assertEqual(_format_file_list_for_display(()), "")
 
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
@@ -900,7 +1046,7 @@ class ChatFlowTests(TestCase):
         self.assertEqual(input_text.count("それを使って答えて"), 1)
         self.assertNotIn("pending", input_text)
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_initial_clarifier_returns_questions_before_planning(self, mock_config, mock_stream, mock_complete):
@@ -943,7 +1089,7 @@ class ChatFlowTests(TestCase):
         self.assertEqual(mock_complete.call_args.kwargs["max_output_tokens"], 192)
         self.assertEqual(mock_complete.call_args.kwargs["reasoning_effort"], "none")
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_initial_clarifier_allows_planning_when_no_clarification_needed(self, mock_config, mock_stream, mock_complete):
@@ -972,7 +1118,7 @@ class ChatFlowTests(TestCase):
         mock_stream.assert_called_once()
         self.assertEqual(mock_complete.call_count, 1)
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_initial_clarifier_falls_back_on_invalid_or_empty_question_response(self, mock_config, mock_stream, mock_complete):
@@ -999,7 +1145,7 @@ class ChatFlowTests(TestCase):
         self.assertIn("fallback answer", body)
         mock_stream.assert_called_once()
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     def test_initial_clarifier_skips_obvious_actionable_tool_plan(self, mock_complete):
         class Config:
             initial_clarifier = {"enabled": True}
@@ -1016,7 +1162,7 @@ class ChatFlowTests(TestCase):
         self.assertIsNone(decision)
         mock_complete.assert_not_called()
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_final_evaluation_retries_from_plan_when_inadequate(self, mock_config, mock_stream, mock_complete):
@@ -1065,7 +1211,7 @@ class ChatFlowTests(TestCase):
         self.assertEqual(mock_complete.call_args_list[1].kwargs["max_output_tokens"], 80)
         self.assertEqual(mock_complete.call_args_list[1].kwargs["reasoning_effort"], "minimal")
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_final_evaluation_receives_rag_context_when_rag_was_used(self, mock_config, mock_stream, mock_complete):
@@ -1103,7 +1249,7 @@ class ChatFlowTests(TestCase):
         self.assertIn("alpha is a sealed book", evaluation_prompt)
         self.assertIn("Candidate answer:", evaluation_prompt)
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_final_evaluation_empty_response_keeps_current_answer(self, mock_config, mock_stream, mock_complete):
@@ -1138,7 +1284,7 @@ class ChatFlowTests(TestCase):
         assistant = Message.objects.get(id=payload["assistant_id"])
         self.assertEqual(assistant.content, "current answer")
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     def test_final_evaluation_does_not_pass_incomplete_json(self, mock_complete):
         class Config:
             final_evaluation_max_output_tokens = 80
@@ -1197,6 +1343,35 @@ class ChatFlowTests(TestCase):
         self.assertEqual(revised.goal, plan.goal)
         self.assertEqual(revised.evaluation_criteria, plan.evaluation_criteria)
         self.assertEqual([step.tool for step in revised.steps], ["rag"])
+
+    def test_failed_local_file_plan_keeps_local_context_in_final_fallback(self):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return name in {"rag", "file_batch"} or default
+
+        plan = AgentPlan(
+            goal="Answer the user's request: merge files",
+            evaluation_criteria=["The answer uses allowed local files."],
+            summary="rag -> file_batch -> sandbox -> final",
+            steps=[
+                AgentPlanStep("rag", "Search context."),
+                AgentPlanStep("file_batch", "Process files."),
+                AgentPlanStep("sandbox", "Create artifact."),
+            ],
+        )
+        failed = [
+            plan.summary,
+            "rag -> file_batch -> final (without sandbox)",
+            "rag -> file_batch -> sandbox -> final (with added rag)",
+        ]
+
+        revised = _avoid_failed_plan(plan, Config(), failed)
+
+        self.assertNotEqual(revised.summary, plan.summary)
+        self.assertEqual(revised.goal, plan.goal)
+        self.assertEqual(revised.evaluation_criteria, plan.evaluation_criteria)
+        self.assertEqual([step.tool for step in revised.steps], ["file_batch", "final"])
+        self.assertIn("local file context", revised.summary)
 
     @patch("agent.views.run_sandbox")
     @patch("agent.views.load_runtime_config")
@@ -1314,7 +1489,7 @@ class ChatFlowTests(TestCase):
             self.assertEqual(output_path.read_text(encoding="utf-8"), "artifact\n")
 
     @patch("agent.views.run_sandbox")
-    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.applications.sandbox.generate_sandbox_code")
     @patch("agent.views.load_runtime_config")
     def test_sandbox_image_artifact_base64_is_saved_and_linked(self, mock_config, mock_generate_sandbox_code, mock_run_sandbox):
         class Config:
@@ -1376,7 +1551,7 @@ class ChatFlowTests(TestCase):
             self.assertEqual(image_response["Content-Type"], "image/png")
 
     @patch("agent.views.run_sandbox")
-    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.applications.sandbox.generate_sandbox_code")
     @patch("agent.views.load_runtime_config")
     def test_typed_sandbox_image_artifact_is_saved_without_raw_json_in_message(
         self,
@@ -1497,7 +1672,7 @@ class ChatFlowTests(TestCase):
         self.assertEqual(artifacts[0]["content_base64"], base64.b64encode(b"png").decode("ascii"))
 
     @patch("agent.views.run_sandbox")
-    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.applications.sandbox.generate_sandbox_code")
     @patch("agent.views.load_runtime_config")
     def test_sandbox_image_artifact_link_handles_spaces(self, mock_config, mock_generate_sandbox_code, mock_run_sandbox):
         class Config:
@@ -1673,6 +1848,50 @@ class ChatFlowTests(TestCase):
         self.assertNotIn("pip install", command[-1])
 
     @patch("agent.tooling.subprocess.run")
+    def test_sandbox_applies_configured_resource_limits(self, mock_run):
+        class Config:
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+            sandbox_memory_limit_mb = 256
+            sandbox_pids_limit = 64
+            sandbox_cpus = 0.5
+
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = "6\n"
+        mock_run.return_value.stderr = ""
+
+        result = run_sandbox("1, 2, 3 の合計を正確に計算して", Config())
+
+        self.assertTrue(result.ok)
+        command = mock_run.call_args.args[0]
+        self.assertIn("--memory", command)
+        self.assertEqual(command[command.index("--memory") + 1], "256m")
+        self.assertIn("--pids-limit", command)
+        self.assertEqual(command[command.index("--pids-limit") + 1], "64")
+        self.assertIn("--cpus", command)
+        self.assertEqual(command[command.index("--cpus") + 1], "0.5")
+
+    @patch("agent.tooling.subprocess.run")
+    def test_sandbox_defaults_resource_limits_when_config_omits_them(self, mock_run):
+        class Config:
+            sandbox_allowed_libraries = []
+            sandbox_image = "python:3.11-slim"
+            sandbox_timeout_seconds = 20
+
+        mock_run.return_value.returncode = 0
+        mock_run.return_value.stdout = "6\n"
+        mock_run.return_value.stderr = ""
+
+        result = run_sandbox("1, 2, 3 の合計を正確に計算して", Config())
+
+        self.assertTrue(result.ok)
+        command = mock_run.call_args.args[0]
+        self.assertEqual(command[command.index("--memory") + 1], "512m")
+        self.assertEqual(command[command.index("--pids-limit") + 1], "128")
+        self.assertEqual(command[command.index("--cpus") + 1], "1.0")
+
+    @patch("agent.tooling.subprocess.run")
     def test_sandbox_generates_program_from_rag_numeric_context(self, mock_run):
         class Config:
             sandbox_allowed_libraries = []
@@ -1829,7 +2048,7 @@ class ChatFlowTests(TestCase):
         self.assertIn("matplotlib.rcParams['font.family']", script)
         self.assertIn("matplotlib.rcParams['axes.unicode_minus'] = False", script)
 
-    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.applications.sandbox.generate_sandbox_code")
     def test_sandbox_code_generation_retries_after_policy_rejection(self, mock_generate_sandbox_code):
         class Config:
             sandbox_code_generation = {"llm_max_retries": 1}
@@ -2095,6 +2314,15 @@ class ChatFlowTests(TestCase):
         self.assertIn(evaluation_criterion("summary"), plan.evaluation_criteria)
         self.assertIn(evaluation_criterion("list"), plan.evaluation_criteria)
 
+    def test_agent_plan_uses_file_batch_for_folder_wide_summary(self):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return name in {"file_batch", "rag"}
+
+        plan = build_agent_plan("フォルダの中のすべてのファイル名と一言要約を表にしてください", Config())
+
+        self.assertEqual([step.tool for step in plan.steps], ["file_batch"])
+
     def test_tool_selection_prefers_sandbox_for_calculation_when_enabled(self):
         class Config:
             def tool_enabled(self, name, default=False):
@@ -2131,7 +2359,7 @@ class ChatFlowTests(TestCase):
 
         self.assertEqual([step.tool for step in plan.steps], ["rag", "sandbox"])
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     def test_dynamic_replanner_can_replace_remaining_queue(self, mock_complete):
         class Config:
             dynamic_replanner = {
@@ -2177,7 +2405,7 @@ class ChatFlowTests(TestCase):
         self.assertEqual(mock_complete.call_args.kwargs["max_output_tokens"], 128)
         self.assertEqual(mock_complete.call_args.kwargs["reasoning_effort"], "medium")
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     def test_dynamic_finalizer_can_add_validation_tasks(self, mock_complete):
         class Config:
             dynamic_finalizer = {
@@ -2215,8 +2443,8 @@ class ChatFlowTests(TestCase):
         self.assertEqual(mock_complete.call_args.kwargs["reasoning_effort"], "minimal")
 
     @patch("agent.views.run_sandbox")
-    @patch("agent.views.generate_sandbox_code")
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.sandbox.generate_sandbox_code")
+    @patch("agent.applications.llm_helpers.complete_response")
     def test_dynamic_finalizer_added_sandbox_task_is_executed(self, mock_complete, mock_generate_code, mock_run_sandbox):
         class Config:
             sandbox_allowed_libraries = []
@@ -2263,7 +2491,7 @@ class ChatFlowTests(TestCase):
         self.assertEqual(mock_complete.call_args_list[0].kwargs["reasoning_effort"], "minimal")
 
     @patch("agent.views.run_sandbox")
-    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.applications.sandbox.generate_sandbox_code")
     def test_generated_sandbox_code_is_passed_directly_to_runner(self, mock_generate_code, mock_run_sandbox):
         class Config:
             sandbox_allowed_libraries = []
@@ -2306,9 +2534,8 @@ class ChatFlowTests(TestCase):
         self.assertIn("Sandbox実行結果: 成功", result["final_message"])
         self.assertEqual(mock_run_sandbox.call_args.kwargs["code"], "print('computed')")
 
-    @patch("agent.views.run_sandbox")
-    @patch("agent.views.generate_sandbox_code")
-    def test_generated_sandbox_code_retries_after_runtime_error(self, mock_generate_code, mock_run_sandbox):
+    @patch("agent.applications.sandbox.generate_sandbox_code")
+    def test_generated_sandbox_code_retries_after_runtime_error(self, mock_generate_code):
         class Config:
             sandbox_allowed_libraries = []
             sandbox_image = "python:3.11-slim"
@@ -2322,10 +2549,15 @@ class ChatFlowTests(TestCase):
             "json",
             "import json\nprint(json.dumps({'maigent_sandbox_result': {'stdout': 'ok', 'artifacts': []}}))",
         ]
-        mock_run_sandbox.side_effect = [
-            SandboxResult(False, "Traceback (most recent call last):\nNameError: name 'json' is not defined"),
-            SandboxResult(True, "ok"),
-        ]
+        # run_sandbox is imported independently into both agent.views and
+        # agent.applications.sandbox (the retry-after-failure path lives there),
+        # so both call sites must share one Mock to see a consistent call sequence.
+        mock_run_sandbox = Mock(
+            side_effect=[
+                SandboxResult(False, "Traceback (most recent call last):\nNameError: name 'json' is not defined"),
+                SandboxResult(True, "ok"),
+            ]
+        )
         input_text = "テスト結果のヒストグラムを作成してください。"
         plan = AgentPlan(
             goal="Create a histogram.",
@@ -2334,14 +2566,15 @@ class ChatFlowTests(TestCase):
             steps=[AgentPlanStep("sandbox", "Create histogram.")],
         )
 
-        runner = _execute_agent_plan(self.thread, input_text, Config(), plan)
-        result = None
-        while True:
-            try:
-                next(runner)
-            except StopIteration as exc:
-                result = exc.value
-                break
+        with patch("agent.views.run_sandbox", mock_run_sandbox), patch("agent.applications.sandbox.run_sandbox", mock_run_sandbox):
+            runner = _execute_agent_plan(self.thread, input_text, Config(), plan)
+            result = None
+            while True:
+                try:
+                    next(runner)
+                except StopIteration as exc:
+                    result = exc.value
+                    break
 
         self.assertTrue(result["ok"])
         self.assertIn("Sandbox実行結果: 成功", result["final_message"])
@@ -2351,7 +2584,7 @@ class ChatFlowTests(TestCase):
         self.assertIn("NameError: name 'json' is not defined", mock_generate_code.call_args_list[1].args[1])
         self.assertIn("import json", mock_run_sandbox.call_args.kwargs["code"])
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     def test_llm_tool_selector_can_choose_rag_and_sandbox(self, mock_complete):
         class Config:
             tool_selector = {
@@ -2391,7 +2624,7 @@ class ChatFlowTests(TestCase):
         self.assertEqual(kwargs["reasoning_effort"], "low")
         self.assertEqual(kwargs["temperature"], 0)
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     def test_llm_tool_selector_corrects_direct_answer_to_rag_for_local_context(self, mock_complete):
         class Config:
             tool_selector = {
@@ -2425,7 +2658,43 @@ class ChatFlowTests(TestCase):
         self.assertEqual(plan.rag_query, "古書修復師 灰島ノエ")
         self.assertIn("RAG", plan.evaluation_criteria[-1])
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
+    def test_llm_tool_selector_adds_file_batch_for_folder_wide_rag_plan(self, mock_complete):
+        class Config:
+            tool_selector = {
+                "enabled": True,
+                "reasoning_effort": "none",
+                "max_output_tokens": 96,
+            }
+
+            def tool_enabled(self, name, default=False):
+                return name in {"tool_selector", "rag", "file_batch"} or default
+
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "scores.csv").write_text("受験者名,科目名,得点\nA,数学,80\n", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_complete.return_value = json.dumps(
+                {
+                    "steps": [{"tool": "rag", "purpose": "Search input files."}],
+                    "rag_query": "input scores",
+                    "reason": "Needs local files.",
+                }
+            )
+
+            from .views import _build_agent_plan_with_llm_tool_selection
+
+            plan = _build_agent_plan_with_llm_tool_selection(
+                self.thread,
+                "フォルダの中のすべてのファイルを読んで、テスト集計を統合してください",
+                Config(),
+            )
+
+        self.assertIsNotNone(plan)
+        self.assertEqual([step.tool for step in plan.steps], ["file_batch", "rag", "final"])
+        self.assertEqual(plan.summary, "file_batch -> rag -> final (LLM-selected tools)")
+
+    @patch("agent.applications.llm_helpers.complete_response")
     def test_llm_tool_selector_retries_empty_response(self, mock_complete):
         class Config:
             def tool_enabled(self, name, default=False):
@@ -2549,6 +2818,33 @@ class ChatFlowTests(TestCase):
         self.assertIn("A,80", input_text)
         self.assertNotIn("construct_prompt.md", input_text)
 
+    def test_rag_auto_candidates_exclude_project_output_path(self):
+        with TemporaryDirectory() as input_dir, TemporaryDirectory() as output_dir:
+            input_root = Path(input_dir)
+            output_root = Path(output_dir)
+            (input_root / "scores.csv").write_text("受験者名,科目名,得点\nA,数学,80\n", encoding="utf-8")
+            (output_root / "maigent-output.txt").write_text("以前の回答: アクセス権がありません", encoding="utf-8")
+            self.project.output_path = str(output_root)
+            self.project.save(update_fields=["output_path"])
+            ProjectAccessPath.objects.create(project=self.project, path=str(input_root), mode="read")
+            ProjectAccessPath.objects.create(project=self.project, path=str(output_root), mode="write")
+
+            documents = _collect_candidate_documents(self.thread)
+
+        paths = [path.name for path, _text in documents]
+        self.assertIn("scores.csv", paths)
+        self.assertNotIn("maigent-output.txt", paths)
+
+    def test_japanese_rag_terms_split_long_request_phrases(self):
+        terms = _search_terms("inputフォルダ内にテストの集計をしたファイルがいくつかあります。それを統合して一つのファイルに保存してください")
+
+        self.assertIn("input", terms)
+        self.assertIn("テスト", terms)
+        self.assertIn("集計", terms)
+        self.assertIn("統合", terms)
+        self.assertIn("保存", terms)
+        self.assertNotIn("フォルダ内にテストの集計をしたファイルがいくつかあります", terms)
+
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_streaming_uses_rag_top_k_for_bm25(self, mock_config, mock_stream):
@@ -2572,8 +2868,9 @@ class ChatFlowTests(TestCase):
         input_text = mock_stream.call_args.args[1]
         self.assertIn("alpha_one.txt", input_text)
         self.assertNotIn("alpha_two.txt", input_text)
+        self.assertIn("files=alpha_one.txt", input_text)
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_llm_decision_can_select_rag_for_ambiguous_named_question(self, mock_config, mock_stream, mock_complete):
@@ -2608,7 +2905,7 @@ class ChatFlowTests(TestCase):
         self.assertIn("読者の肺活量に合わせて泳いでくる", input_text)
         mock_complete.assert_called_once()
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_streaming_returns_no_info_when_search_needed_but_bm25_not_relevant(self, mock_config, mock_stream, mock_complete):
@@ -2633,7 +2930,7 @@ class ChatFlowTests(TestCase):
         mock_stream.assert_not_called()
         mock_complete.assert_called_once()
 
-    @patch("agent.views.complete_response")
+    @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
     def test_bm25_inadequate_uses_llm_judge_for_top_k_files(self, mock_config, mock_stream, mock_complete):
@@ -2763,7 +3060,7 @@ class ChatFlowTests(TestCase):
 
     @patch("agent.views.stream_response")
     @patch("agent.views.run_sandbox")
-    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.applications.sandbox.generate_sandbox_code")
     @patch("agent.views.load_runtime_config")
     def test_grouped_named_csv_generates_code_then_runs_sandbox(
         self,
@@ -2815,7 +3112,7 @@ class ChatFlowTests(TestCase):
 
     @patch("agent.views.stream_response")
     @patch("agent.views.run_sandbox")
-    @patch("agent.views.generate_sandbox_code")
+    @patch("agent.applications.sandbox.generate_sandbox_code")
     @patch("agent.views.load_runtime_config")
     def test_llm_sandbox_code_gets_host_dataset_api_for_named_csv(
         self,
@@ -2921,6 +3218,20 @@ class ChatFlowTests(TestCase):
 
             ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="write")
             self.assertTrue(is_path_allowed(self.project, str(child), write=True))
+
+    def test_access_helper_rejects_symlink_escaping_allowed_root(self):
+        with TemporaryDirectory() as allowed_dir, TemporaryDirectory() as outside_dir:
+            allowed_root = Path(allowed_dir)
+            outside_root = Path(outside_dir)
+            secret = outside_root / "secret.txt"
+            secret.write_text("outside secret")
+            escape_link = allowed_root / "escape"
+            escape_link.symlink_to(outside_root, target_is_directory=True)
+            ProjectAccessPath.objects.create(project=self.project, path=str(allowed_root), mode="read")
+
+            self.assertFalse(is_path_allowed(self.project, str(escape_link / "secret.txt"), write=False))
+            self.assertFalse(is_path_allowed(self.project, str(outside_root), write=False))
+            self.assertTrue(is_path_allowed(self.project, str(allowed_root / "inside.txt"), write=False))
 
 
 @override_settings(STATICFILES_DIRS=[])
@@ -3172,3 +3483,180 @@ class OpenAIClientTests(TestCase):
         self.assertEqual(Client.responses.kwargs["max_output_tokens"], 64)
         self.assertEqual(Client.responses.kwargs["reasoning"], {"effort": "none"})
         self.assertEqual(Client.responses.kwargs["temperature"], 0)
+
+
+class WebSearchTests(TestCase):
+    def setUp(self):
+        self.project = Project.objects.create(name="Repo", is_current=True)
+        self.thread = Thread.objects.create(project=self.project, title="Main")
+
+    def test_search_web_reports_not_configured_without_api_key(self):
+        from .applications.web_search import search_web
+
+        class Config:
+            web_search_api_key = ""
+            web_search_max_results = 5
+            web_search_timeout_seconds = 10
+
+        result = search_web(Config(), "latest django release")
+
+        self.assertFalse(result.ok)
+        self.assertIn("未設定", result.message)
+
+    @patch("agent.applications.web_search.urllib.request.urlopen")
+    def test_search_web_returns_parsed_results_when_configured(self, mock_urlopen):
+        from .applications.web_search import search_web
+
+        class Config:
+            web_search_api_key = "tvly-test-key"
+            web_search_max_results = 5
+            web_search_timeout_seconds = 10
+
+        response_body = json.dumps(
+            {
+                "results": [
+                    {"title": "Django 5.1 released", "url": "https://example.com/django-5-1", "content": "Release notes."},
+                ]
+            }
+        ).encode("utf-8")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return response_body
+
+        mock_urlopen.return_value = Response()
+
+        result = search_web(Config(), "django latest release")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(result.results), 1)
+        self.assertEqual(result.results[0].title, "Django 5.1 released")
+        self.assertEqual(result.results[0].url, "https://example.com/django-5-1")
+
+    @patch("agent.applications.web_search.urllib.request.urlopen")
+    def test_search_web_reports_no_results(self, mock_urlopen):
+        from .applications.web_search import search_web
+
+        class Config:
+            web_search_api_key = "tvly-test-key"
+            web_search_max_results = 5
+            web_search_timeout_seconds = 10
+
+        response_body = json.dumps({"results": []}).encode("utf-8")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return response_body
+
+        mock_urlopen.return_value = Response()
+
+        result = search_web(Config(), "an extremely obscure query")
+
+        self.assertFalse(result.ok)
+        self.assertIn("見つかりませんでした", result.message)
+
+    @patch("agent.views.search_web")
+    def test_execute_agent_task_reports_web_search_not_configured(self, mock_search_web):
+        from .applications.web_search import WebSearchResult
+        from .tooling import AgentPlanStep
+        from .views import _execute_agent_task
+
+        mock_search_web.return_value = WebSearchResult(ok=False, query="latest news", message="web_searchのAPIキーが未設定です。")
+
+        runner = _execute_agent_task(
+            self.thread,
+            "最新のニュースを調べて",
+            object(),
+            "answer base",
+            [],
+            AgentPlanStep("web_search", "Collect current information."),
+        )
+        result = None
+        while True:
+            try:
+                next(runner)
+            except StopIteration as exc:
+                result = exc.value
+                break
+
+        self.assertFalse(result["ok"])
+        self.assertIn("未設定", result["final_message"])
+
+    @patch("agent.views.search_web")
+    def test_execute_agent_task_attaches_web_search_context(self, mock_search_web):
+        from .applications.web_search import WebSearchItem, WebSearchResult
+        from .tooling import AgentPlanStep
+        from .views import _execute_agent_task
+
+        mock_search_web.return_value = WebSearchResult(
+            ok=True,
+            query="latest django release",
+            results=(WebSearchItem(title="Django 5.1 released", url="https://example.com", snippet="Release notes."),),
+        )
+
+        runner = _execute_agent_task(
+            self.thread,
+            "Djangoの最新リリースを調べて",
+            object(),
+            "answer base",
+            [],
+            AgentPlanStep("web_search", "Collect current information."),
+        )
+        result = None
+        while True:
+            try:
+                next(runner)
+            except StopIteration as exc:
+                result = exc.value
+                break
+
+        self.assertTrue(result["ok"])
+        self.assertIn("Web search results", result["input_text"])
+        self.assertIn("Django 5.1 released", result["input_text"])
+        self.assertIn("https://example.com", result["input_text"])
+
+
+class LoggingRedactionTests(TestCase):
+    def _filtered_message(self, message, *args):
+        import logging
+
+        from .logging import RedactSecretsFilter
+
+        record = logging.LogRecord("agent", logging.DEBUG, __file__, 1, message, args, None)
+        RedactSecretsFilter().filter(record)
+        return record.getMessage()
+
+    def test_redacts_openai_style_api_key(self):
+        message = self._filtered_message("llm_start config=%s", "api_key=sk-abcdefghijklmnop")
+
+        self.assertNotIn("sk-abcdefghijklmnop", message)
+        self.assertIn("********", message)
+
+    def test_redacts_aws_access_key(self):
+        message = self._filtered_message("bedrock_auth key=%s", "AKIAABCDEFGHIJKLMNOP")
+
+        self.assertNotIn("AKIAABCDEFGHIJKLMNOP", message)
+        self.assertIn("********", message)
+
+    def test_redacts_generic_key_value_secret(self):
+        message = self._filtered_message("config_loaded values=%s", "api_key: hunter2secretvalue")
+
+        self.assertNotIn("hunter2secretvalue", message)
+        self.assertIn("********", message)
+
+    def test_leaves_non_secret_messages_unchanged(self):
+        message = self._filtered_message("agent_step_result thread_id=%s tool=%s", 1, "rag")
+
+        self.assertEqual(message, "agent_step_result thread_id=1 tool=rag")

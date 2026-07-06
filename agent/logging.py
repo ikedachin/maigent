@@ -1,5 +1,30 @@
 import logging
 import os
+import re
+
+
+_SECRET_PATTERNS = [
+    re.compile(r"sk-(?:ant-|or-)?[A-Za-z0-9_-]{10,}"),
+    re.compile(r"AKIA[0-9A-Z]{16}"),
+    re.compile(r"(?i)(api[_-]?key|access[_-]?key|secret[_-]?key|secret|token)(\"?\s*[:=]\s*\"?)([A-Za-z0-9/+_.=-]{8,})"),
+]
+
+
+def _redact_secrets_text(text: str) -> str:
+    redacted = _SECRET_PATTERNS[0].sub("********", text)
+    redacted = _SECRET_PATTERNS[1].sub("********", redacted)
+    redacted = _SECRET_PATTERNS[2].sub(lambda match: f"{match.group(1)}{match.group(2)}********", redacted)
+    return redacted
+
+
+class RedactSecretsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        redacted = _redact_secrets_text(message)
+        if redacted != message:
+            record.msg = redacted
+            record.args = ()
+        return True
 
 
 class AgentColorFormatter(logging.Formatter):

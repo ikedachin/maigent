@@ -1,0 +1,7 @@
+User request:
+{{user_text}}
+
+Map batch: {{batch_index}}
+Summarize each file independently for later reduction.
+
+{{file_blocks}}

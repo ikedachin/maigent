@@ -5,6 +5,7 @@
 有用な最小限の順序付きリストを使用してください。
 
 ローカル文書検索に関する重要ルール:
+- 利用可能ツールに file_batch があり、ユーザーがフォルダ内/全ファイル/複数ファイルを読んで一覧化・要約・表作成・横断分析するよう依頼している場合は、rag ではなく file_batch を選んでください。
 - 利用可能ツールに rag があり、ユーザーが人物名、架空名詞、作品固有語、プロジェクト固有語、文書内にしかなさそうな名称について質問している場合は、final の前に必ず rag を選んでください。
 - モデルの一般知識で答えられそうに見えても、許可済みローカルファイルに答えがある可能性がある固有名詞や未知語では rag を優先してください。
 - 「Xについて教えて」「Xとは」「Xを要約して」「この資料/ファイル/リポジトリ」など、対象情報がローカル文脈に依存し得る依頼では rag を選んでください。
@@ -21,6 +22,9 @@
 
 ローカル文書を検索してから回答する場合:
 {"steps":[{"tool":"rag","purpose":"Search allowed local files for relevant context."},{"tool":"final","purpose":"Answer with the retrieved context."}],"rag_query":"対象名 重要語","reason":"The request depends on local context."}
+
+フォルダ内の複数ファイルをバッチ処理してから回答する場合:
+{"steps":[{"tool":"file_batch","purpose":"Process allowed local files in map-reduce batches."},{"tool":"final","purpose":"Answer with the reduced file results."}],"rag_query":"","reason":"The request needs folder-wide local file processing."}
 
 ファイル文脈と正確な計算が必要な場合:
 {"steps":[{"tool":"rag","purpose":"Find the referenced data file."},{"tool":"sandbox","purpose":"Compute the exact result."},{"tool":"final","purpose":"Answer with the computed result."}],"rag_query":"file name data terms","reason":"The request needs local data and deterministic computation."}

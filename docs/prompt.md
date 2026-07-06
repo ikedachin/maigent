@@ -67,8 +67,9 @@ JSONを期待するプロンプトでは、実装側が `_extract_json_object()`
 利用可能なツール:
 - `final`: LLMだけで回答する
 - `rag`: 許可済みローカルファイルを検索する
+- `file_batch`: 許可済みローカルファイルをフォルダ横断でmap-reduce処理する
 - `sandbox`: Docker内でPythonを実行する
-- `web_search`: 外部情報収集用。現状は未実装通知を返す
+- `web_search`: Tavily検索APIで外部情報を取得する。`tools.web_search.api_key` 未設定時は未設定メッセージを返す
 
 関連設定:
 - `tool_selector.enabled`
@@ -118,6 +119,23 @@ REASON: short reason
 目的:
 - キーワード一致だけでは拾いにくい関連ファイルを救う
 - 汎用語だけが一致した無関係ファイルを除外する
+
+## file_batch_map_instructions.txt / file_batch_map_prompt.txt
+
+`file_batch` ツールのmap段階で、1バッチ分のローカルファイルをLLMに要約させるプロンプトです。
+
+期待出力:
+
+```json
+[{"path": "/abs/path/a.txt", "summary": "short Japanese sentence", "status": "ok"}]
+```
+
+使う場面:
+- フォルダ内の複数ファイルを要約・一覧化・横断分析する `file_batch` タスク
+
+注意:
+- JSON配列でない場合や、対象外のpathを含む場合は、そのファイルをフォールバック要約(`_heuristic_file_summary()`)に置き換えます。
+- `file_batch.max_output_tokens` / `file_batch.reasoning_effort` / `file_batch.max_retries` で軽量化と再試行を設定できます。
 
 ## sandbox_code_generation_instructions.txt
 

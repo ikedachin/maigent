@@ -120,8 +120,11 @@ def build_agent_plan(message: str, config: RuntimeConfig) -> AgentPlan:
     steps: list[AgentPlanStep] = []
     if _config_tool_enabled(config, "web_search") and _looks_like_web_search(message):
         steps.append(AgentPlanStep("web_search", "Collect current or external information."))
+    if _config_tool_enabled(config, "file_batch") and _looks_like_file_batch_task(message):
+        steps.append(AgentPlanStep("file_batch", "Process allowed local files in batches and reduce the results."))
     if _config_tool_enabled(config, "rag", default=True) and _looks_like_rag_task(message):
-        steps.append(AgentPlanStep("rag", "Search allowed local files with BM25 and attach relevant context."))
+        if not any(step.tool == "file_batch" for step in steps):
+            steps.append(AgentPlanStep("rag", "Search allowed local files with BM25 and attach relevant context."))
     if _config_tool_enabled(config, "sandbox") and _looks_like_sandbox_task(message):
         steps.append(AgentPlanStep("sandbox", "Run deterministic Python in Docker for exact computation."))
     if not steps:
@@ -146,7 +149,8 @@ def build_agent_worker_specs(plan: AgentPlan, max_workers: int = 3, parallel_too
     specs: list[AgentWorkerSpec] = []
     research_steps = tuple(step for step in tool_steps if step.tool in {"rag", "web_search"})
     compute_steps = tuple(step for step in tool_steps if step.tool == "sandbox")
-    other_steps = tuple(step for step in tool_steps if step.tool not in {"rag", "web_search", "sandbox"})
+    batch_steps = tuple(step for step in tool_steps if step.tool == "file_batch")
+    other_steps = tuple(step for step in tool_steps if step.tool not in {"rag", "web_search", "sandbox", "file_batch"})
 
     if research_steps:
         specs.append(
@@ -164,6 +168,15 @@ def build_agent_worker_specs(plan: AgentPlan, max_workers: int = 3, parallel_too
                 role="compute",
                 purpose="Run deterministic computation or artifact generation.",
                 steps=compute_steps,
+            )
+        )
+    if batch_steps:
+        specs.append(
+            AgentWorkerSpec(
+                name="file_batch",
+                role="file_batch",
+                purpose="Process local files in map-reduce batches.",
+                steps=batch_steps,
             )
         )
     if other_steps:
@@ -252,6 +265,10 @@ def select_tool(message: str, config: RuntimeConfig) -> ToolDecision:
         decision = ToolDecision("sandbox", "calculation_or_code_execution")
         logger.debug("tool_selected name=%s reason=%s", decision.name, decision.reason)
         return decision
+    if _config_tool_enabled(config, "file_batch") and _looks_like_file_batch_task(message):
+        decision = ToolDecision("file_batch", "batch_local_file_processing")
+        logger.debug("tool_selected name=%s reason=%s", decision.name, decision.reason)
+        return decision
     if _config_tool_enabled(config, "web_search") and _looks_like_web_search(message):
         decision = ToolDecision("web_search", "current_or_external_information")
         logger.debug("tool_selected name=%s reason=%s", decision.name, decision.reason)
@@ -296,11 +313,20 @@ def run_sandbox(message: str, config: RuntimeConfig, code: str = "", datasets: t
         if libraries and install_on_run:
             install = "pip install --no-cache-dir " + " ".join(shlex.quote(lib) for lib in libraries) + " && "
         network = [] if install else ["--network", "none"]
+        limits = [
+            "--memory",
+            f"{getattr(config, 'sandbox_memory_limit_mb', 512)}m",
+            "--pids-limit",
+            str(getattr(config, "sandbox_pids_limit", 128)),
+            "--cpus",
+            str(getattr(config, "sandbox_cpus", 1.0)),
+        ]
         command = [
             "docker",
             "run",
             "--rm",
             *network,
+            *limits,
             "-v",
             f"{tmp_dir}:/work:ro",
             "-w",
@@ -635,6 +661,28 @@ def _looks_like_rag_task(message: str) -> bool:
         marker in lowered
         for marker in ["file", "files", "folder", "directory", "document", "docs", "list", "summarize", "read", "where"]
     ) or any(marker in message for marker in ["ファイル", "フォルダ", "資料", "一覧", "要約", "読んで", "どこ"])
+
+
+def _looks_like_file_batch_task(message: str) -> bool:
+    lowered = message.lower()
+    scope_markers = ["all files", "every file", "folder", "directory", "files in", "フォルダ", "ディレクトリ", "全ファイル", "すべてのファイル"]
+    task_markers = [
+        "summary",
+        "summarize",
+        "summaries",
+        "table",
+        "list",
+        "inventory",
+        "read all",
+        "要約",
+        "一覧",
+        "表",
+        "読んで",
+        "洗い出",
+    ]
+    return any(marker in lowered or marker in message for marker in scope_markers) and any(
+        marker in lowered or marker in message for marker in task_markers
+    )
 
 
 def _extract_python_code(message: str) -> str:

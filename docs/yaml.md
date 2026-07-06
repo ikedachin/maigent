@@ -47,12 +47,17 @@ final_evaluation:
 tools:
   rag:
     enabled: true
+  file_batch:
+    enabled: true
   web_search:
     enabled: false
   sandbox:
     enabled: true
     image: maigent-sandbox:py311
     timeout_seconds: 20
+    memory_limit_mb: 512
+    pids_limit: 128
+    cpus: 1
     install_libraries_on_run: false
     allowed_libraries:
       - pandas
@@ -316,15 +321,45 @@ tools:
 
 `enabled: true` の場合でも、読み取り許可パスがなければ検索対象はありません。
 
+### tools.file_batch
+
+```yaml
+tools:
+  file_batch:
+    enabled: true
+    max_output_tokens: 4096
+    max_retries: 0
+    reasoning_effort: none
+```
+
+許可済みローカルファイルをフォルダ横断でmap-reduce処理する設定です。全ファイル要約や一覧化・横断分析など、単一クエリのBM25検索では扱いにくいタスクで `rag` の代わりに選ばれます。
+
+項目:
+- `enabled`: file_batch実行を有効化するか。`tools.file_batch` が未定義でも `tools.rag.enabled` が `true` なら自動的に有効になります(明示的に `false` を指定すれば無効化できます)
+- `max_output_tokens`: map段階の要約LLM呼び出しの最大出力トークン数。未指定時は `4096`
+- `max_retries`: map段階のLLMが空応答/None/例外を返した場合の再試行回数
+- `reasoning_effort`: map段階のreasoning effort
+
 ### tools.web_search
 
 ```yaml
 tools:
   web_search:
     enabled: false
+    api_key: tvly-...
+    max_results: 5
+    timeout_seconds: 10
 ```
 
-外部Web検索用の設定です。現状の実装では未実装通知を返します。
+外部Web検索の設定です。[Tavily](https://tavily.com/) の検索APIを使います。
+
+項目:
+- `enabled`: web_search実行を有効化するか
+- `api_key`: Tavily APIキー。環境変数 `TAVILY_API_KEY` でも可
+- `max_results`: 取得する検索結果件数。1から10に丸められます。既定は5
+- `timeout_seconds`: HTTPタイムアウト秒。1から30に丸められます。既定は10
+
+`api_key` が未設定の場合、計画に選択されても「APIキーが未設定です」という明確なメッセージを返すだけで、無言で成功したことにはしません。
 
 ### tools.sandbox
 
@@ -334,6 +369,9 @@ tools:
     enabled: true
     image: maigent-sandbox:py311
     timeout_seconds: 20
+    memory_limit_mb: 512
+    pids_limit: 128
+    cpus: 1
     install_libraries_on_run: false
     allowed_libraries:
       - pandas
@@ -344,6 +382,9 @@ tools:
 - `enabled`: sandbox実行を有効化するか
 - `image`: Dockerイメージ名
 - `timeout_seconds`: 実行タイムアウト秒。1から600に丸められます
+- `memory_limit_mb`: コンテナのメモリ上限(MB)。64から8192に丸められます。既定は512
+- `pids_limit`: コンテナ内で生成できるプロセス/スレッド数の上限。16から2048に丸められます。既定は128
+- `cpus`: コンテナに割り当てるCPUコア数。0.1から8.0に丸められます。既定は1
 - `install_libraries_on_run`: 実行ごとに `allowed_libraries` をpip installするか
 - `allowed_libraries`: 実行時インストールを許可するライブラリ
 
@@ -354,6 +395,7 @@ tools:
 sandboxの安全性:
 - 入力ファイルは直接マウントしません
 - 通常はDockerネットワークを無効化します
+- `docker run` に `--memory` / `--pids-limit` / `--cpus` を付与し、暴走コードやフォーク爆弾がホストへ影響しないよう制限します
 - ファイル保存は typed `maigent_sandbox_result` JSONをstdoutへ出し、ホスト側brokerが権限検証して行います
 
 ## tool_selector

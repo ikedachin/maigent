@@ -227,6 +227,11 @@ class RuntimeConfig:
         return legacy if isinstance(legacy, dict) else {}
 
     def tool_enabled(self, name: str, default: bool = False) -> bool:
+        if name == "file_batch" and name not in self.tools:
+            if "rag" not in self.tools:
+                return False
+            rag = self.tools.get("rag", {})
+            return isinstance(rag, dict) and _as_bool(rag.get("enabled", False))
         if name not in CONTROL_CONFIG_NAMES and name not in self.tools:
             return False
         config = self.control_config(name) if name in CONTROL_CONFIG_NAMES else self.tools.get(name, {})
@@ -236,11 +241,14 @@ class RuntimeConfig:
 
     @property
     def enabled_tool_names(self) -> set[str]:
-        return {
+        names = {
             str(name)
             for name, config in self.tools.items()
             if isinstance(config, dict) and _as_bool(config.get("enabled", False))
         }
+        if self.tool_enabled("file_batch"):
+            names.add("file_batch")
+        return names
 
     @property
     def sandbox_image(self) -> str:
@@ -277,6 +285,62 @@ class RuntimeConfig:
             return max(1, min(600, int(sandbox.get("timeout_seconds", 20))))
         except (TypeError, ValueError):
             return 20
+
+    @property
+    def sandbox_memory_limit_mb(self) -> int:
+        sandbox = self.tools.get("sandbox", {})
+        if not isinstance(sandbox, dict):
+            return 512
+        try:
+            return max(64, min(8192, int(sandbox.get("memory_limit_mb", 512))))
+        except (TypeError, ValueError):
+            return 512
+
+    @property
+    def sandbox_pids_limit(self) -> int:
+        sandbox = self.tools.get("sandbox", {})
+        if not isinstance(sandbox, dict):
+            return 128
+        try:
+            return max(16, min(2048, int(sandbox.get("pids_limit", 128))))
+        except (TypeError, ValueError):
+            return 128
+
+    @property
+    def sandbox_cpus(self) -> float:
+        sandbox = self.tools.get("sandbox", {})
+        if not isinstance(sandbox, dict):
+            return 1.0
+        try:
+            return max(0.1, min(8.0, float(sandbox.get("cpus", 1.0))))
+        except (TypeError, ValueError):
+            return 1.0
+
+    @property
+    def web_search_api_key(self) -> str:
+        web_search = self.tools.get("web_search", {})
+        config_value = web_search.get("api_key") if isinstance(web_search, dict) else None
+        return str(config_value or os.environ.get("TAVILY_API_KEY", "")).strip()
+
+    @property
+    def web_search_max_results(self) -> int:
+        web_search = self.tools.get("web_search", {})
+        if not isinstance(web_search, dict):
+            return 5
+        try:
+            return max(1, min(10, int(web_search.get("max_results", 5))))
+        except (TypeError, ValueError):
+            return 5
+
+    @property
+    def web_search_timeout_seconds(self) -> int:
+        web_search = self.tools.get("web_search", {})
+        if not isinstance(web_search, dict):
+            return 10
+        try:
+            return max(1, min(30, int(web_search.get("timeout_seconds", 10))))
+        except (TypeError, ValueError):
+            return 10
 
     @property
     def multi_agent(self) -> dict[str, Any]:

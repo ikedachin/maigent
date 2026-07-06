@@ -282,6 +282,23 @@ Dataset API:
 - `dynamic_finalizer.reasoning_effort`
 - `dynamic_finalizer.llm_max_retries`
 
+## multi_agent_synthesis_instructions.txt
+
+複数のworker agent(`research` / `compute` / `file_batch` などの実行結果)を1つの最終回答へ統合させるための指示です。プロンプト本文ではなくシステム指示のみで、実行時のworker結果は `agent/applications/multi_agent.py` の `_format_worker_results_for_synthesis()` が組み立てます。
+
+目的:
+- 各workerの出力を検証済みの根拠として扱い、そのまま並べるだけにしない
+- workerの結果同士に矛盾がある場合は明示的に解消する
+- 一部のworkerが失敗しても、他の信頼できる結果を使って回答を続ける
+- 内部実装の詳細(worker名など)はユーザーに必要な場合以外は言及しない
+
+使う場面:
+- `multi_agent.enabled` が有効で、2つ以上のworkerが並列実行された場合
+
+関連関数:
+- `_format_worker_results_for_synthesis()`
+- `_execute_multi_agent_plan()`
+
 ## final_evaluation_instructions.txt / final_evaluation_prompt.txt
 
 回答をユーザーへ返す前に、事前に決めたゴールと評価基準を満たしているか判定するプロンプトです。

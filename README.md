@@ -86,7 +86,9 @@ sandbox_code_generation:
 
 `logging.llm_tail_chars` は、LLMプロンプトやLLM応答をデバッグログへ出すときの末尾文字数です。標準は `100` です。全文を出す場合は `full`、`all`、`unlimited`、または `0` を指定します。
 
-`final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。最終評価のLLM呼び出しは `reasoning_effort`、`max_output_tokens`、`llm_max_retries` で軽量化と応答失敗時の再試行を設定できます。画面から保存した最終評価の有効/無効とリトライ回数はDBの `AppSetting` に保存され、設定ファイル値より優先されます。
+`final_evaluation.enabled` を `true` にすると、回答をブラウザへ返す前に最終評価を行い、不十分な場合は最初のプランから最大 `max_retries` 回まで再実行します。`max_retries` は 0 から 3 の範囲に丸められます。最終評価のLLM呼び出しは `reasoning_effort`、`max_output_tokens`、`llm_max_retries` で軽量化と応答失敗時の再試行を設定できます。画面から保存した最終評価の有効/無効とリトライ回数はDBの `AppSetting` に保存され、設定ファイル値より優先されます。ただし、プランが `rag` / `sandbox` / `web_search` / `file_batch` のいずれも使わず直接回答した場合は、`final_evaluation.enabled` の値によらず評価LLM呼び出し自体を行わず回答をそのまま返します。ツールを使わない雑談的な回答は検証対象を持たないため常にスキップし、ツールで外部情報や計算結果を取り込んだ回答だけを評価する設計です。
+
+`initial_clarifier` と `tool_selector` を両方有効にしている場合、この2つのLLM判定は順番待ちさせず並列実行します（`ThreadPoolExecutor`で同時に投げて両方の結果を待ち合わせ）。DB参照を伴う下準備（利用可能ツール一覧の取得、ローカルコンテキストの補正）は並列化せずリクエストのスレッド上で行い、ネットワーク越しのLLM呼び出し部分だけを並列化しているため、応答内容は逐次実行時と変わらず、体感速度だけが改善します。さらに、`tool_selector` が `rag` / `sandbox` / `web_search` / `file_batch` のいずれかを含む具体的な実行プランを見つけた場合は、`initial_clarifier` が「確認が必要」と判定していてもその確認質問は表示せず、`tool_selector` が見つけた実行プランをそのまま採用します。ツールを使った具体的な実行方針が既に見つかっているなら、ユーザーに聞き返す必要はないという考え方です。`tool_selector` が実行可能なツールを見つけられなかった場合（直接回答のみ、または判定失敗）は、従来どおり `initial_clarifier` の判定に従います。
 
 `multi_agent.enabled` は、1つのユーザー依頼の内部で複数worker agentを並列実行するかを制御します。標準は有効で、`max_workers` は 1 から 5 の範囲に丸められます。v1では同一スレッドへの複数ユーザー送信を同時処理するのではなく、1つのassistant回答の中で `research` / `compute` / `verify` workerを走らせ、最後に1つの回答へ統合します。`parallel_tools` が `true` の場合、RAGやsandboxなど独立可能なツールをworkerへ分割します。`file_batch` はフォルダ横断タスクをmap-reduceバッチへ分け、必要に応じて `max_workers` まで並列map処理します。`progress_visible` が `true` の場合、ブラウザの進捗欄にagent別の状態を表示します。
 

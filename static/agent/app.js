@@ -95,7 +95,9 @@ const translations = {
     running: "実行中",
     queued: "待機中",
     preparing: "準備中",
-    partialProgress: "進行ログ（一部・最新3行）",
+    partialProgress: "進行ログ",
+    showAllProgress: "すべて表示",
+    showLessProgress: "折りたたむ",
     error: "エラー",
     pending: "待機中",
     elapsedTime: "実行時間",
@@ -195,7 +197,9 @@ const translations = {
     running: "running",
     queued: "queued",
     preparing: "preparing",
-    partialProgress: "Progress log (partial, latest 3 lines)",
+    partialProgress: "Progress log",
+    showAllProgress: "Show all",
+    showLessProgress: "Show less",
     error: "error",
     pending: "pending",
     elapsedTime: "Elapsed time",
@@ -463,16 +467,31 @@ function appendMessage(role, content, status) {
     progress = document.createElement("div");
     progress.className = "message-progress";
     progress.hidden = true;
+    progress.fullLines = [];
+    progress.expanded = false;
+    const header = document.createElement("div");
+    header.className = "message-progress-header";
     const label = document.createElement("div");
     label.className = "message-progress-label";
     label.dataset.i18n = "partialProgress";
     label.textContent = t("partialProgress");
-    const list = document.createElement("ol");
-    list.className = "message-progress-lines";
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "message-progress-toggle";
+    toggle.hidden = true;
+    toggle.dataset.i18n = "showAllProgress";
+    toggle.textContent = t("showAllProgress");
+    toggle.addEventListener("click", () => {
+      progress.expanded = !progress.expanded;
+      renderProgressLines(progress);
+    });
+    header.append(label, toggle);
     const agents = document.createElement("ul");
     agents.className = "message-agent-progress";
     agents.hidden = true;
-    progress.append(label, agents, list);
+    const list = document.createElement("ol");
+    list.className = "message-progress-lines";
+    progress.append(header, agents, list);
     article.append(progress);
   }
   container.append(article);
@@ -559,7 +578,7 @@ function streamAssistant(url, node) {
   source.onmessage = (event) => {
     const payload = JSON.parse(event.data);
     if (payload.progress_tail) {
-      updateProgressTail(node, payload.progress_tail, payload.progress_truncated);
+      updateProgressTail(node, payload.progress_tail, payload.progress_truncated, payload.progress_full);
     }
     if (payload.agent && payload.agent_status) {
       updateAgentProgress(node, payload.agent, payload.agent_status, payload.agent_progress || "");
@@ -623,18 +642,36 @@ function streamAssistant(url, node) {
   };
 }
 
-function updateProgressTail(node, lines, truncated) {
+function updateProgressTail(node, tail, truncated, full) {
   if (!node.progress) return;
-  const list = node.progress.querySelector(".message-progress-lines");
+  node.progress.fullLines = Array.isArray(full) && full.length ? full : tail;
+  node.progress.truncatedAvailable = Boolean(truncated);
+  renderProgressLines(node.progress);
+  node.progress.hidden = node.progress.fullLines.length === 0;
+}
+
+function renderProgressLines(progress) {
+  const list = progress.querySelector(".message-progress-lines");
+  const toggle = progress.querySelector(".message-progress-toggle");
   if (!list) return;
+  const full = progress.fullLines || [];
+  const expanded = Boolean(progress.expanded);
+  const lines = expanded ? full : full.slice(-3);
   list.innerHTML = "";
   lines.forEach((line) => {
     const item = document.createElement("li");
     item.textContent = line;
     list.append(item);
   });
-  node.progress.classList.toggle("truncated", Boolean(truncated));
-  node.progress.hidden = lines.length === 0;
+  const canExpand = progress.truncatedAvailable || full.length > 3;
+  progress.classList.toggle("truncated", canExpand && !expanded);
+  if (toggle) {
+    toggle.hidden = !canExpand;
+    const key = expanded ? "showLessProgress" : "showAllProgress";
+    toggle.dataset.i18n = key;
+    toggle.textContent = t(key);
+    toggle.setAttribute("aria-expanded", expanded ? "true" : "false");
+  }
 }
 
 function updateAgentProgress(node, agent, status, message) {

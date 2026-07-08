@@ -679,6 +679,13 @@ textarea:focus {
   display: none;
 }
 
+.message-progress-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
 .message-progress-label {
   font-weight: 700;
   color: var(--ink);
@@ -687,6 +694,24 @@ textarea:focus {
 .message-progress.truncated .message-progress-label::after {
   content: " ...";
   color: var(--muted);
+}
+
+.message-progress-toggle {
+  flex-shrink: 0;
+  padding: 3px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface-soft);
+}
+
+.message-progress-toggle[hidden] {
+  display: none;
+}
+
+.message-progress-toggle:hover {
+  color: var(--ink);
 }
 
 .message-progress-lines {

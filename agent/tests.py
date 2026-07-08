@@ -1108,7 +1108,7 @@ class ChatFlowTests(TestCase):
         mock_complete.return_value = '{"needs_clarification": false, "reason": "clear", "questions": []}'
         mock_stream.return_value = iter([("delta", "planned answer")])
 
-        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "この件について教えてください。"})
         payload = create.json()
         stream = self.client.get(payload["stream_url"])
         body = b"".join(stream.streaming_content).decode()
@@ -1137,7 +1137,7 @@ class ChatFlowTests(TestCase):
         mock_complete.return_value = '{"needs_clarification": true, "reason": "missing"}'
         mock_stream.return_value = iter([("delta", "fallback answer")])
 
-        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "この件について教えてください。"})
         payload = create.json()
         stream = self.client.get(payload["stream_url"])
         body = b"".join(stream.streaming_content).decode()
@@ -1165,6 +1165,110 @@ class ChatFlowTests(TestCase):
     @patch("agent.applications.llm_helpers.complete_response")
     @patch("agent.views.stream_response")
     @patch("agent.views.load_runtime_config")
+    def test_precheck_runs_clarifier_and_tool_selector_together(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = False
+
+            def tool_enabled(self, name, default=False):
+                return name in {"initial_clarifier", "tool_selector"}
+
+        def fake_complete(config, prompt, instructions, **kwargs):
+            if "ツールを選択" in instructions:
+                return '{"steps": [], "reason": "no tool needed"}'
+            return '{"needs_clarification": false, "reason": "clear", "questions": []}'
+
+        mock_config.return_value = Config()
+        mock_complete.side_effect = fake_complete
+        mock_stream.return_value = iter([("delta", "hi there")])
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        body = b"".join(stream.streaming_content).decode()
+
+        self.assertIn("hi there", body)
+        self.assertEqual(mock_complete.call_count, 2)
+        mock_stream.assert_called_once()
+
+    @patch("agent.applications.llm_helpers.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_tool_selector_result_overrides_clarifier_when_actionable(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = False
+
+            def tool_enabled(self, name, default=False):
+                return name in {"initial_clarifier", "tool_selector", "rag"}
+
+        def fake_complete(config, prompt, instructions, **kwargs):
+            if "ツールを選択" in instructions:
+                return '{"steps": [{"tool": "rag", "purpose": "look up local context"}], "rag_query": "alpha", "reason": "named entity may be local"}'
+            return '{"needs_clarification": true, "reason": "ambiguous request", "questions": ["どのファイルですか？"]}'
+
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "alpha.txt").write_text("alpha is a sealed book in the deep sea library.", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_config.return_value = Config()
+            mock_complete.side_effect = fake_complete
+            mock_stream.return_value = iter([("delta", "alpha is a sealed book.")])
+
+            # This message has no rag/folder/file keyword, so the cheap rule-based
+            # planner alone would not know a tool is available and would let the
+            # clarifier's "needs_clarification" stand. The (mocked) tool-selector
+            # LLM finds a concrete actionable plan instead, which should win.
+            create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "灰島ノエについて教えて"})
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            body = b"".join(stream.streaming_content).decode()
+
+        self.assertNotIn("どのファイルですか", body)
+        self.assertIn("alpha is a sealed book.", body)
+        mock_stream.assert_called_once()
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertEqual(AgentRun.objects.filter(assistant_message=assistant).count(), 1)
+
+    @patch("agent.applications.llm_helpers.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_final_evaluation_skip_when_no_tools_used(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = True
+            final_evaluation_max_retries = 2
+
+            def tool_enabled(self, name, default=False):
+                return False
+
+        mock_config.return_value = Config()
+        mock_stream.return_value = iter([("delta", "direct answer")])
+
+        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "日本の首都は？"})
+        payload = create.json()
+        stream = self.client.get(payload["stream_url"])
+        body = b"".join(stream.streaming_content).decode()
+
+        self.assertIn("no tools were used; skipping final evaluation", body)
+        self.assertIn("direct answer", body)
+        mock_complete.assert_not_called()
+        mock_stream.assert_called_once()
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertEqual(assistant.content, "direct answer")
+
+    @patch("agent.applications.llm_helpers.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
     def test_final_evaluation_retries_from_plan_when_inadequate(self, mock_config, mock_stream, mock_complete):
         class Config:
             model = "test-model"
@@ -1178,27 +1282,31 @@ class ChatFlowTests(TestCase):
             final_evaluation = {"llm_max_retries": 1}
 
             def tool_enabled(self, name, default=False):
-                return False
+                return name == "rag"
 
-        mock_config.return_value = Config()
-        mock_stream.side_effect = [
-            iter([("delta", "bad answer"), ("response_id", "resp_1")]),
-            iter([("delta", "good answer"), ("response_id", "resp_2")]),
-        ]
-        mock_complete.side_effect = [
-            None,
-            '{"adequate": false, "reason": "too vague"}',
-            '{"adequate": true, "reason": "answers the question"}',
-        ]
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "alpha.txt").write_text("alpha is a sealed book in the deep sea library.", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_config.return_value = Config()
+            mock_stream.side_effect = [
+                iter([("delta", "bad answer"), ("response_id", "resp_1")]),
+                iter([("delta", "good answer"), ("response_id", "resp_2")]),
+            ]
+            mock_complete.side_effect = [
+                None,
+                '{"adequate": false, "reason": "too vague"}',
+                '{"adequate": true, "reason": "answers the question"}',
+            ]
 
-        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
-        payload = create.json()
-        stream = self.client.get(payload["stream_url"])
-        body = b"".join(stream.streaming_content).decode()
+            create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "alphaについて要約して"})
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            body = b"".join(stream.streaming_content).decode()
 
         self.assertIn("good answer", body)
         self.assertIn("final evaluation failed; replanning with a different plan", body)
-        self.assertIn("Revised direct answer after failed final evaluation", body)
+        self.assertIn("Revised local file context after failed final evaluation", body)
         assistant = Message.objects.get(id=payload["assistant_id"])
         self.assertEqual(assistant.content, "good answer")
         self.assertEqual(assistant.openai_response_id, "resp_2")
@@ -1265,20 +1373,24 @@ class ChatFlowTests(TestCase):
             final_evaluation = {"llm_max_retries": 1}
 
             def tool_enabled(self, name, default=False):
-                return False
+                return name == "rag"
 
-        mock_config.return_value = Config()
-        mock_stream.return_value = iter([("delta", "current answer"), ("response_id", "resp_1")])
-        mock_complete.side_effect = [None, ""]
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "alpha.txt").write_text("alpha is a sealed book in the deep sea library.", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_config.return_value = Config()
+            mock_stream.return_value = iter([("delta", "current answer"), ("response_id", "resp_1")])
+            mock_complete.side_effect = [None, ""]
 
-        create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "hello"})
-        payload = create.json()
-        stream = self.client.get(payload["stream_url"])
-        body = b"".join(stream.streaming_content).decode()
+            create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "alphaについて要約して"})
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            body = b"".join(stream.streaming_content).decode()
 
         self.assertIn("current answer", body)
         self.assertIn("final evaluation could not be completed; keeping current answer", body)
-        self.assertNotIn("Revised direct answer after failed final evaluation", body)
+        self.assertNotIn("Revised local file context after failed final evaluation", body)
         self.assertEqual(mock_stream.call_count, 1)
         self.assertEqual(mock_complete.call_count, 2)
         assistant = Message.objects.get(id=payload["assistant_id"])

@@ -35,7 +35,7 @@ JSONを期待するプロンプトでは、実装側が `_extract_json_object()`
 {"needs_clarification": true, "reason": "short reason", "questions": ["question 1", "question 2"]}
 ```
 
-質問が必要な場合、通常のassistantメッセージとして理由と最大3問の質問を返し、ツール実行や最終評価には進みません。空応答、不正JSON、空の質問配列の場合は既存のプラン作成へフォールバックします。
+質問が必要な場合、通常のassistantメッセージとして理由と最大3問の質問を返し、ツール実行や最終評価には進みません。空応答、不正JSON、空の質問配列の場合は既存のプラン作成へフォールバックします。`tool_selector` も有効な場合はこのプロンプトと並列実行され、`tool_selector` が `rag` / `sandbox` / `web_search` / `file_batch` を含む実行プランを見つけた場合はこちらの確認要求より優先されます（`_run_precheck_in_parallel()` 参照）。
 
 関連設定:
 - `initial_clarifier.enabled`
@@ -76,6 +76,7 @@ JSONを期待するプロンプトでは、実装側が `_extract_json_object()`
 - `tool_selector.max_output_tokens`
 - `tool_selector.reasoning_effort`
 - `tool_selector.max_retries`
+- `initial_clarifier` も有効な場合、このプロンプトと `initial_clarifier_prompt.txt` は順番待ちせず並列実行されます（設定不要、常時有効）。このプロンプトの応答が `rag` / `sandbox` / `web_search` / `file_batch` を含む実行プランを返した場合、`initial_clarifier` が確認要求を返していてもその確認は無視され、このプランがそのまま採用されます。
 
 ## rag_decision_instructions.txt / rag_decision_prompt.txt
 
@@ -326,6 +327,7 @@ JSONでない場合は `ADEQUATE` / `INADEQUATE` と `REASON` ラベルも許容
 注意:
 - `final_evaluation.max_retries` は「評価NG時に別プランでやり直す回数」
 - `final_evaluation.llm_max_retries` は「評価LLMが空応答/None/例外を返したときの短い再試行回数」
+- プランが `rag` / `sandbox` / `web_search` / `file_batch` を1つも使わなかった（直接回答のみの）ときは、`final_evaluation.enabled` の値によらずこのプロンプト自体を呼び出さず、回答をそのまま返します（設定不要、常時有効）。
 
 ## retry_feedback_prefix.txt
 

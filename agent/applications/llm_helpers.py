@@ -13,6 +13,12 @@ def _sse(payload: dict[str, object]) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
+def _as_bool_like(value: object) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 @dataclass(frozen=True)
 class FinalEvaluationSettings:
     enabled: bool

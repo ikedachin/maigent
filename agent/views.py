@@ -51,6 +51,7 @@ from .applications.planning import (
     _replan_after_step,
     _request_initial_clarification_if_needed,
     _route_final_output,
+    _run_precheck_in_parallel,
     _summarize_revised_plan,
     _tool_selector_llm_enabled,
     _tool_selector_max_output_tokens,
@@ -421,6 +422,7 @@ def stream_message(request, thread_id, message_id):
                 "progress": message,
                 "progress_tail": progress_lines[-3:],
                 "progress_truncated": len(progress_lines) > 3,
+                "progress_full": list(progress_lines),
             }
 
         assistant.status = "streaming"
@@ -574,6 +576,16 @@ def _generate_with_final_evaluation(
                 result["plan_summary"],
             )
             return result
+        if not result.get("used_tools", True):
+            if progress:
+                yield _sse(progress(f"Attempt {attempt}: no tools were used; skipping final evaluation."))
+            logger.debug(
+                "final_evaluation_skipped thread_id=%s attempt=%s reason=no_tools_used plan=%r",
+                thread.id,
+                attempt,
+                result["plan_summary"],
+            )
+            return result
         if progress:
             yield _sse(progress(f"Attempt {attempt}: evaluating answer completeness."))
         goal = str(result.get("goal") or build_agent_goal(user_text))
@@ -656,7 +668,9 @@ def _generate_once(
     user_message: Message | None = None,
     assistant_message: Message | None = None,
 ):
-    clarification = _request_initial_clarification_if_needed(config, input_text, latest_user_text=user_text)
+    if progress:
+        yield _sse(progress("Precheck: running clarification check and tool selection in parallel."))
+    clarification, plan = _run_precheck_in_parallel(thread, user_text, input_text, config)
     if clarification:
         content = _format_initial_clarification_message(clarification)
         if progress:
@@ -678,13 +692,13 @@ def _generate_once(
             "clarification_requested": True,
             "evaluation_context": input_text,
         }
-    plan = _build_agent_plan_with_llm_tool_selection(thread, user_text, config)
     if not plan:
         plan = build_agent_plan(user_text, config)
         plan = _apply_llm_rag_decision(thread, user_text, config, plan)
     plan = _avoid_failed_plan(plan, config, failed_plans)
     allowed_tools = _allowed_plan_tools(config)
     plan = _filter_plan_to_allowed_tools(plan, allowed_tools)
+    used_tools = any(step.tool != "final" for step in plan.steps)
     if progress:
         yield _sse(progress(f"Goal: {plan.goal}"))
         yield _sse(progress("Criteria: " + "; ".join(plan.evaluation_criteria)))
@@ -717,6 +731,7 @@ def _generate_once(
             "evaluation_criteria": plan.evaluation_criteria,
             "plan_summary": plan.summary,
             "evaluation_context": str(plan_result["input_text"]),
+            "used_tools": used_tools,
         }
 
     input_text = str(plan_result["input_text"])
@@ -750,6 +765,7 @@ def _generate_once(
         "evaluation_criteria": plan.evaluation_criteria,
         "plan_summary": plan.summary,
         "evaluation_context": input_text,
+        "used_tools": used_tools,
     }
 
 

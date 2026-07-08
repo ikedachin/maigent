@@ -6,6 +6,7 @@ from ..config import RuntimeConfig
 from ..models import AgentRun, AgentTaskRecord, AgentWorkerRun
 from ..prompt_loader import load_prompt
 from ..tooling import AgentPlan, AgentPlanStep, AgentWorkerResult, AgentWorkerSpec, build_agent_worker_specs
+from .llm_helpers import _as_bool_like
 from .planning import TaskExecutionRecord
 
 
@@ -52,12 +53,6 @@ def _multi_agent_progress_visible(config) -> bool:
     if isinstance(multi_agent, dict):
         return _as_bool_like(multi_agent.get("progress_visible", True))
     return True
-
-
-def _as_bool_like(value: object) -> bool:
-    if isinstance(value, bool):
-        return value
-    return str(value).strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _build_multi_agent_workers(plan: AgentPlan, user_text: str, config) -> list[AgentWorkerSpec]:

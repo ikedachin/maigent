@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TypedDict
 
@@ -199,14 +200,29 @@ def _filter_plan_to_allowed_tools(plan: AgentPlan, allowed_tools: set[str]) -> A
 
 
 def _build_agent_plan_with_llm_tool_selection(thread: Thread, user_text: str, config) -> AgentPlan | None:
-    if not _tool_selector_llm_enabled(config):
-        return None
-    tools = _available_tool_specs(thread, config)
+    tools = _prepare_tool_selection(thread, config)
     if not tools:
         return None
     decision = _select_tools_with_llm(config, user_text, tools)
     if not decision or not decision.steps:
         return None
+    return _finalize_tool_selection_plan(thread, user_text, config, tools, decision)
+
+
+def _prepare_tool_selection(thread: Thread, config) -> list[dict[str, str]] | None:
+    if not _tool_selector_llm_enabled(config):
+        return None
+    tools = _available_tool_specs(thread, config)
+    return tools or None
+
+
+def _finalize_tool_selection_plan(
+    thread: Thread,
+    user_text: str,
+    config,
+    tools: list[dict[str, str]],
+    decision: LlmToolPlanDecision,
+) -> AgentPlan | None:
     decision = _correct_tool_selection_for_local_context(thread, user_text, tools, decision)
     goal = build_agent_goal(user_text)
     criteria = build_agent_evaluation_criteria(user_text)
@@ -316,6 +332,48 @@ def _request_initial_clarification_if_needed(config, user_text: str, latest_user
     if not decision or not decision.needed or not decision.questions:
         return None
     return decision
+
+
+def _plan_has_actionable_tool(plan: AgentPlan | None) -> bool:
+    return bool(plan) and any(step.tool in KNOWN_TOOL_NAMES for step in plan.steps)
+
+
+def _run_precheck_in_parallel(thread: Thread, user_text: str, input_text: str, config) -> tuple[InitialClarification | None, AgentPlan | None]:
+    run_clarifier = _initial_clarifier_llm_enabled(config) and not _should_skip_initial_clarifier(user_text, config)
+    tools = _prepare_tool_selection(thread, config)
+
+    clarification: InitialClarification | None = None
+    decision: LlmToolPlanDecision | None = None
+
+    # Only the pure LLM calls run inside the thread pool; DB-backed prep/finalization
+    # (_prepare_tool_selection above, _finalize_tool_selection_plan below) stays on this
+    # thread so it shares the request's DB connection/transaction.
+    if run_clarifier and tools:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            clarifier_future = executor.submit(_decide_initial_clarification, config, input_text)
+            decision_future = executor.submit(_select_tools_with_llm, config, user_text, tools)
+            clarification = clarifier_future.result()
+            decision = decision_future.result()
+    elif run_clarifier:
+        clarification = _decide_initial_clarification(config, input_text)
+    elif tools:
+        decision = _select_tools_with_llm(config, user_text, tools)
+
+    plan: AgentPlan | None = None
+    if tools and decision and decision.steps:
+        plan = _finalize_tool_selection_plan(thread, user_text, config, tools, decision)
+
+    if not clarification or not clarification.needed or not clarification.questions:
+        clarification = None
+    elif _plan_has_actionable_tool(plan):
+        logger.debug(
+            "initial_clarifier_overridden thread_id=%s reason=tool_selector_found_actionable_plan tools=%s",
+            thread.id,
+            [step.tool for step in plan.steps],
+        )
+        clarification = None
+
+    return clarification, plan
 
 
 def _should_skip_initial_clarifier(user_text: str, config) -> bool:

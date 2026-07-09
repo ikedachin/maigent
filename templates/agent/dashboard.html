@@ -179,6 +179,7 @@
 
       <section class="panel">
         <h2 data-i18n="threadMemory">スレッドメモリ</h2>
+        <p class="muted"><span data-i18n="threadMemoryHelp">/compact で要約を作成すると自動でメモリが有効になり、以後の回答生成にこの要約が使われます。無効にしたい場合は /memories を実行してください。</span></p>
         {% if thread.summary %}
           <pre class="memory-summary" data-thread-summary>{{ thread.summary }}</pre>
         {% else %}

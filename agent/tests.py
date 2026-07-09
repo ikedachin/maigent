@@ -551,6 +551,31 @@ class ChatFlowTests(TestCase):
         self.assertIn(self.thread.summary, payload["content"])
         self.assertEqual(payload["thread_summary"], self.thread.summary)
 
+    def test_compact_automatically_enables_thread_memory(self):
+        self.assertFalse(self.thread.memory_enabled)
+        Message.objects.create(thread=self.thread, role="user", content="main thread fact")
+
+        response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/compact"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("メモリ: on", response.json()["content"])
+        self.thread.refresh_from_db()
+        self.assertTrue(self.thread.memory_enabled)
+
+    def test_memories_command_can_disable_after_compact(self):
+        Message.objects.create(thread=self.thread, role="user", content="main thread fact")
+        self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/compact"})
+        self.thread.refresh_from_db()
+        self.assertTrue(self.thread.memory_enabled)
+
+        response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/memories"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"], "Memories: off")
+        self.thread.refresh_from_db()
+        self.assertFalse(self.thread.memory_enabled)
+        self.assertTrue(self.thread.summary)
+
     def test_compact_ignores_slash_commands_and_responses(self):
         Message.objects.create(thread=self.thread, role="user", content="/status")
         Message.objects.create(thread=self.thread, role="assistant", content="Project: Repo")
@@ -735,6 +760,42 @@ class ChatFlowTests(TestCase):
         self.assertEqual(Thread.objects.count(), 2)
         fork = Thread.objects.exclude(id=self.thread.id).get()
         self.assertGreaterEqual(fork.messages.count(), 2)
+
+    @patch("agent.views.load_runtime_config")
+    def test_model_command_returns_current_model(self, mock_config):
+        mock_config.return_value.model = "test-model"
+        mock_config.return_value.sources = []
+
+        response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/model"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"], "Current model: test-model")
+
+    def test_resume_command_lists_recent_threads(self):
+        other = Thread.objects.create(project=self.project, title="Other thread")
+
+        response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/resume"})
+
+        self.assertEqual(response.status_code, 200)
+        content = response.json()["content"]
+        self.assertIn(f"#{other.id} Other thread", content)
+        self.assertIn(f"#{self.thread.id} Main", content)
+
+    def test_status_only_stub_commands_return_placeholder(self):
+        for command in ["/experimental", "/agent", "/theme", "/apps"]:
+            with self.subTest(command=command):
+                response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": command})
+
+                self.assertEqual(response.status_code, 200)
+                content = response.json()["content"]
+                self.assertIn(command, content)
+                self.assertIn("初回版では状態表示のみ", content)
+
+    def test_unknown_slash_command_returns_error_message(self):
+        response = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "/nonexistent"})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["content"], "未対応のスラッシュコマンドです: /nonexistent")
 
     def test_delete_thread_redirects_to_remaining_thread(self):
         other = Thread.objects.create(project=self.project, title="Other")
@@ -1315,7 +1376,7 @@ class ChatFlowTests(TestCase):
         first_evaluation_prompt = mock_complete.call_args_list[1].args[1]
         self.assertIn("Goal set before planning:", first_evaluation_prompt)
         self.assertIn("Evaluation criteria set before planning:", first_evaluation_prompt)
-        self.assertIn("ユーザーの依頼に直接対応", first_evaluation_prompt)
+        self.assertIn("ユーザーの発言に直接対応", first_evaluation_prompt)
         self.assertEqual(mock_complete.call_args_list[1].kwargs["max_output_tokens"], 80)
         self.assertEqual(mock_complete.call_args_list[1].kwargs["reasoning_effort"], "minimal")
 
@@ -2411,7 +2472,10 @@ class ChatFlowTests(TestCase):
         plan = build_agent_plan("正確に説明してください", Config())
 
         self.assertEqual(plan.goal, "Answer the user's request: 正確に説明してください")
-        self.assertIn("回答は、ユーザーの依頼に直接対応している。", plan.evaluation_criteria)
+        self.assertIn(
+            "回答は、ユーザーの発言に直接対応している。具体的な作業依頼であれば要求に応え、雑談・近況報告・意思表示など会話的な発言であれば、タスクの成果物ではなく自然な受け答えで応じている。",
+            plan.evaluation_criteria,
+        )
         self.assertEqual([step.tool for step in plan.steps], ["final"])
         self.assertFalse(can_build_sandbox_program("正確に説明してください"))
 

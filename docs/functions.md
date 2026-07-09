@@ -241,10 +241,10 @@ Dockerコンテナ内でPythonコードを実行します。
 - `/write <path> -- <content>`: 許可済みパスへ書き込み
 - `/append <path> -- <content>`: 許可済みパスへ追記
 - `/features list|enable|disable`: 機能フラグ操作
-- `/compact`: スレッド要約を更新
+- `/compact`: スレッド要約を更新し、そのスレッドのメモリを自動的に有効化
 - `/resume`: 再開可能なスレッドを表示
 - `/fork`: スレッドを複製
-- `/memories`: メモリ有効/無効を切り替え
+- `/memories`: メモリ有効/無効を切り替え（主に、`/compact`で有効化されたメモリを無効化する用途）
 
 ## ファイルアクセスと保存
 

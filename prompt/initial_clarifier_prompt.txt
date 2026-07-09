@@ -1,4 +1,4 @@
-User request and conversation context:
+Latest user message and conversation context:
 {{user_text}}
 
-あなたは最新のユーザー依頼に対して確認が必要な項目があるかどうかを判断してください。
+あなたは最新のユーザーメッセージに対して、実行前に確認が必要な項目があるかどうかを判断してください。それが具体的な作業依頼なのか、単なる会話（雑談・近況報告・意思表示など）なのかも踏まえて判断してください。

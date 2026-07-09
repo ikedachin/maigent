@@ -165,6 +165,25 @@ Dockerコンテナ内でPythonコードを実行します。
 注意:
 - この実装は開発環境でTavily APIキーを用意できず、ライブ検索の動作確認までは行えていません(モックしたHTTPレスポンスでのユニットテストのみ)。実際のキーを設定した上での動作確認を推奨します。
 
+### skill:\<name\>（動的スキル）
+
+`.maigent/skills/<name>/SKILL.md` から発見された、プロジェクト固有の再利用可能な指示です。固定4種のツール(`rag`/`sandbox`/`web_search`/`file_batch`)とは異なり、プロジェクトごとに動的に増減します。
+
+主な処理:
+- `_available_tool_specs()` が `.maigent/skills/*/SKILL.md` を読み、`skill:<name>` という名前・`description`(frontmatter)付きのツールとしてtool_selectorへ提示する
+- LLMが `skill:<name>` を選択すると、`_execute_agent_task()` がSKILL.mdの本文(frontmatterより後ろ)を回答生成の入力へ追記する
+- 本文は「従うべき指示」として渡るだけで、コード実行や外部アクセスは一切行わない(あくまでプロンプト注入)
+
+関連関数:
+- `load_skills()` / `Skill`（`agent/config.py`）
+- `_available_tool_specs()` / `_allowed_plan_tools()`（`agent/applications/planning.py`）
+- `_execute_agent_task()` の `skill:` 分岐（`agent/views.py`）
+
+注意:
+- 有効/無効の設定項目はなく、`SKILL.md` の有無だけで決まる
+- 同名スキルは プロジェクト > アプリ > ユーザー の順で後の層が上書きする
+- `SKILL.md` が無い、または本文が空のディレクトリは無視される
+
 ## 動的リプラン
 
 ### dynamic_replanner
@@ -265,6 +284,8 @@ Dockerコンテナ内でPythonコードを実行します。
 - `_persist_sandbox_artifacts()`
 
 ## 新しいツールを追加する方法
+
+コードを書かずに済む場合は、`.maigent/skills/<name>/SKILL.md` を追加するだけで新しい振る舞いをtool_selectorへ登録できます（上記「skill:\<name\>」参照）。Python実装が必要な固定ツール（DB接続など）を追加する場合は以下の手順です。
 
 例として `database` ツールを追加する場合の手順です。
 

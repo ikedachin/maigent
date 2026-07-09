@@ -209,6 +209,44 @@ tools:
 
 `web_search.enabled` を `true` にし、`api_key`(または環境変数 `TAVILY_API_KEY`)を設定すると、[Tavily](https://tavily.com/) の検索APIを使って最新情報や外部情報を取得します。APIキー未設定の場合は、計画に選択されても「APIキーが未設定です」という明確なメッセージを返し、黙って失敗しません。`max_results`(既定5、1〜10)は取得件数、`timeout_seconds`(既定10、1〜30)はHTTPタイムアウト秒です。この実装は本リポジトリの開発環境ではTavily APIキーを用意できず、ライブ検索の動作確認までは行えていません。実際のキーを設定した上で一度動作確認することを推奨します。
 
+## Project instructions and skills (AGENTS.md / SKILL.md)
+
+Claude Codeなどで使われる `AGENTS.md` / `SKILL.md` 相当の規約ファイルに対応しています。どちらも `.maigent/` 配下に置くだけで、コード変更や設定なしに反映されます。読み込み順は `.maigent/config.yaml` と同じ3層（`~/.maigent/` → アプリ直下の `.maigent/` → プロジェクト内の `.maigent/`）です。
+
+### `.maigent/AGENTS.md`
+
+プレーンテキストのプロジェクト向け指示書です。存在する層をすべて連結し、`base_instructions.txt` の直後、スレッド要約メモリより前に system instructions へ差し込まれます（[agent/views.py:470](agent/views.py:470) の `_build_instructions()`）。トグルや有効/無効設定はなく、ファイルの有無だけで決まります。
+
+```
+.maigent/AGENTS.md
+```
+```markdown
+このプロジェクトでは常に丁寧語で回答してください。
+金額は必ず税込表記にしてください。
+```
+
+テンプレートは [`.maigent/AGENTS.sample.md`](.maigent/AGENTS.sample.md) を参照してください。`config.yaml.sample` と同じ考え方で、ファイル名が `AGENTS.md` と完全一致しないため実際には読み込まれません。有効化する場合は中身を参考に、同じ `.maigent/` フォルダ内へ `AGENTS.md` という名前で作成してください。
+
+### `.maigent/skills/<name>/SKILL.md`
+
+再利用可能な手順・ガイドラインを、ツール選択（`tool_selector`）に組み込まれた1つの選択肢として登録します。frontmatter（`---`区切り）で `name` / `description` を指定し、本文に実際の指示を書きます。
+
+```
+.maigent/skills/weekly-report/SKILL.md
+```
+```markdown
+---
+name: weekly-report
+description: 週次売上レポートを固定フォーマットで作成する。
+---
+
+回答は必ず「Weekly Report:」から始め、箇条書き3点で要点をまとめてください。
+```
+
+`tool_selector.enabled` が `true` の場合、このスキルは `skill:weekly-report` という名前でツール一覧に加わり、依頼内容が `description` に合致するとLLMがこれを選択します。選択されると本文（frontmatterより後ろ）がその回答生成の入力に差し込まれ、以後の回答はこの指示に従います。`frontmatter` を省略した場合はディレクトリ名がスキル名になり、`description` は空扱いになります（LLMには「'<name>' スキルの指示に従う」という汎用文言が渡ります）。`SKILL.md` が存在しない、または本文が空のディレクトリは無視されます。同名のスキルがある場合は プロジェクト > アプリ > ユーザー の順で後の層が上書きします。
+
+書き方のテンプレートは [`.maigent/skill/sample/SKILL.md`](.maigent/skill/sample/SKILL.md) を参照してください。ここは意図的に `skills`（複数形）ではなく `skill`（単数形）に置かれており、`load_skills()` の探索対象外なので実際には読み込まれません。実際に使う場合は中身を `.maigent/skills/<スキル名>/SKILL.md` へコピーしてください。
+
 ## Sandbox image
 
 Docker sandboxを使う前に、ローカル用イメージを一度ビルドしてください。

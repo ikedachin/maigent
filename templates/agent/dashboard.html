@@ -188,6 +188,23 @@
       </section>
 
       <section class="panel">
+        <h2 data-i18n="skills">スキル</h2>
+        <p class="muted"><span data-i18n="skillsHelp">.maigent/skills/&lt;name&gt;/SKILL.md を置くと、ツール選択に自動で候補として加わります。</span></p>
+        {% if skills %}
+          <div class="list">
+            {% for skill in skills %}
+              <div class="tool-item">
+                <strong>skill:{{ skill.name }}</strong>
+                <small>{{ skill.description|default:"" }}</small>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <p class="muted" data-i18n="noSkills">検出されたスキルはありません。</p>
+        {% endif %}
+      </section>
+
+      <section class="panel">
         <h2 data-i18n="accessPaths">アクセス許可</h2>
         <form class="stack-form" method="post" action="{% url 'add_access_path' current_project.id %}">
           {% csrf_token %}

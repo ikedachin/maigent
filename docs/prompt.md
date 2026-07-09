@@ -70,13 +70,14 @@ JSONを期待するプロンプトでは、実装側が `_extract_json_object()`
 - `file_batch`: 許可済みローカルファイルをフォルダ横断でmap-reduce処理する
 - `sandbox`: Docker内でPythonを実行する
 - `web_search`: Tavily検索APIで外部情報を取得する。`tools.web_search.api_key` 未設定時は未設定メッセージを返す
+- `skill:<name>`: `.maigent/skills/<name>/SKILL.md` から動的に発見されたプロジェクト固有の指示。選択されると本文が回答生成の入力へ差し込まれる（README「Project instructions and skills」参照）
 
 関連設定:
 - `tool_selector.enabled`
 - `tool_selector.max_output_tokens`
 - `tool_selector.reasoning_effort`
 - `tool_selector.max_retries`
-- `initial_clarifier` も有効な場合、このプロンプトと `initial_clarifier_prompt.txt` は順番待ちせず並列実行されます（設定不要、常時有効）。このプロンプトの応答が `rag` / `sandbox` / `web_search` / `file_batch` を含む実行プランを返した場合、`initial_clarifier` が確認要求を返していてもその確認は無視され、このプランがそのまま採用されます。
+- `initial_clarifier` も有効な場合、このプロンプトと `initial_clarifier_prompt.txt` は順番待ちせず並列実行されます（設定不要、常時有効）。このプロンプトの応答が `rag` / `sandbox` / `web_search` / `file_batch` / `skill:<name>` を含む実行プランを返した場合、`initial_clarifier` が確認要求を返していてもその確認は無視され、このプランがそのまま採用されます。
 
 ## rag_decision_instructions.txt / rag_decision_prompt.txt
 

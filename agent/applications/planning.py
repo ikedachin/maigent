@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import TypedDict
 
-from ..config import RuntimeConfig
+from ..config import RuntimeConfig, load_skills
 from ..models import AgentRun, Thread
 from ..prompt_loader import load_prompt
 from ..tooling import (
@@ -335,7 +335,9 @@ def _request_initial_clarification_if_needed(config, user_text: str, latest_user
 
 
 def _plan_has_actionable_tool(plan: AgentPlan | None) -> bool:
-    return bool(plan) and any(step.tool in KNOWN_TOOL_NAMES for step in plan.steps)
+    if not plan:
+        return False
+    return any(step.tool in KNOWN_TOOL_NAMES or step.tool.startswith("skill:") for step in plan.steps)
 
 
 def _run_precheck_in_parallel(thread: Thread, user_text: str, input_text: str, config) -> tuple[InitialClarification | None, AgentPlan | None]:
@@ -426,7 +428,8 @@ def _format_initial_clarification_message(clarification: InitialClarification) -
 
 
 def _select_tools_with_llm(config, user_text: str, tools: list[dict[str, str]]) -> LlmToolPlanDecision | None:
-    instructions = _append_allowed_tool_instruction(load_prompt("tool_selection_instructions.txt"), _allowed_plan_tools(config))
+    allowed_names = {tool["name"] for tool in tools}
+    instructions = _append_allowed_tool_instruction(load_prompt("tool_selection_instructions.txt"), allowed_names)
     prompt = load_prompt("tool_selection_prompt.txt", user_text=user_text, tools=json.dumps(tools, ensure_ascii=False))
     _log_tail("llm_prompt", prompt, config=config, purpose="tool_selection")
     payload = None
@@ -457,11 +460,7 @@ def _select_tools_with_llm(config, user_text: str, tools: list[dict[str, str]]) 
     if payload is None:
         logger.debug("tool_selection_fallback reason=no_valid_response attempts=%s", max_attempts)
         return None
-    steps = _parse_plan_tasks(payload.get("steps"), _allowed_plan_tools(config))
-    if not steps:
-        return None
-    allowed = {tool["name"] for tool in tools}
-    steps = [step for step in steps if step.tool in allowed]
+    steps = _parse_plan_tasks(payload.get("steps"), allowed_names)
     if not steps:
         return None
     if steps[-1].tool != "final":
@@ -488,6 +487,9 @@ def _available_tool_specs(thread: Thread, config) -> list[dict[str, str]]:
         tools.append({"name": "sandbox", "description": "Run deterministic Python in Docker for calculations, code execution, data processing, or artifact generation."})
     if _tool_enabled(config, "web_search"):
         tools.append({"name": "web_search", "description": "Collect current or external web information via a configured search API (Tavily)."})
+    for skill in load_skills(thread.project.path):
+        description = skill.description or f"Follow the '{skill.name}' skill instructions."
+        tools.append({"name": f"skill:{skill.name}", "description": description})
     return tools
 
 
@@ -521,8 +523,11 @@ def _allowed_configured_tool_names(config) -> set[str]:
     return {name for name in KNOWN_TOOL_NAMES if _tool_enabled(config, name)}
 
 
-def _allowed_plan_tools(config) -> set[str]:
-    return _allowed_configured_tool_names(config) | INTERNAL_PLAN_TOOL_NAMES
+def _allowed_plan_tools(config, thread: Thread | None = None) -> set[str]:
+    allowed = _allowed_configured_tool_names(config) | INTERNAL_PLAN_TOOL_NAMES
+    if thread is not None:
+        allowed |= {f"skill:{skill.name}" for skill in load_skills(thread.project.path)}
+    return allowed
 
 
 def _append_allowed_tool_instruction(instructions: str, allowed_tools: set[str]) -> str:

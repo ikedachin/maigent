@@ -8,7 +8,7 @@ from django.test import TestCase, override_settings
 from django.urls import reverse
 
 from .access import is_path_allowed, normalize_access_path
-from .config import RuntimeConfig, load_runtime_config
+from .config import RuntimeConfig, load_agents_md, load_runtime_config, load_skills
 from .openai_client import stream_response
 from .models import AgentRun, AgentTaskRecord, AgentWorkerRun, AppSetting, ApprovalRequest, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .tooling import (
@@ -34,7 +34,7 @@ from .applications.rag import (
     _format_file_list_for_display,
     _search_terms,
 )
-from .applications.planning import _initial_clarifier_max_output_tokens, _parse_plan_tasks
+from .applications.planning import _available_tool_specs, _initial_clarifier_max_output_tokens, _parse_plan_tasks
 from .applications.llm_helpers import _control_config_max_output_tokens, _final_evaluation_max_output_tokens
 from .applications.sandbox import (
     _generate_sandbox_code_with_retries,
@@ -3408,6 +3408,200 @@ class ChatFlowTests(TestCase):
             self.assertFalse(is_path_allowed(self.project, str(escape_link / "secret.txt"), write=False))
             self.assertFalse(is_path_allowed(self.project, str(outside_root), write=False))
             self.assertTrue(is_path_allowed(self.project, str(allowed_root / "inside.txt"), write=False))
+
+
+class AgentsMdAndSkillTests(TestCase):
+    def setUp(self):
+        self.project = Project.objects.create(name="SkillProj", path="")
+        self.thread = Thread.objects.create(project=self.project, title="Main")
+
+    def _set_project_path(self, root_dir: str) -> None:
+        self.project.path = root_dir
+        self.project.save(update_fields=["path"])
+
+    def test_load_agents_md_includes_project_layer(self):
+        with TemporaryDirectory() as root_dir:
+            maigent_dir = Path(root_dir) / ".maigent"
+            maigent_dir.mkdir()
+            (maigent_dir / "AGENTS.md").write_text("Follow the project style guide.", encoding="utf-8")
+
+            content = load_agents_md(root_dir)
+
+        self.assertIn("Follow the project style guide.", content)
+
+    def test_load_agents_md_returns_empty_when_absent(self):
+        with TemporaryDirectory() as root_dir:
+            content = load_agents_md(root_dir)
+
+        self.assertNotIn("Follow the project style guide.", content)
+
+    def test_build_instructions_includes_project_agents_md(self):
+        with TemporaryDirectory() as root_dir:
+            self._set_project_path(root_dir)
+            maigent_dir = Path(root_dir) / ".maigent"
+            maigent_dir.mkdir()
+            (maigent_dir / "AGENTS.md").write_text("常に丁寧語で回答してください。", encoding="utf-8")
+
+            instructions = _build_instructions(self.thread)
+
+        self.assertIn("Project AGENTS.md instructions:", instructions)
+        self.assertIn("常に丁寧語で回答してください。", instructions)
+
+    def test_load_skills_parses_frontmatter_and_body(self):
+        with TemporaryDirectory() as root_dir:
+            skill_dir = Path(root_dir) / ".maigent" / "skills" / "weekly-report"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: weekly-report\ndescription: Summarize weekly sales figures.\n---\n\nStep 1: gather data.\nStep 2: summarize.",
+                encoding="utf-8",
+            )
+
+            skills = load_skills(root_dir)
+
+        found = [skill for skill in skills if skill.name == "weekly-report"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].description, "Summarize weekly sales figures.")
+        self.assertIn("Step 1: gather data.", found[0].body)
+
+    def test_load_skills_falls_back_to_directory_name_without_frontmatter(self):
+        with TemporaryDirectory() as root_dir:
+            skill_dir = Path(root_dir) / ".maigent" / "skills" / "my-skill"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("Just do the thing.", encoding="utf-8")
+
+            skills = load_skills(root_dir)
+
+        found = [skill for skill in skills if skill.name == "my-skill"]
+        self.assertEqual(len(found), 1)
+        self.assertEqual(found[0].description, "")
+        self.assertEqual(found[0].body, "Just do the thing.")
+
+    def test_load_skills_ignores_directories_without_skill_md(self):
+        with TemporaryDirectory() as root_dir:
+            (Path(root_dir) / ".maigent" / "skills" / "empty-dir").mkdir(parents=True)
+
+            skills = load_skills(root_dir)
+
+        self.assertEqual(skills, [])
+
+    def test_repo_sample_skill_is_not_loaded(self):
+        # .maigent/skill/sample/SKILL.md (singular "skill") is a documentation
+        # template, deliberately outside .maigent/skills/ (plural) so it never
+        # becomes an active tool-selector candidate for real projects.
+        skills = load_skills("")
+
+        self.assertNotIn("sample-skill", {skill.name for skill in skills})
+
+    def test_repo_sample_agents_md_is_not_loaded(self):
+        # .maigent/AGENTS.sample.md is a documentation template (same convention
+        # as config.yaml.sample); load_agents_md() only reads the exact filename
+        # "AGENTS.md", so this sample never affects real instructions.
+        content = load_agents_md("")
+
+        self.assertNotIn("常に丁寧語で回答してください", content)
+
+    def test_available_tool_specs_includes_discovered_skill(self):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return False
+
+        with TemporaryDirectory() as root_dir:
+            self._set_project_path(root_dir)
+            skill_dir = Path(root_dir) / ".maigent" / "skills" / "weekly-report"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: weekly-report\ndescription: Summarize weekly sales figures.\n---\n\nBody", encoding="utf-8"
+            )
+
+            specs = _available_tool_specs(self.thread, Config())
+
+        spec_by_name = {spec["name"]: spec for spec in specs}
+        self.assertIn("skill:weekly-report", spec_by_name)
+        self.assertEqual(spec_by_name["skill:weekly-report"]["description"], "Summarize weekly sales figures.")
+
+    def test_allowed_plan_tools_includes_discovered_skill_names(self):
+        class Config:
+            def tool_enabled(self, name, default=False):
+                return False
+
+        with TemporaryDirectory() as root_dir:
+            self._set_project_path(root_dir)
+            skill_dir = Path(root_dir) / ".maigent" / "skills" / "weekly-report"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text("---\nname: weekly-report\n---\nBody", encoding="utf-8")
+
+            allowed_with_thread = _allowed_plan_tools(Config(), self.thread)
+            allowed_without_thread = _allowed_plan_tools(Config())
+
+        self.assertIn("skill:weekly-report", allowed_with_thread)
+        self.assertIn("final", allowed_with_thread)
+        self.assertNotIn("skill:weekly-report", allowed_without_thread)
+
+    @patch("agent.applications.llm_helpers.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_skill_selected_by_tool_selector_is_applied(self, mock_config, mock_stream, mock_complete):
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = False
+
+            def tool_enabled(self, name, default=False):
+                return name == "tool_selector"
+
+        def fake_complete(config, prompt, instructions, **kwargs):
+            if "ツールを選択" in instructions:
+                return '{"steps": [{"tool": "skill:weekly-report", "purpose": "apply weekly report skill"}], "reason": "matches skill"}'
+            return '{"needs_clarification": false, "reason": "clear", "questions": []}'
+
+        with TemporaryDirectory() as root_dir:
+            self._set_project_path(root_dir)
+            skill_dir = Path(root_dir) / ".maigent" / "skills" / "weekly-report"
+            skill_dir.mkdir(parents=True)
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: weekly-report\ndescription: Summarize weekly sales figures in a fixed format.\n---\n\n"
+                "Always start the answer with 'Weekly Report:' and list three bullet points.",
+                encoding="utf-8",
+            )
+            mock_config.return_value = Config()
+            mock_complete.side_effect = fake_complete
+            mock_stream.return_value = iter([("delta", "Weekly Report: ...")])
+
+            create = self.client.post(reverse("send_message", args=[self.thread.id]), {"message": "今週の売上をまとめて"})
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            body = b"".join(stream.streaming_content).decode()
+
+        self.assertIn("Weekly Report: ...", body)
+        answer_generation_input = mock_stream.call_args.args[1]
+        self.assertIn("Always start the answer with 'Weekly Report:'", answer_generation_input)
+
+    def test_execute_agent_task_reports_missing_skill(self):
+        from .views import _execute_agent_task
+
+        with TemporaryDirectory() as root_dir:
+            self._set_project_path(root_dir)
+
+            runner = _execute_agent_task(
+                self.thread,
+                "hello",
+                object(),
+                "input text",
+                [],
+                AgentPlanStep("skill:missing", "apply missing skill"),
+            )
+            outcome = None
+            while True:
+                try:
+                    next(runner)
+                except StopIteration as exc:
+                    outcome = exc.value
+                    break
+
+        self.assertFalse(outcome["ok"])
+        self.assertIn("見つかりませんでした", outcome["final_message"])
 
 
 @override_settings(STATICFILES_DIRS=[])

@@ -84,7 +84,7 @@ from .applications.sandbox import (
     _sandbox_datasets_from_rag_context,
 )
 from .applications.web_search import search_web
-from .config import RuntimeConfig, load_runtime_config
+from .config import RuntimeConfig, load_agents_md, load_runtime_config, load_skills
 from .file_broker import allowed_image_mime_type, resolve_project_output_file
 from .models import AgentRun, AgentWorkerRun, AppSetting, ApprovalRequest, Automation, FeatureFlag, Message, Project, ProjectAccessPath, Thread
 from .openai_client import stream_response
@@ -157,6 +157,7 @@ def dashboard(request, thread_id=None):
             "rag_top_k": rag_top_k,
             "final_evaluation": final_evaluation,
             "tool_settings": _tool_settings(config),
+            "skills": load_skills(project.path),
         },
     )
 
@@ -469,6 +470,10 @@ def stream_message(request, thread_id, message_id):
 
 def _build_instructions(thread: Thread) -> str:
     lines = [load_prompt("base_instructions.txt")]
+    agents_md = load_agents_md(thread.project.path)
+    if agents_md:
+        lines.append("Project AGENTS.md instructions:")
+        lines.append(agents_md)
     if thread.memory_enabled and thread.summary:
         lines.append("Thread memory summary:")
         lines.append(thread.summary)
@@ -696,7 +701,7 @@ def _generate_once(
         plan = build_agent_plan(user_text, config)
         plan = _apply_llm_rag_decision(thread, user_text, config, plan)
     plan = _avoid_failed_plan(plan, config, failed_plans)
-    allowed_tools = _allowed_plan_tools(config)
+    allowed_tools = _allowed_plan_tools(config, thread)
     plan = _filter_plan_to_allowed_tools(plan, allowed_tools)
     used_tools = any(step.tool != "final" for step in plan.steps)
     if progress:
@@ -877,7 +882,7 @@ def _execute_multi_agent_plan(
     if len(workers) < 2 or not run:
         return (yield from _execute_agent_plan(thread, user_text, config, plan, progress, run=run, input_text=input_text))
 
-    allowed_tools = _allowed_plan_tools(config)
+    allowed_tools = _allowed_plan_tools(config, thread)
     plan = _filter_plan_to_allowed_tools(plan, allowed_tools)
     base_input = input_text or user_text
     parent_state = AgentState.from_plan(plan, base_input, run=run, allowed_tools=allowed_tools)
@@ -1129,7 +1134,7 @@ def _execute_agent_plan(
     run: AgentRun | None = None,
     input_text: str | None = None,
 ):
-    allowed_tools = _allowed_plan_tools(config)
+    allowed_tools = _allowed_plan_tools(config, thread)
     plan = _filter_plan_to_allowed_tools(plan, allowed_tools)
     state = AgentState.from_plan(plan, input_text or user_text, run=run, allowed_tools=allowed_tools)
     _sync_agent_run_state(state)
@@ -1358,6 +1363,20 @@ def _execute_agent_task(
         if artifact_message:
             final_message = f"{final_message}\n\n{artifact_message}"
         return {"ok": True, "input_text": input_text, "final_message": final_message}
+    if step.tool.startswith("skill:"):
+        skill_name = step.tool[len("skill:") :]
+        skill = next((item for item in load_skills(thread.project.path) if item.name == skill_name), None)
+        if not skill:
+            logger.debug("agent_step_result thread_id=%s tool=%s status=not_found", thread.id, step.tool)
+            if progress:
+                yield _sse(progress(f"Tool {step.tool}: skill definition not found."))
+            return {"ok": False, "input_text": input_text, "final_message": f"スキル '{skill_name}' が見つかりませんでした。"}
+        plan_trace.append(f"Skill result: applied '{skill.name}' instructions from {skill.path}.")
+        logger.debug("agent_step_result thread_id=%s tool=%s status=adequate path=%s", thread.id, step.tool, skill.path)
+        if progress:
+            yield _sse(progress(f"Tool {step.tool}: applying skill instructions."))
+        skill_input_text = input_text + f"\n\nSkill instructions to follow ({skill.name}):\n{skill.body}"
+        return {"ok": True, "input_text": _prepend_plan_trace(skill_input_text, plan_trace), "final_message": ""}
     return {"ok": True, "input_text": input_text, "final_message": ""}
 
 

@@ -515,3 +515,90 @@ def load_runtime_config(project_path: str = "") -> RuntimeConfig:
         sources.append("OPENAI_MODEL")
 
     return RuntimeConfig(values=values, sources=sources)
+
+
+def _maigent_layer_dirs(project_path: str = "") -> list[Path]:
+    dirs = [Path.home() / ".maigent", Path(settings.BASE_DIR) / ".maigent"]
+    if project_path:
+        project_dir = Path(project_path).expanduser() / ".maigent"
+        if project_dir != dirs[-1]:
+            dirs.append(project_dir)
+    return dirs
+
+
+def load_agents_md(project_path: str = "") -> str:
+    """Read AGENTS.md from each .maigent/ layer (user, app, project) and
+    concatenate whichever are present, in that precedence order."""
+    parts: list[str] = []
+    for directory in _maigent_layer_dirs(project_path):
+        agents_path = directory / "AGENTS.md"
+        try:
+            if agents_path.is_file():
+                text = agents_path.read_text(encoding="utf-8").strip()
+                if text:
+                    parts.append(text)
+        except OSError:
+            continue
+    return "\n\n---\n\n".join(parts)
+
+
+@dataclass(frozen=True)
+class Skill:
+    name: str
+    description: str
+    body: str
+    path: str
+
+
+def _parse_skill_frontmatter(text: str) -> tuple[dict[str, str], str]:
+    """Parse a SKILL.md file: optional `---`-delimited frontmatter with flat
+    `key: value` pairs, followed by the markdown body. Returns (frontmatter, body)."""
+    lines = text.lstrip("﻿").splitlines()
+    if not lines or lines[0].strip() != "---":
+        return {}, text.strip()
+    frontmatter: dict[str, str] = {}
+    end_index = None
+    for index, line in enumerate(lines[1:], start=1):
+        if line.strip() == "---":
+            end_index = index
+            break
+        if ":" in line:
+            key, _, value = line.partition(":")
+            frontmatter[key.strip()] = value.strip().strip('"').strip("'")
+    if end_index is None:
+        return {}, text.strip()
+    body = "\n".join(lines[end_index + 1 :]).strip()
+    return frontmatter, body
+
+
+def _load_skills_from_dir(skills_dir: Path) -> list[Skill]:
+    skills: list[Skill] = []
+    if not skills_dir.is_dir():
+        return skills
+    for entry in sorted(skills_dir.iterdir()):
+        if not entry.is_dir():
+            continue
+        skill_path = entry / "SKILL.md"
+        if not skill_path.is_file():
+            continue
+        try:
+            text = skill_path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        frontmatter, body = _parse_skill_frontmatter(text)
+        if not body:
+            continue
+        name = frontmatter.get("name") or entry.name
+        description = frontmatter.get("description") or ""
+        skills.append(Skill(name=name, description=description, body=body, path=str(skill_path)))
+    return skills
+
+
+def load_skills(project_path: str = "") -> list[Skill]:
+    """Discover .maigent/skills/<name>/SKILL.md across the user, app, and
+    project layers. Later layers override earlier ones with the same skill name."""
+    skills: dict[str, Skill] = {}
+    for directory in _maigent_layer_dirs(project_path):
+        for skill in _load_skills_from_dir(directory / "skills"):
+            skills[skill.name] = skill
+    return list(skills.values())

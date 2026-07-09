@@ -293,15 +293,17 @@ class ConfigTests(TestCase):
         self.assertEqual(default_config.web_search_api_key, "")
         self.assertEqual(default_config.web_search_max_results, 5)
         self.assertEqual(default_config.web_search_timeout_seconds, 10)
+        self.assertEqual(default_config.web_search_max_retries, 1)
 
         configured = RuntimeConfig(
-            values={"tools": {"web_search": {"api_key": "tvly-abc", "max_results": 999, "timeout_seconds": 999}}},
+            values={"tools": {"web_search": {"api_key": "tvly-abc", "max_results": 999, "timeout_seconds": 999, "max_retries": 999}}},
             sources=[],
         )
 
         self.assertEqual(configured.web_search_api_key, "tvly-abc")
         self.assertEqual(configured.web_search_max_results, 10)
         self.assertEqual(configured.web_search_timeout_seconds, 30)
+        self.assertEqual(configured.web_search_max_retries, 5)
 
     def test_runtime_config_web_search_api_key_falls_back_to_env(self):
         import os
@@ -1295,6 +1297,60 @@ class ChatFlowTests(TestCase):
         self.assertIn("alpha is a sealed book.", body)
         mock_stream.assert_called_once()
         assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertEqual(assistant.content, "alpha is a sealed book.")
+
+    @patch("agent.views.search_web")
+    @patch("agent.applications.llm_helpers.complete_response")
+    @patch("agent.views.stream_response")
+    @patch("agent.views.load_runtime_config")
+    def test_web_search_still_runs_after_rag_finds_no_local_context(self, mock_config, mock_stream, mock_complete, mock_search_web):
+        from .applications.web_search import WebSearchItem, WebSearchResult
+
+        class Config:
+            model = "test-model"
+            api_key = "test-key"
+            base_url = ""
+            sources = []
+            final_evaluation_enabled = False
+
+            def tool_enabled(self, name, default=False):
+                return name in {"tool_selector", "rag", "web_search"}
+
+        def fake_complete(config, prompt, instructions, **kwargs):
+            return (
+                '{"steps": [{"tool": "rag", "purpose": "check local files first"}, '
+                '{"tool": "web_search", "purpose": "search the web as explicitly requested"}], "reason": "user explicitly asked for web"}'
+            )
+
+        mock_config.return_value = Config()
+        mock_complete.side_effect = fake_complete
+        mock_search_web.return_value = WebSearchResult(
+            ok=True,
+            query="今治西高校 校歌",
+            results=(WebSearchItem(title="今治西高校の校歌", url="https://example.com", snippet="..."),),
+        )
+        mock_stream.return_value = iter([("delta", "今治西高校の校歌についての情報です。")])
+
+        # An access path exists (so rag is offered to tool_selector at all) but
+        # its only file is unrelated, so the real rag search finds no adequate
+        # context. Before the fix, rag's "no context" result would end the
+        # whole plan here and web_search would never run.
+        with TemporaryDirectory() as root_dir:
+            (Path(root_dir) / "unrelated.txt").write_text("quarterly budget notes", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=root_dir, mode="read")
+
+            create = self.client.post(
+                reverse("send_message", args=[self.thread.id]), {"message": "今治西校の校歌についてwebを調べてみてよ"}
+            )
+            payload = create.json()
+            stream = self.client.get(payload["stream_url"])
+            b"".join(stream.streaming_content)
+
+        mock_search_web.assert_called_once()
+        mock_stream.assert_called_once()
+        assistant = Message.objects.get(id=payload["assistant_id"])
+        self.assertEqual(assistant.content, "今治西高校の校歌についての情報です。")
+        self.assertNotIn("見つかりませんでした", assistant.content)
         self.assertEqual(AgentRun.objects.filter(assistant_message=assistant).count(), 1)
 
     @patch("agent.applications.llm_helpers.complete_response")
@@ -2834,6 +2890,61 @@ class ChatFlowTests(TestCase):
         self.assertEqual(plan.rag_query, "古書修復師 灰島ノエ")
         self.assertIn("RAG", plan.evaluation_criteria[-1])
 
+    def test_should_force_rag_for_local_context_ignores_generic_investigate_verbs(self):
+        from .applications.planning import _should_force_rag_for_local_context
+
+        # Generic "look into/search/check" verbs alone no longer force rag;
+        # they are not specific to local files and previously over-triggered
+        # via the broad _should_search() marker list.
+        self.assertFalse(_should_force_rag_for_local_context("資料を検索して確認してください"))
+        self.assertFalse(_should_force_rag_for_local_context("ちょっと調べてみてよ"))
+
+    def test_should_force_rag_for_local_context_defers_to_explicit_web_instruction(self):
+        from .applications.planning import _should_force_rag_for_local_context
+
+        # Even though "について" is present, an explicit request to use the web
+        # must not be silently overridden with a forced rag step.
+        self.assertFalse(_should_force_rag_for_local_context("今治西校の校歌についてwebを調べてみてよ"))
+        self.assertFalse(_should_force_rag_for_local_context("この件についてネットで検索して"))
+
+    def test_should_force_rag_for_local_context_still_catches_named_entity_questions(self):
+        from .applications.planning import _should_force_rag_for_local_context
+
+        # The original, intended case (a possibly project-specific proper noun
+        # with no explicit external-search instruction) still forces rag.
+        self.assertTrue(_should_force_rag_for_local_context("古書修復師の灰島ノエについて教えて"))
+
+    @patch("agent.applications.llm_helpers.complete_response")
+    def test_llm_tool_selector_does_not_force_rag_when_web_explicitly_requested(self, mock_complete):
+        class Config:
+            tool_selector = {
+                "enabled": True,
+                "reasoning_effort": "none",
+                "max_output_tokens": 96,
+            }
+
+            def tool_enabled(self, name, default=False):
+                return name in {"tool_selector", "rag", "web_search"} or default
+
+        with TemporaryDirectory() as root_dir:
+            root = Path(root_dir)
+            (root / "unrelated.txt").write_text("quarterly budget notes", encoding="utf-8")
+            ProjectAccessPath.objects.create(project=self.project, path=str(root), mode="read")
+            mock_complete.return_value = json.dumps(
+                {
+                    "steps": [{"tool": "web_search", "purpose": "Search the web as explicitly requested."}],
+                    "rag_query": "",
+                    "reason": "User explicitly asked for a web search.",
+                }
+            )
+
+            from .views import _build_agent_plan_with_llm_tool_selection
+
+            plan = _build_agent_plan_with_llm_tool_selection(self.thread, "今治西校の校歌についてwebを調べてみてよ", Config())
+
+        self.assertIsNotNone(plan)
+        self.assertEqual([step.tool for step in plan.steps], ["web_search", "final"])
+
     @patch("agent.applications.llm_helpers.complete_response")
     def test_llm_tool_selector_adds_file_batch_for_folder_wide_rag_plan(self, mock_complete):
         class Config:
@@ -3482,7 +3593,10 @@ class AgentsMdAndSkillTests(TestCase):
 
             skills = load_skills(root_dir)
 
-        self.assertEqual(skills, [])
+        # Only checks that this test's own (empty) project layer contributed
+        # nothing; the app-level .maigent/skills/ layer may legitimately have
+        # its own real skills, which load_skills() also returns.
+        self.assertFalse(any(skill.path.startswith(root_dir) for skill in skills))
 
     def test_repo_sample_skill_is_not_loaded(self):
         # .maigent/skill/sample/SKILL.md (singular "skill") is a documentation
@@ -3996,6 +4110,157 @@ class WebSearchTests(TestCase):
         self.assertIn("Web search results", result["input_text"])
         self.assertIn("Django 5.1 released", result["input_text"])
         self.assertIn("https://example.com", result["input_text"])
+
+    @patch("agent.views.search_web")
+    def test_execute_agent_task_uses_cleaned_query_for_web_search(self, mock_search_web):
+        from .applications.web_search import WebSearchItem, WebSearchResult
+        from .tooling import AgentPlanStep
+        from .views import _execute_agent_task
+
+        mock_search_web.return_value = WebSearchResult(
+            ok=True,
+            query="今治西高校 校歌",
+            results=(WebSearchItem(title="今治西高校の校歌", url="https://example.com", snippet="..."),),
+        )
+
+        runner = _execute_agent_task(
+            self.thread,
+            "じゃ、ちょっと今治西校の校歌についてwebを調べてみてよ",
+            object(),
+            "answer base",
+            [],
+            AgentPlanStep("web_search", "Search the web."),
+        )
+        while True:
+            try:
+                next(runner)
+            except StopIteration:
+                break
+
+        called_query = mock_search_web.call_args.args[1]
+        self.assertNotEqual(called_query, "じゃ、ちょっと今治西校の校歌についてwebを調べてみてよ")
+        self.assertIn("今治西", called_query)
+
+    def test_execute_agent_task_rag_no_context_continues_when_more_steps_queued(self):
+        from .tooling import AgentPlanStep
+        from .views import _execute_agent_task
+
+        runner = _execute_agent_task(
+            self.thread,
+            "今治西校の校歌について教えて",
+            object(),
+            "answer base",
+            [],
+            AgentPlanStep("rag", "Search local files."),
+            "今治西高校 校歌",
+            None,
+            True,
+        )
+        result = None
+        while True:
+            try:
+                next(runner)
+            except StopIteration as exc:
+                result = exc.value
+                break
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["final_message"], "")
+
+    def test_execute_agent_task_rag_no_context_stops_when_no_more_steps(self):
+        from .tooling import AgentPlanStep
+        from .views import _execute_agent_task
+
+        runner = _execute_agent_task(
+            self.thread,
+            "今治西校の校歌について教えて",
+            object(),
+            "answer base",
+            [],
+            AgentPlanStep("rag", "Search local files."),
+            "今治西高校 校歌",
+        )
+        result = None
+        while True:
+            try:
+                next(runner)
+            except StopIteration as exc:
+                result = exc.value
+                break
+
+        self.assertTrue(result["ok"])
+        self.assertIn("見つかりませんでした", result["final_message"])
+
+    @patch("agent.applications.web_search.urllib.request.urlopen")
+    def test_search_web_retries_on_transient_network_error_then_succeeds(self, mock_urlopen):
+        from .applications.web_search import search_web
+
+        class Config:
+            web_search_api_key = "tvly-test-key"
+            web_search_max_results = 5
+            web_search_timeout_seconds = 10
+            web_search_max_retries = 1
+
+        response_body = json.dumps(
+            {"results": [{"title": "Django 5.1 released", "url": "https://example.com", "content": "Release notes."}]}
+        ).encode("utf-8")
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return response_body
+
+        mock_urlopen.side_effect = [OSError("temporary failure"), Response()]
+
+        result = search_web(Config(), "django latest release")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(mock_urlopen.call_count, 2)
+
+    @patch("agent.applications.web_search.urllib.request.urlopen")
+    def test_search_web_does_not_retry_on_invalid_api_key(self, mock_urlopen):
+        from urllib.error import HTTPError
+
+        from .applications.web_search import search_web
+
+        class Config:
+            web_search_api_key = "tvly-invalid-key"
+            web_search_max_results = 5
+            web_search_timeout_seconds = 10
+            web_search_max_retries = 2
+
+        mock_urlopen.side_effect = HTTPError("https://api.tavily.com/search", 401, "Unauthorized", {}, None)
+
+        result = search_web(Config(), "django latest release")
+
+        self.assertFalse(result.ok)
+        self.assertIn("拒否されました", result.message)
+        self.assertEqual(mock_urlopen.call_count, 1)
+
+    @patch("agent.applications.web_search.urllib.request.urlopen")
+    def test_search_web_exhausts_retries_on_repeated_server_error(self, mock_urlopen):
+        from urllib.error import HTTPError
+
+        from .applications.web_search import search_web
+
+        class Config:
+            web_search_api_key = "tvly-test-key"
+            web_search_max_results = 5
+            web_search_timeout_seconds = 10
+            web_search_max_retries = 2
+
+        mock_urlopen.side_effect = HTTPError("https://api.tavily.com/search", 503, "Service Unavailable", {}, None)
+
+        result = search_web(Config(), "django latest release")
+
+        self.assertFalse(result.ok)
+        self.assertIn("status=503", result.message)
+        self.assertEqual(mock_urlopen.call_count, 3)
 
 
 class LoggingRedactionTests(TestCase):

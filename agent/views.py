@@ -29,6 +29,7 @@ from .applications.rag import (
     DISPLAY_FILE_LIST_LIMIT,
     MAX_RAG_TOP_K,
     _apply_llm_rag_decision,
+    _build_answer_query,
     _build_rag_input,
     _format_file_list_for_display,
     _get_rag_top_k,
@@ -1150,7 +1151,10 @@ def _execute_agent_plan(
             _sync_agent_run_state(state)
             continue
         input_before = state.input_text
-        outcome = yield from _execute_agent_task(thread, user_text, config, state.input_text, plan_trace, step, plan.rag_query, progress)
+        has_more_steps = any(queued.tool != "final" for queued in state.plan_queue)
+        outcome = yield from _execute_agent_task(
+            thread, user_text, config, state.input_text, plan_trace, step, plan.rag_query, progress, has_more_steps=has_more_steps
+        )
         state.input_text = str(outcome["input_text"])
         state.final_message = str(outcome["final_message"])
         task_record = TaskExecutionRecord(
@@ -1230,12 +1234,14 @@ def _execute_agent_task(
     step: AgentPlanStep,
     preferred_rag_query: str = "",
     progress=None,
+    has_more_steps: bool = False,
 ):
     logger.debug("agent_step_start thread_id=%s tool=%s purpose=%s", thread.id, step.tool, step.purpose)
     if progress:
         yield _sse(progress(f"Tool {step.tool}: {step.purpose}"))
     if step.tool == "web_search":
-        search = search_web(config, user_text)
+        search_query = _build_answer_query(user_text)
+        search = search_web(config, search_query)
         if not search.ok:
             logger.debug("agent_step_result thread_id=%s tool=web_search status=failed message=%r", thread.id, search.message)
             if progress:
@@ -1261,9 +1267,17 @@ def _execute_agent_task(
     if step.tool == "rag":
         rag = _build_rag_input(thread, user_text, preferred_rag_query, input_text)
         if rag.searched and not rag.has_context:
-            logger.debug("agent_step_result thread_id=%s tool=rag status=no_context query=%r", thread.id, rag.query)
+            logger.debug(
+                "agent_step_result thread_id=%s tool=rag status=no_context query=%r has_more_steps=%s",
+                thread.id,
+                rag.query,
+                has_more_steps,
+            )
             if progress:
                 yield _sse(progress("Tool rag: no adequate context found."))
+            if has_more_steps:
+                plan_trace.append("RAG result: no adequate local context found; continuing with the remaining plan.")
+                return {"ok": True, "input_text": _prepend_plan_trace(input_text, plan_trace), "final_message": ""}
             return {
                 "ok": True,
                 "input_text": input_text,

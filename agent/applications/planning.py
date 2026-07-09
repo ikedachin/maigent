@@ -26,7 +26,7 @@ from .llm_helpers import (
     _log_tail,
     _tool_enabled,
 )
-from .rag import _build_answer_query, _has_allowed_context_sources, _search_terms, _should_search
+from .rag import _build_answer_query, _has_allowed_context_sources, _search_terms
 
 logger = logging.getLogger("agent")
 
@@ -299,13 +299,16 @@ def _should_force_file_batch_for_local_context(user_text: str) -> bool:
     )
 
 
+_EXPLICIT_EXTERNAL_METHOD_MARKERS = ["web", "ネットで", "インターネットで", "検索して", "search the web", "google"]
+
+
 def _should_force_rag_for_local_context(user_text: str) -> bool:
-    if _should_search(user_text):
-        return True
     text = user_text.strip()
     if not text:
         return False
     lowered = text.lower()
+    if any(marker in lowered or marker in text for marker in _EXPLICIT_EXTERNAL_METHOD_MARKERS):
+        return False
     if any(marker in lowered for marker in ["who is", "what is", "tell me about", "について", "教えて"]):
         return bool(_search_terms(text))
     return False

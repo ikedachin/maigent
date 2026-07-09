@@ -343,6 +343,16 @@ class RuntimeConfig:
             return 10
 
     @property
+    def web_search_max_retries(self) -> int:
+        web_search = self.tools.get("web_search", {})
+        if not isinstance(web_search, dict):
+            return 1
+        try:
+            return max(0, min(5, int(web_search.get("max_retries", 1))))
+        except (TypeError, ValueError):
+            return 1
+
+    @property
     def multi_agent(self) -> dict[str, Any]:
         value = self.values.get("multi_agent", {})
         return value if isinstance(value, dict) else {}
